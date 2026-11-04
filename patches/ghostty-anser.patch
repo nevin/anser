@@ -1,0 +1,119 @@
+diff --git a/include/ghostty.h b/include/ghostty.h
+index eec6550..97c9176 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1238,6 +1238,15 @@ GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_
+ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
+                                               ghostty_selection_s,
+                                               ghostty_text_s*);
++// Anser: output of the Nth most recent command (0 = last), via OSC 133 marks.
++GHOSTTY_API bool ghostty_surface_read_command_output(ghostty_surface_t, uint32_t, ghostty_text_s*);
++// Anser: visible prompt positions (from OSC 133 marks), newest first.
++typedef struct {
++  double y;
++  double height;
++  uint32_t index;
++} ghostty_prompt_mark_s;
++GHOSTTY_API size_t ghostty_surface_prompt_marks(ghostty_surface_t, ghostty_prompt_mark_s*, size_t);
+ GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+ 
+ #ifdef __APPLE__
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 4c4249e..0c1b950 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -1942,6 +1942,94 @@ pub const CAPI = struct {
+         return true;
+     }
+ 
++    /// Anser: reads the output of a recent command using the semantic
++    /// prompt marks written by shell integration (OSC 133). `index` 0 is the
++    /// command just above the prompt the cursor is on, 1 the one before, etc.
++    /// Returns false if there is no such command or it printed nothing.
++    /// Anser: one prompt that's visible on screen.
++    pub const PromptMark = extern struct {
++        /// Top of the prompt's first row, in points from the top of the surface.
++        y: f64,
++        /// Height of one row, in points.
++        height: f64,
++        /// 0 = the prompt the cursor is on, 1 = the command before it, ...
++        index: u32,
++    };
++
++    /// Anser: where the visible prompts are (from OSC 133 marks), newest first.
++    /// Lets the app draw command blocks next to the terminal text.
++    export fn ghostty_surface_prompt_marks(
++        surface: *Surface,
++        out: [*]PromptMark,
++        cap: usize,
++    ) usize {
++        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
++        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
++
++        const core = &surface.core_surface;
++        const screen = core.renderer_state.terminal.screens.active;
++        const scale = surface.getContentScale() catch apprt.ContentScale{ .x = 1, .y = 1 };
++        const cell_h: f64 = @floatFromInt(core.size.cell.height);
++        const pad_top: f64 = @floatFromInt(core.size.padding.top);
++
++        var it = screen.cursor.page_pin.promptIterator(.left_up, null);
++        var n: usize = 0;
++        var index: u32 = 0;
++        var seen = false;
++        while (it.next()) |pin| : (index += 1) {
++            if (n >= cap or index > 10000) break;
++            if (screen.pages.pointFromPin(.viewport, pin)) |pt| {
++                seen = true;
++                const row: f64 = @floatFromInt(pt.viewport.y);
++                out[n] = .{
++                    .y = (row * cell_h + pad_top) / scale.y,
++                    .height = cell_h / scale.y,
++                    .index = index,
++                };
++                n += 1;
++            } else if (seen) {
++                // Above the top of the screen; older prompts are further up.
++                break;
++            }
++        }
++        return n;
++    }
++
++    export fn ghostty_surface_read_command_output(
++        surface: *Surface,
++        index: u32,
++        result: *Text,
++    ) bool {
++        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
++        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
++
++        const screen = surface.core_surface.renderer_state.terminal.screens.active;
++        var it = screen.cursor.page_pin.promptIterator(.left_up, null);
++
++        // The first prompt found is the one the cursor is on.
++        _ = it.next() orelse return false;
++
++        var i: u32 = 0;
++        while (it.next()) |prompt_pin| : (i += 1) {
++            if (i != index) continue;
++            var hl = screen.pages.highlightSemanticContent(
++                prompt_pin,
++                .output,
++            ) orelse return false;
++
++            // Trim trailing blank cells.
++            var cell_it = hl.end.cellIterator(.left_up, hl.start);
++            while (cell_it.next()) |p| {
++                hl.end = p;
++                if (p.rowAndCell().cell.hasText()) break;
++            }
++
++            const sel = terminal.Selection.init(hl.start, hl.end, false);
++            return readTextLocked(surface, sel, result);
++        }
++        return false;
++    }
++
+     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
+         ptr.deinit();
+     }

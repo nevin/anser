@@ -1,0 +1,6 @@
+.build/
+.tools/
+build/
+vendor/
+.swiftpm/
+*.log
