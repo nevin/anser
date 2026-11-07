@@ -6,7 +6,7 @@ dec() { printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 -D
 dec '@@ZSH@@' > "$d/anser.zsh"
 dec '@@BASH@@' > "$d/anser.bash"
 printf '%s\n' 'ZDOTDIR="$HOME"; [ -r "$HOME/.zshenv" ] && . "$HOME/.zshenv"' ". \"$d/anser.zsh\"" > "$d/.zshenv"
-export ANSER_REMOTE_DIR="$d"
+export ANSER_REMOTE_DIR="$d" ANSER_REMOTE_TOKEN='@@TOKEN@@'
 case "${SHELL##*/}" in
     zsh) ZDOTDIR="$d" exec "$SHELL" -l ;;
     bash) exec "$SHELL" --rcfile "$d/anser.bash" -i ;;

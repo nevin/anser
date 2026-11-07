@@ -1,12 +1,14 @@
 # Anser hooks for a remote zsh (sent over ssh for this session only).
 # Events travel in-band as terminal title updates that Anser intercepts:
-#   ESC ] 2 ; U+E000 "anser:" fields-separated-by-U+E001 BEL
+#   ESC ] 2 ; U+E000 "anser:" token U+E001 fields-separated-by-U+E001 BEL
+# The token is a per-session secret, so program output can't fake events.
 # plus OSC 133 prompt marks for command blocks and output copying.
 [[ -o interactive ]] || return 0
+typeset -g _ar_tok=${ANSER_REMOTE_TOKEN:-none}; unset ANSER_REMOTE_TOKEN
 typeset -g _ar_mark=$'' _ar_sep=$''
 [[ -n "$ANSER_REMOTE_DIR" ]] && trap 'command rm -rf -- "$ANSER_REMOTE_DIR"' EXIT
 
-_ar_emit() { builtin print -rn -- $'\e]2;'"${_ar_mark}anser:$1"$'\a' }
+_ar_emit() { builtin print -rn -- $'\e]2;'"${_ar_mark}anser:${_ar_tok}${_ar_sep}$1"$'\a' }
 
 _ar_precmd() {
     local ec=$?

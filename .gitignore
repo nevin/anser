@@ -4,3 +4,4 @@ build/
 vendor/
 .swiftpm/
 *.log
+.DS_Store

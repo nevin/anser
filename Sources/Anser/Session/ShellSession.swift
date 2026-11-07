@@ -1,10 +1,13 @@
 import Foundation
+import Security
 import AnserCore
 
 protocol ShellSessionDelegate: AnyObject {
     func sessionDidShowPrompt(_ session: ShellSession)
     func sessionDidStartCommand(_ session: ShellSession, command: String)
     func sessionDidUpdateInfo(_ session: ShellSession)
+    /// Whether you can see this shell right now (app in front, its tab showing).
+    var sessionIsVisible: Bool { get }
 }
 
 /// One shell's side channel. The shell hooks write events into a private
@@ -21,12 +24,54 @@ final class ShellSession {
         var output: String?
     }
 
-    func setOutput(_ text: String, forBlockAt i: Int) {
-        guard blocks.indices.contains(i) else { return }
-        blocks[i].output = text.count > 1_000_000 ? String(text.suffix(1_000_000)) : text
+    /// Deep Clean: forget this tab's finished commands and their output. Returns their history ids.
+    @discardableResult
+    func forgetBlocks() -> [Int64] {
+        let ids = blocks.map(\.historyID)
+        blocks = []
+        lastExit = nil
+        return ids
     }
 
-    let id = UUID().uuidString
+    /// How much output this tab keeps in memory (MemoryManager tightens it when macOS is short).
+    var outputBudget: OutputBudget = .standard
+
+    func setOutput(_ text: String, forBlockAt i: Int) {
+        guard blocks.indices.contains(i) else { return }
+        blocks[i].output = text.utf8.count > outputBudget.newest ? OutputBudget.tail(text, bytes: outputBudget.newest) : text
+        applyOutputBudget()
+    }
+
+    /// Shrinks older outputs to their last part, and drops them past the tab's total.
+    func applyOutputBudget(_ budget: OutputBudget? = nil) {
+        let plan = (budget ?? outputBudget).plan(blocks.map { $0.output?.utf8.count })
+        for i in blocks.indices {
+            guard let out = blocks[i].output else { continue }
+            if let keep = plan[i] {
+                if out.utf8.count > keep { blocks[i].output = OutputBudget.tail(out, bytes: keep) }
+            } else {
+                blocks[i].output = nil
+            }
+        }
+    }
+
+    /// Bytes of output this tab holds (for problem reports and tests).
+    var outputBytes: Int { blocks.reduce(0) { $0 + ($1.output?.utf8.count ?? 0) } }
+
+    let id: String
+    /// Held by anser-session, so it survives Anser quitting (see SessionHost).
+    let persistent: Bool
+    /// Secret that events from Anser's ssh hooks must carry. They arrive as
+    /// terminal titles, which any output can print, so without it a file you
+    /// `cat` could fake commands into history or switch the pane to "remote".
+    private(set) var remoteToken: String = ShellSession.makeToken()
+
+    static func makeToken() -> String {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+    private(set) var rejectedRemoteEvents = 0
     let fifoPath: String
     weak var delegate: ShellSessionDelegate?
 
@@ -54,6 +99,9 @@ final class ShellSession {
     private(set) var gitDirty = false
     /// Number of changed (including untracked) files in the repo.
     private(set) var gitChangeCount = 0
+    /// This repo's config could make git run programs, so Anser's own
+    /// automatic git checks are switched off here.
+    private(set) var gitRisky = false
 
     // ssh: while a remote shell with Anser's hooks is active, the ssh command
     // itself is kept aside and the remote prompt/commands drive the editor.
@@ -79,28 +127,93 @@ final class ShellSession {
     /// Don't save this tab's commands to history.
     var historyPaused = false
 
-    init(cwd: String?) {
-        self.cwd = cwd ?? NSHomeDirectory()
-        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("anser")
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        fifoPath = (dir as NSString).appendingPathComponent("s-\(id.prefix(8))")
-        unlink(fifoPath)
-        if mkfifo(fifoPath, 0o600) == 0 {
-            // O_RDWR keeps the FIFO open (no EOF) even when no shell is writing.
-            fd = open(fifoPath, O_RDWR)
+    /// `persistentID`: a shell kept by anser-session (the same id comes back
+    /// after a restart). `restored`: what this shell looked like when Anser
+    /// quit, when re-attaching to a shell that is still running.
+    init(cwd: String?, persistentID: String? = nil, restored: SavedState? = nil) {
+        id = persistentID ?? UUID().uuidString
+        persistent = persistentID != nil
+        self.cwd = restored?.cwd ?? cwd ?? NSHomeDirectory()
+        if persistent {
+            // A fixed place, so a restarted Anser finds the same channel the shell still writes to.
+            fifoPath = SessionHost.shared.fifoPath(id)
+            var st = stat()
+            let isFIFO = stat(fifoPath, &st) == 0 && (st.st_mode & S_IFMT) == S_IFIFO
+            if !isFIFO { unlink(fifoPath); mkfifo(fifoPath, 0o600) }
+        } else {
+            let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("anser")
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            fifoPath = (dir as NSString).appendingPathComponent("s-\(id.prefix(8))")
+            unlink(fifoPath)
+            mkfifo(fifoPath, 0o600)
         }
+        // O_RDWR keeps the FIFO open (no EOF) even when no shell is writing.
+        fd = open(fifoPath, O_RDWR)
+        if let r = restored { apply(r) }
         if fd >= 0 { startReader() }
         refreshGit()
     }
 
-    func close() {
+    /// `keepShell`: Anser is quitting and the shell lives on in anser-session;
+    /// leave its channel in place for the next launch.
+    func close(keepShell: Bool = false) {
         guard fd >= 0, !stopFlag.isSet else { return }
         stopFlag.set()
         // Wake the reader thread; it closes the descriptor on its way out.
         var nl: UInt8 = 0x0A
         _ = write(fd, &nl, 1)
         fd = -1
-        unlink(fifoPath)
+        if !(keepShell && persistent) { unlink(fifoPath) }
+    }
+
+    // MARK: Saved state (kept shells)
+
+    struct SavedBlock: Codable {
+        var command: String, cwd: String, started: Date, duration: Double?, exitCode: Int?, historyID: Int64
+    }
+
+    struct SavedState: Codable {
+        var cwd: String
+        var integrated: Bool
+        var atPrompt: Bool
+        var running: SavedBlock?
+        var blocks: [SavedBlock]
+        var lastExit: Int?
+        var shellPID: Int32
+        var shell: String
+        var path: [String]
+        var aliases: [String: String]
+        var functions: [String]
+        var historyPaused: Bool
+        var remoteToken: String
+    }
+
+    func savedState() -> SavedState {
+        func saved(_ b: Block) -> SavedBlock {
+            SavedBlock(command: b.command, cwd: b.cwd, started: b.started, duration: b.duration, exitCode: b.exitCode, historyID: b.historyID)
+        }
+        return SavedState(cwd: cwd, integrated: integrated, atPrompt: atPrompt, running: running.map(saved),
+                          blocks: blocks.suffix(200).map(saved), lastExit: lastExit, shellPID: shellPID, shell: env.shell,
+                          path: env.path, aliases: env.aliases, functions: Array(env.functions), historyPaused: historyPaused,
+                          remoteToken: remoteToken)
+    }
+
+    private func apply(_ r: SavedState) {
+        func block(_ b: SavedBlock) -> Block {
+            Block(command: b.command, cwd: b.cwd, started: b.started, duration: b.duration, exitCode: b.exitCode, historyID: b.historyID, output: nil)
+        }
+        integrated = r.integrated
+        atPrompt = r.atPrompt
+        running = r.running.map(block)
+        blocks = r.blocks.map(block)
+        lastExit = r.lastExit
+        shellPID = r.shellPID
+        env.shell = r.shell
+        env.path = r.path
+        env.aliases = r.aliases
+        env.functions = Set(r.functions)
+        historyPaused = r.historyPaused
+        remoteToken = r.remoteToken
     }
 
     deinit { close() }
@@ -116,6 +229,9 @@ final class ShellSession {
             "GHOSTTY_SHELL_FEATURES": "cursor,title,sudo",
         ]
         env["ANSER_PROMPT_MODE"] = Services.shared.config.shellPrompt
+        // Gives the shell an `imgcat` (when it has none) that shows pictures.
+        if let helper = SessionHost.shared.helperPath { env["ANSER_HELPER"] = helper }
+        if !Services.shared.config.showLoginMessage { env["ANSER_HIDE_LOGIN"] = "1" }
         if let gh = GhosttyRuntime.shared.resourcesDir {
             env["GHOSTTY_RESOURCES_DIR"] = gh
             env["ANSER_GHOSTTY_INTEGRATION"] = gh + "/shell-integration"
@@ -126,7 +242,14 @@ final class ShellSession {
             if let z = ProcessInfo.processInfo.environment["ZDOTDIR"] { env["ANSER_ORIG_ZDOTDIR"] = z }
             env["ZDOTDIR"] = shellDir + "/zsh"
         }
-        if let boot = RemoteBootstrap.path { env["ANSER_SSH_BOOTSTRAP"] = boot }
+        // A matching folder profile can add environment (e.g. AWS_PROFILE) to new tabs.
+        if let extra = Profile.resolve(Services.shared.config.profiles, host: nil, cwd: cwd)?.env {
+            for (k, v) in extra where !k.hasPrefix("ANSER_") && !["ZDOTDIR", "TERM_PROGRAM"].contains(k) { env[k] = v }
+        }
+        if let boot = RemoteBootstrap.path {
+            env["ANSER_SSH_BOOTSTRAP"] = boot
+            env["ANSER_REMOTE_TOKEN"] = remoteToken
+        }
         return env
     }
 
@@ -209,8 +332,8 @@ final class ShellSession {
                 if blocks.count > 500 { blocks.removeFirst(blocks.count - 500) }
                 running = nil
                 let threshold = Services.shared.config.notifyAfterSeconds
-                if threshold > 0, let d = b.duration, d >= threshold, !AppDelegate.shared.isActive {
-                    Services.shared.notifyCommandFinished(b.command, exitCode: exitCode, duration: d)
+                if threshold > 0, let d = b.duration, d >= threshold, !(delegate?.sessionIsVisible ?? false) {
+                    Services.shared.notifyCommandFinished(b.command, exitCode: exitCode, duration: d, sessionID: id)
                 }
             }
             insertFinishedAt = nil
@@ -234,7 +357,14 @@ final class ShellSession {
     // MARK: Remote (ssh) events, delivered in-band through the terminal
 
     /// Fields from an in-band event: ["hello", shell, host] / ["prompt", exit, host, cwd] / ["preexec", command, cwd].
-    func handleRemote(_ f: [String]) {
+    /// Fields after the token; events with a missing or wrong token are dropped.
+    func handleRemote(token: String, _ f: [String]) {
+        guard token.utf8.count == remoteToken.utf8.count,
+              zip(token.utf8, remoteToken.utf8).reduce(0, { $0 | ($1.0 ^ $1.1) }) == 0 else {
+            rejectedRemoteEvents += 1
+            if rejectedRemoteEvents <= 3 { Diagnostics.shared.log("ignored a fake ssh event printed by a program") }
+            return
+        }
         guard let kind = f.first else { return }
         func field(_ i: Int) -> String { i < f.count ? f[i] : "" }
         enterRemote(host: kind == "hello" ? field(2) : (kind == "prompt" ? field(2) : remoteHost ?? "remote"))
@@ -336,15 +466,40 @@ final class ShellSession {
             head = t.hasPrefix("ref: refs/heads/") ? String(t.dropFirst(16)) : String(t.prefix(7))
         }
         gitBranch = head
-        guard head != nil else { gitDirty = false; gitChangeCount = 0; delegate?.sessionDidUpdateInfo(self); return }
-        let env = self.env
+        guard head != nil else { gitDirty = false; gitChangeCount = 0; gitRisky = false; delegate?.sessionDidUpdateInfo(self); return }
+        gitRisky = GitSafety.isRisky(cwd: dir)
+        if gitRisky {
+            gitDirty = false; gitChangeCount = 0
+            Diagnostics.shared.log("git checks off: repo config can run programs")
+            delegate?.sessionDidUpdateInfo(self)
+            return
+        }
+        countGitChanges()
+        delegate?.sessionDidUpdateInfo(self)
+    }
+
+    /// One `git status` per session at a time. Requests that arrive while one is
+    /// running are merged into a single follow-up run for the latest folder.
+    private var gitCountRunning = false
+    private var gitCountAgain = false
+
+    private func countGitChanges() {
+        if gitCountRunning { gitCountAgain = true; return }
+        gitCountRunning = true
+        let dir = cwd, env = self.env
         Task { @MainActor [weak self] in
             let out = await ScriptRunner.shared.run("git status --porcelain 2>/dev/null | head -5000 | wc -l", cwd: dir, env: env, timeout: 2)
-            guard let self, self.cwd == dir else { return }
+            guard let self else { return }
+            self.gitCountRunning = false
+            if self.gitCountAgain {
+                self.gitCountAgain = false
+                if self.gitBranch != nil, !self.gitRisky { self.countGitChanges() }
+                if self.cwd != dir { return }
+            }
+            guard self.cwd == dir else { return }
             self.gitChangeCount = Int((out ?? "").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
             self.gitDirty = self.gitChangeCount > 0
             self.delegate?.sessionDidUpdateInfo(self)
         }
-        delegate?.sessionDidUpdateInfo(self)
     }
 }

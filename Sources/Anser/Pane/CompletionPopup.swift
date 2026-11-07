@@ -7,7 +7,7 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
     private let table = NSTableView()
     private let scroll = NSScrollView()
     private let detail = NSTextField(labelWithString: "")
-    private var items: [Completion] = []
+    private(set) var items: [Completion] = []
     private weak var parentWindow: NSWindow?
     /// Side panel with the full description of the highlighted item.
     private let docsPanel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 120), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
@@ -203,13 +203,9 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
     }
 
     private func updateDetail() {
-        guard let c = selected else { detail.stringValue = ""; return }
-        let hint = "⇥ accept   ↑↓ choose   esc close"
-        if let d = c.detail, !d.isEmpty, c.kind != .history {
-            detail.stringValue = d + "    " + hint
-        } else {
-            detail.stringValue = hint
-        }
+        // Keys only: the row shows the description, and the docs panel beside
+        // the popup shows it in full when the row cuts it off.
+        detail.stringValue = selected == nil ? "" : "⇥ accept   ↑↓ choose   esc close"
     }
 
     private func widest() -> CGFloat {

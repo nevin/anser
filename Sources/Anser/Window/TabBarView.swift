@@ -8,6 +8,10 @@ final class TabBarView: NSView {
     var inFullScreen = false { didSet { needsLayout = true } }
     private var items: [TabItemView] = []
     private let plus = NSButton()
+    /// Shows or hides the sidebar (⌃⌘S); sits just after the window buttons.
+    private let sidebarButton = NSButton()
+    /// Opens the Command Notebook (⌥⌘N).
+    private let notebookButton = NSButton()
     /// Lists every tab when there are too many to read their names.
     private let overflow = NSButton()
     private(set) var editingIndex: Int?
@@ -51,7 +55,42 @@ final class TabBarView: NSView {
         addSubview(overflow)
         plus.setAccessibilityLabel("New tab")
         setAccessibilityLabel("Tabs")
+        sidebarButton.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Sidebar")
+        sidebarButton.isBordered = false
+        sidebarButton.imageScaling = .scaleProportionallyDown
+        sidebarButton.target = self
+        sidebarButton.action = #selector(toggleSidebar)
+        addSubview(sidebarButton)
+        notebookButton.image = NSImage(systemSymbolName: "book.closed", accessibilityDescription: "Command Notebook")
+        notebookButton.isBordered = false
+        notebookButton.imageScaling = .scaleProportionallyDown
+        notebookButton.target = self
+        notebookButton.action = #selector(openNotebook)
+        notebookButton.toolTip = "Command Notebook: your saved commands (⌥⌘N)"
+        notebookButton.setAccessibilityLabel("Command Notebook")
+        addSubview(notebookButton)
+        updateSidebarButton()
     }
+
+    @objc private func openNotebook() { controller?.toggleNotebookPanel() }
+    func clickNotebookButton() { notebookButton.performClick(nil) }
+    var notebookButtonFrame: NSRect { notebookButton.frame }
+
+    @objc private func toggleSidebar() { controller?.toggleSidebar() }
+
+    /// Brighter while the sidebar is open; the tooltip says what a click does.
+    func updateSidebarButton() {
+        let open = controller?.sidebarVisible ?? false
+        let fg = GhosttyRuntime.shared.theme.foreground
+        sidebarButton.contentTintColor = fg.withAlphaComponent(open ? 0.9 : 0.5)
+        let nbOpen = controller?.notebookPanelVisible ?? false
+        notebookButton.contentTintColor = fg.withAlphaComponent(nbOpen ? 0.9 : 0.5)
+        notebookButton.image = NSImage(systemSymbolName: nbOpen ? "book.fill" : "book.closed", accessibilityDescription: "Command Notebook")
+        sidebarButton.toolTip = (open ? "Hide sidebar" : "Show sidebar") + " (⌃⌘S)"
+        sidebarButton.setAccessibilityLabel(open ? "Hide sidebar" : "Show sidebar")
+    }
+    var sidebarButtonFrame: NSRect { sidebarButton.frame }
+    func clickSidebarButton() { sidebarButton.performClick(nil) }
 
     @objc private func showAllTabs() {
         guard let c = controller else { return }
@@ -59,7 +98,7 @@ final class TabBarView: NSView {
         for (i, tab) in c.tabs.enumerated() {
             let item = ClosureMenuItem(title: c.title(of: tab)) { [weak c] in c?.selectTab(i) }
             item.state = i == c.selectedIndex ? .on : .off
-            if let color = Self.color(tab.color) { item.image = Self.swatch(color) }
+            if let color = Self.color(tab.color ?? tab.profileColor) { item.image = Self.swatch(color) }
             m.addItem(item)
         }
         m.popUp(positioning: nil, at: NSPoint(x: overflow.frame.minX, y: overflow.frame.minY), in: self)
@@ -91,20 +130,26 @@ final class TabBarView: NSView {
         while items.count > c.tabs.count { items.removeLast().removeFromSuperview() }
         for (i, tab) in c.tabs.enumerated() {
             items[i].configure(index: i, title: c.title(of: tab), selected: i == c.selectedIndex,
-                               color: Self.color(tab.color), activity: c.activity(of: tab))
+                               color: Self.color(tab.color ?? tab.profileColor), activity: c.activity(of: tab))
+            if let p = tab.focusedPane { items[i].toolTip = c.title(of: tab) + "\n" + p.tabTooltip + "\nDouble-click to rename" }
         }
         plus.contentTintColor = GhosttyRuntime.shared.theme.foreground.withAlphaComponent(0.55)
+        updateSidebarButton()
         needsLayout = true
         needsDisplay = true
     }
 
-    private var leadingInset: CGFloat { inFullScreen ? 8 : 78 }
+    /// Room for the window buttons (outside full screen), then the sidebar button.
+    private var buttonsInset: CGFloat { inFullScreen ? 8 : 78 }
+    private var leadingInset: CGFloat { buttonsInset + 28 }
+    /// Room at the right end for the notebook button.
+    private let trailingInset: CGFloat = 34
 
     /// Where tab `i` sits.
     func frameForTab(_ i: Int, count: Int) -> NSRect {
-        let crowded = (bounds.width - leadingInset - 40) / CGFloat(max(count, 1)) < 90
-        let available = bounds.width - leadingInset - (crowded ? 66 : 40)
-        let w = max(44, min(230, available / CGFloat(max(count, 1))))
+        let crowded = (bounds.width - leadingInset - trailingInset - 40) / CGFloat(max(count, 1)) < 90
+        let available = bounds.width - leadingInset - trailingInset - (crowded ? 66 : 40)
+        let w = max(44, min(200, available / CGFloat(max(count, 1))))
         return NSRect(x: leadingInset + CGFloat(i) * w, y: 3, width: w - 2, height: bounds.height - 6)
     }
 
@@ -128,9 +173,11 @@ final class TabBarView: NSView {
                 v.frame = target
             }
         }
+        sidebarButton.frame = NSRect(x: buttonsInset, y: (bounds.height - 18) / 2, width: 20, height: 18)
+        notebookButton.frame = NSRect(x: bounds.width - 30, y: (bounds.height - 18) / 2, width: 20, height: 18)
         let last = items.isEmpty ? leadingInset : frameForTab(items.count - 1, count: items.count).maxX
         plus.frame = NSRect(x: last + 6, y: (bounds.height - 18) / 2, width: 18, height: 18)
-        let crowded = !items.isEmpty && (bounds.width - leadingInset - 40) / CGFloat(items.count) < 90
+        let crowded = !items.isEmpty && (bounds.width - leadingInset - trailingInset - 40) / CGFloat(items.count) < 90
         overflow.isHidden = !crowded
         overflow.frame = NSRect(x: plus.frame.maxX + 6, y: (bounds.height - 16) / 2, width: 16, height: 16)
         overflow.contentTintColor = plus.contentTintColor

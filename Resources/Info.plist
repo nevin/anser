@@ -2,19 +2,80 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>Anser</string>
-    <key>CFBundleDisplayName</key><string>Anser</string>
-    <key>CFBundleIdentifier</key><string>app.anser.terminal</string>
-    <key>CFBundleExecutable</key><string>Anser</string>
-    <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
-    <key>LSMinimumSystemVersion</key><string>14.0</string>
-    <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
-    <key>NSHighResolutionCapable</key><true/>
-    <key>NSPrincipalClass</key><string>NSApplication</string>
-    <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
-    <key>NSHumanReadableCopyright</key><string>Terminal engine: Ghostty (MIT)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Anser</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Shell Script</string>
+			<key>CFBundleTypeRole</key>
+			<string>Shell</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.apple.terminal.shell-script</string>
+				<string>public.unix-executable</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Folder</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.folder</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleExecutable</key>
+	<string>Anser</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.anser.terminal</string>
+	<key>CFBundleName</key>
+	<string>Anser</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.4.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>SSH</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>ssh</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Manual Page</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>x-man-page</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>4</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Terminal engine: Ghostty (MIT)</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
 </dict>
 </plist>

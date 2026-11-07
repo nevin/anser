@@ -1,6 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 import GhosttyKit
+import AnserCore
 
 /// An NSView that hosts one libghostty terminal surface (GPU-rendered by
 /// Ghostty itself) and forwards keyboard, mouse and IME input to it.
@@ -335,6 +336,7 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
             _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RIGHT, Self.mods(event.modifierFlags))
             return
         }
+        sendPos(event)
         NSMenu.popUpContextMenu(contextMenu(), with: event, for: self)
     }
 
@@ -356,13 +358,23 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
     override func mouseMoved(with event: NSEvent) {
         sendPos(event)
         if let o = pane?.blocksOverlay { o.hover(at: o.convert(event.locationInWindow, from: nil)) }
+        // Quick Look a file path once the mouse rests on it.
+        let point = convert(event.locationInWindow, from: nil)
+        pane?.mouseMovedOverOutput(at: point)
+        hoverWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.pane?.previewPathUnderMouse(at: point) }
+        hoverWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7, execute: work)
     }
+    private var hoverWork: DispatchWorkItem?
     override func mouseDragged(with event: NSEvent) { sendPos(event) }
     override func rightMouseDragged(with event: NSEvent) { sendPos(event) }
     override func otherMouseDragged(with event: NSEvent) { sendPos(event) }
     override func mouseEntered(with event: NSEvent) { sendPos(event) }
 
     override func mouseExited(with event: NSEvent) {
+        hoverWork?.cancel()
+        pane?.closePreview()
         // Moving onto the hover strip keeps it; leaving the terminal hides it.
         if let o = pane?.blocksOverlay, !o.stripContains(o.convert(event.locationInWindow, from: nil)) { o.hover(at: nil) }
         guard let surface else { return }
@@ -397,17 +409,42 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
 
     private func contextMenu() -> NSMenu {
         let m = NSMenu()
+        // Right-clicked a file path in the output: open, preview, blame, reveal, copy.
+        if let pane, let word = wordUnderMouse(), let link = pane.pathLink(word, viewport: viewportText()) {
+            let name = (link.path as NSString).lastPathComponent
+            let env = pane.session.env
+            m.addItem(ClosureMenuItem(title: "Open “\(name)”") { [weak pane] in
+                if !FileActions.openInEditor(link.path, env: env) { _ = pane?.openFile(link.line.map { "\(link.path):\($0)" } ?? link.path) }
+            })
+            m.addItem(ClosureMenuItem(title: "Quick Look") { FileActions.quickLook(link.path) })
+            if !FileActions.isFolder(link.path), GitInfo.gitDir(for: (link.path as NSString).deletingLastPathComponent) != nil {
+                m.addItem(ClosureMenuItem(title: link.line == nil ? "Blame" : "Blame Line \(link.line!)") { [weak pane] in
+                    guard let pane else { return }
+                    pane.windowController?.showBlame(for: pane, path: link.path, line: link.line)
+                })
+            }
+            m.addItem(ClosureMenuItem(title: "Show in Finder") { FileActions.reveal(link.path) })
+            m.addItem(ClosureMenuItem(title: "Copy Path") { FileActions.copyPath(link.path) })
+            m.addItem(.separator())
+        }
         m.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
         m.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
         m.addItem(.separator())
         m.addItem(withTitle: "Copy Last Output", action: #selector(AppDelegate.copyLastOutput(_:)), keyEquivalent: "")
         m.addItem(withTitle: "Copy Last Command", action: #selector(AppDelegate.copyLastCommand(_:)), keyEquivalent: "")
         m.addItem(withTitle: "Search History…", action: #selector(AppDelegate.historySearch(_:)), keyEquivalent: "")
+        m.addItem(ClosureMenuItem(title: "Find in All Tabs…") { [weak pane] in
+            guard let pane else { return }
+            pane.windowController?.showSearchAllTabs(for: pane)
+        })
         m.addItem(.separator())
         m.addItem(withTitle: "Split Right", action: #selector(AppDelegate.splitRight(_:)), keyEquivalent: "")
         m.addItem(withTitle: "Split Down", action: #selector(AppDelegate.splitDown(_:)), keyEquivalent: "")
+        m.addItem(ClosureMenuItem(title: "Split Left") { [weak pane] in if let pane { pane.windowController?.split(pane, vertical: true, before: true) } })
+        m.addItem(ClosureMenuItem(title: "Split Up") { [weak pane] in if let pane { pane.windowController?.split(pane, vertical: false, before: true) } })
         m.addItem(.separator())
         m.addItem(withTitle: "Clear", action: #selector(AppDelegate.clearScreen(_:)), keyEquivalent: "")
+        m.addItem(ClosureMenuItem(title: "Deep Clean…") { [weak pane] in pane?.confirmDeepClean() })
         return m
     }
 
@@ -422,7 +459,10 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
 
     var hasSelection: Bool { surface.map { ghostty_surface_has_selection($0) } ?? false }
 
-    @objc func copy(_ sender: Any?) { binding("copy_to_clipboard") }
+    @objc func copy(_ sender: Any?) {
+        if let surface, ghostty_surface_has_selection(surface) { Services.shared.tip(in: pane) { $0.mouseCopy() } }
+        binding("copy_to_clipboard")
+    }
     @objc func paste(_ sender: Any?) {
         if let pane, pane.pasteIntoEditorIfAtPrompt() { return }
         binding("paste_from_clipboard")

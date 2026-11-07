@@ -4,7 +4,8 @@ import GhosttyKit
 
 /// Draws command blocks over the terminal: a colored bar beside each command
 /// and its output (green ok, red failed, yellow running), and on hover a
-/// small strip with the result and Copy output / Copy command / Re-run.
+/// small strip with the result and Explain (failed only) / Copy output /
+/// Copy command / Re-run / Open in window / Export / Save to notebook.
 /// Positions come from the prompt marks shell integration writes (OSC 133).
 final class BlocksOverlayView: NSView {
     weak var pane: PaneView?
@@ -19,17 +20,15 @@ final class BlocksOverlayView: NSView {
         var blockIndex: Int?
         var running: Bool
         var rowHeight: CGFloat = 17
-        /// Stable identity for remembering which blocks are collapsed.
-        var key: Double? { info?.started.timeIntervalSince1970 }
     }
 
     private(set) var blocks: [Block] = []
-    /// Blocks whose output is covered ("collapsed"), by start time.
-    private(set) var collapsed = Set<Double>()
     private var hovered: Int?
     private let strip = NSView()
     private let stripLabel = NSTextField(labelWithString: "")
     private var stripButtons: [NSButton] = []
+    /// "Explain with AI": only on failed commands.
+    private var explainButton: NSButton!
     private var refreshScheduled = false
 
     override var isFlipped: Bool { true }
@@ -42,10 +41,13 @@ final class BlocksOverlayView: NSView {
         strip.isHidden = true
         stripLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .medium)
         strip.addSubview(stripLabel)
-        for (sym, tip, sel) in [("doc.on.doc", "Copy output", #selector(copyOutput)),
+        for (sym, tip, sel) in [("sparkles", "Explain with AI (why did this fail?)", #selector(explain)),
+                                ("doc.on.doc", "Copy output", #selector(copyOutput)),
                                 ("terminal", "Copy command", #selector(copyCommand)),
                                 ("arrow.clockwise", "Run again", #selector(rerun)),
-                                ("chevron.up.chevron.down", "Collapse output", #selector(toggleCollapse))] {
+                                ("macwindow", "Open the output in its own window (find, copy, export)", #selector(openViewer)),
+                                ("square.and.arrow.up", "Export output (Markdown, JSON, PDF…)", #selector(exportBlock)),
+                                ("book.closed", "Save command to notebook", #selector(saveToNotebook))] {
             let b = NSButton(image: NSImage(systemSymbolName: sym, accessibilityDescription: tip)!, target: self, action: sel)
             b.isBordered = false
             b.imageScaling = .scaleProportionallyDown
@@ -54,44 +56,21 @@ final class BlocksOverlayView: NSView {
             strip.addSubview(b)
             stripButtons.append(b)
         }
+        explainButton = stripButtons.first
         addSubview(strip)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    // Only the hover strip and collapsed covers take clicks; everything else
-    // goes to the terminal.
+    // Only the hover strip takes clicks; everything else goes to the terminal.
     override func hitTest(_ point: NSPoint) -> NSView? {
         let local = convert(point, from: superview)
         if !strip.isHidden, strip.frame.contains(local) { return super.hitTest(point) }
-        if blocks.contains(where: { isCollapsed($0) && coverRect($0).contains(local) }) { return self }
         return nil
     }
 
-    func isCollapsed(_ b: Block) -> Bool { b.key.map(collapsed.contains) ?? false }
-
-    /// The output rows of a block (everything below its command line).
-    func coverRect(_ b: Block) -> NSRect {
-        let top = b.top + b.rowHeight
-        return NSRect(x: 0, y: top, width: bounds.width, height: max(0, b.bottom - top - 2))
-    }
-
-    func setCollapsed(_ b: Block, _ on: Bool) {
-        guard let k = b.key, !b.running else { return }
-        if on { collapsed.insert(k) } else { collapsed.remove(k) }
-        updateStrip()
-        needsDisplay = true
-    }
-
-    @objc private func toggleCollapse() {
-        guard let b = hoveredBlock else { return }
-        setCollapsed(b, !isCollapsed(b))
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        if let b = blocks.first(where: { isCollapsed($0) && coverRect($0).contains(p) }) { setCollapsed(b, false) }
-    }
+    /// The buttons showing on the hover strip right now (for tests).
+    var visibleStripActions: [String] { strip.isHidden ? [] : stripButtons.filter { !$0.isHidden }.compactMap(\.toolTip) }
 
     private var lastRefresh = Date.distantPast
 
@@ -110,6 +89,7 @@ final class BlocksOverlayView: NSView {
     }
 
     func refresh() {
+        pane?.scheduleFollowCheck()
         guard let pane, let surface = pane.surfaceView.surface, Services.shared.config.commandBlocks else {
             blocks = []; strip.isHidden = true; needsDisplay = true; return
         }
@@ -182,17 +162,15 @@ final class BlocksOverlayView: NSView {
         var x: CGFloat = 8
         stripLabel.frame.origin = NSPoint(x: x, y: (22 - stripLabel.frame.height) / 2)
         x = stripLabel.frame.maxX + 8
-        for btn in stripButtons {
-            btn.contentTintColor = t.foreground.withAlphaComponent(0.7)
+        explainButton.isHidden = ok
+        explainButton.toolTip = "Explain with \(Services.shared.aiName) (why did this fail?)"
+        for btn in stripButtons where !btn.isHidden {
+            btn.contentTintColor = btn === explainButton ? t.magenta : t.foreground.withAlphaComponent(0.7)
             btn.frame = NSRect(x: x, y: 4, width: 14, height: 14)
             x += 22
         }
         let w = x - 2
         strip.frame = NSRect(x: bounds.width - w - 10, y: max(0, b.top + 1), width: w, height: 22)
-        if let toggle = stripButtons.last {
-            toggle.toolTip = isCollapsed(b) ? "Show output" : "Hide output"
-            toggle.image = NSImage(systemSymbolName: isCollapsed(b) ? "chevron.down" : "chevron.up", accessibilityDescription: toggle.toolTip)
-        }
         strip.isHidden = false
     }
 
@@ -203,37 +181,74 @@ final class BlocksOverlayView: NSView {
             if b.running { color = t.yellow }
             else if let e = b.info?.exitCode, e != 0 { color = t.red }
             else { color = t.green.withAlphaComponent(0.55) }
+            let failed = (b.info?.exitCode ?? 0) != 0 && !b.running
             let hovered = b.markIndex == self.hovered
-            let rect = NSRect(x: 1, y: b.top + 2, width: hovered ? 3.5 : 2.5, height: max(4, b.bottom - b.top - 5))
-            color.withAlphaComponent(hovered ? 1 : (b.running ? 0.9 : 0.75)).setFill()
+            let rect = NSRect(x: 1, y: b.top + 2, width: hovered ? 3.5 : (failed ? 3 : 2.5), height: max(4, b.bottom - b.top - 5))
+            color.withAlphaComponent(hovered || failed ? 1 : (b.running ? 0.9 : 0.75)).setFill()
             NSBezierPath(roundedRect: rect, xRadius: 1.25, yRadius: 1.25).fill()
-            if hovered && !isCollapsed(b) {
+            if !hovered { drawResultMark(b) }
+            if hovered {
                 t.foreground.withAlphaComponent(0.035).setFill()
                 NSRect(x: 0, y: b.top, width: bounds.width, height: b.bottom - b.top).fill()
             }
-            if isCollapsed(b) {
-                // Cover the output with a placeholder (the terminal can't remove
-                // rows, so the space stays; the noise goes).
-                let r = coverRect(b)
-                guard r.height > 2 else { continue }
-                t.background.setFill()
-                r.fill()
-                let lines = max(1, Int((r.height / max(b.rowHeight, 1)).rounded()))
-                let label = "▸ Output hidden · \(lines) line\(lines == 1 ? "" : "s") · click to show" as NSString
-                let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11.5, weight: .medium), .foregroundColor: t.dim]
-                let pill = NSRect(x: 14, y: r.minY + 3, width: label.size(withAttributes: attrs).width + 20, height: min(r.height - 6, 22))
-                t.foreground.withAlphaComponent(0.06).setFill()
-                NSBezierPath(roundedRect: pill, xRadius: 6, yRadius: 6).fill()
-                label.draw(at: NSPoint(x: pill.minX + 10, y: pill.midY - 7.5), withAttributes: attrs)
-            }
         }
+    }
+
+    /// The command's result at the right end of its line: "✓ 2.8s" or
+    /// "✗ exit 1 · 2.8s". Shape as well as color, so it reads without color.
+    /// Successful commands at least this long show "✓ time".
+    static let slowCommand: TimeInterval = 1
+
+    func resultMark(_ b: Block) -> String? {
+        if b.running { return "● running" }
+        guard let info = b.info, info.exitCode != nil || info.duration != nil else { return nil }
+        let d = info.duration.map { Services.formatDuration($0) } ?? ""
+        let ec = info.exitCode ?? 0
+        if ec != 0 { return "✗ exit \(ec)\(d.isEmpty ? "" : " · " + d)" }
+        // Quick successes stay quiet (the green bar says enough); slow ones show their time.
+        guard let dur = info.duration, dur >= Self.slowCommand else { return nil }
+        return "✓ \(d)"
+    }
+
+    /// Whether "❯ command" on its row ends clear of a mark starting at `markStart`.
+    static func markFits(command: String, cellWidth: CGFloat, markStart: CGFloat) -> Bool {
+        let firstLine = command.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        guard !command.contains("\n") else { return false }
+        // Wide characters (CJK, emoji) take two cells.
+        let cells = firstLine.unicodeScalars.reduce(2) { $0 + ($1.properties.isEmojiPresentation || ($1.value >= 0x1100 && $1.value <= 0xFFDC && $1.properties.isIdeographic) ? 2 : 1) }
+        return CGFloat(cells) * cellWidth + 16 < markStart
+    }
+
+    private func drawResultMark(_ b: Block) {
+        guard bounds.width > 320, let text = resultMark(b) else { return }
+        let t = GhosttyRuntime.shared.theme
+        let failed = (b.info?.exitCode ?? 0) != 0 && !b.running
+        let color: NSColor = b.running ? t.yellow : (failed ? t.red : t.foreground.withAlphaComponent(0.4))
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: failed ? .semibold : .regular),
+                                                    .foregroundColor: color]
+        let s = text as NSString
+        let size = s.size(withAttributes: attrs)
+        let pill = NSRect(x: bounds.width - size.width - 22, y: b.top + max(0, (b.rowHeight - size.height - 2) / 2), width: size.width + 12, height: size.height + 2)
+        // Never cover text: skip the mark when the command line reaches it
+        // (the hover strip still shows the result).
+        if let cmd = b.info?.command, !Self.markFits(command: cmd, cellWidth: pane?.surfaceView.cellSize.width ?? 8, markStart: pill.minX) { return }
+        // A backing so a long command line under it stays readable around it.
+        t.background.setFill()
+        NSBezierPath(roundedRect: pill, xRadius: 4, yRadius: 4).fill()
+        if failed {
+            t.red.withAlphaComponent(0.14).setFill()
+            NSBezierPath(roundedRect: pill, xRadius: 4, yRadius: 4).fill()
+        }
+        s.draw(at: NSPoint(x: pill.minX + 6, y: pill.minY + 1), withAttributes: attrs)
     }
 
     // MARK: Actions
 
     @objc private func copyOutput() {
         guard let b = hoveredBlock, let pane else { return }
-        let text = b.blockIndex.flatMap { pane.output(ofBlock: $0) } ?? pane.surfaceView.commandOutput(index: b.markIndex - 1)
+        // The terminal still has the whole output while it's in scrollback; the kept copy may be just its end.
+        let live = b.markIndex >= 1 ? pane.surfaceView.commandOutput(index: b.markIndex - 1) : nil
+        let text = (live?.isEmpty == false ? live : nil) ?? b.blockIndex.flatMap { pane.output(ofBlock: $0) }
         if let out = text, !out.isEmpty {
             TerminalWindowController.copy(out)
             pane.flash("Copied output (\(out.components(separatedBy: "\n").count) lines)")
@@ -246,6 +261,26 @@ final class BlocksOverlayView: NSView {
         guard let cmd = hoveredBlock?.info?.command, let pane else { return }
         TerminalWindowController.copy(cmd)
         pane.flash("Copied command")
+    }
+
+    @objc private func exportBlock() {
+        guard let pane, let i = hoveredBlock?.blockIndex else { NSSound.beep(); return }
+        pane.windowController?.exportOutput(for: pane, block: i)
+    }
+
+    @objc private func saveToNotebook() {
+        guard let cmd = hoveredBlock?.info?.command, !cmd.isEmpty else { NSSound.beep(); return }
+        NotebookWindow.shared.add(command: cmd)
+    }
+
+    @objc private func explain() {
+        guard let pane, let i = hoveredBlock?.blockIndex else { NSSound.beep(); return }
+        pane.explainBlock(at: i)
+    }
+
+    @objc private func openViewer() {
+        guard let pane, let i = hoveredBlock?.blockIndex else { NSSound.beep(); return }
+        pane.windowController?.showOutputViewer(for: pane, block: i)
     }
 
     @objc private func rerun() {

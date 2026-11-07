@@ -4,9 +4,16 @@
 
 [[ -n "$ANSER_FIFO" && -p "$ANSER_FIFO" ]] || return 0
 typeset -gi _anser_fd
-exec {_anser_fd}<>"$ANSER_FIFO" 2>/dev/null || return 0
+# No "2>/dev/null" on this line: with exec, every redirection becomes permanent,
+# so it would silently hide all error output in the shell for the whole session.
+exec {_anser_fd}<>"$ANSER_FIFO" || return 0
+# `imgcat FILE` shows pictures, unless you have an imgcat of your own.
+if [[ -n "$ANSER_HELPER" && -x "$ANSER_HELPER" ]] && (( ! $+commands[imgcat] )); then
+    typeset -g _anser_helper=$ANSER_HELPER
+    imgcat() { "$_anser_helper" imgcat "$@" }
+fi
 # Don't leak into child programs or nested shells.
-builtin unset ANSER_FIFO ANSER_SHELL_DIR ANSER_GHOSTTY_INTEGRATION
+builtin unset ANSER_FIFO ANSER_SHELL_DIR ANSER_GHOSTTY_INTEGRATION ANSER_HELPER
 
 typeset -g _anser_alias_sig="" _anser_func_sig="" _anser_path=""
 
@@ -137,6 +144,10 @@ _anser_preexec() {
 # session (temporary, deleted on logout) so the editor and history work there.
 if [[ -r "$ANSER_SSH_BOOTSTRAP" ]]; then
     typeset -g _anser_ssh_boot=$ANSER_SSH_BOOTSTRAP
+    # The session's secret, kept out of the environment of programs you run.
+    typeset -g _anser_tok=$ANSER_REMOTE_TOKEN
+    unset ANSER_REMOTE_TOKEN
+    _anser_ssh_command() { local b="$(<$_anser_ssh_boot)"; builtin print -r -- "${b//@@TOKEN@@/$_anser_tok}" }
     ssh() {
         local a host="" i=1 n=$#
         while (( i <= n )); do
@@ -154,7 +165,7 @@ if [[ -r "$ANSER_SSH_BOOTSTRAP" ]]; then
             esac
         done
         if [[ -z $host || ! -t 0 || ! -t 1 ]]; then command ssh "$@"; return; fi
-        command ssh -t "$@" "$(<$_anser_ssh_boot)"
+        command ssh -t "$@" "$(_anser_ssh_command)"
     }
 fi
 

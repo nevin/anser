@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 // A JSON completion spec, loosely modeled on Fig/withfig autocomplete specs.
 //
@@ -11,14 +12,14 @@ import Foundation
 //   "args": { "name": "service", "generators": { "script": "ls services" } }
 // }
 
-public final class CompletionSpec: Decodable, @unchecked Sendable {
-    public var names: [String]
-    public var description: String?
-    public var subcommands: [CompletionSpec]
-    public var options: [OptionSpec]
-    public var args: [ArgSpec]
+public final class CompletionSpec: Decodable, Sendable {
+    public let names: [String]
+    public let description: String?
+    public let subcommands: [CompletionSpec]
+    public let options: [OptionSpec]
+    public let args: [ArgSpec]
     /// Parse `<cmd> --help` for options when the spec has none.
-    public var parseHelp: Bool
+    public let parseHelp: Bool
 
     enum CodingKeys: String, CodingKey { case name, description, subcommands, options, args, parseHelp }
 
@@ -152,38 +153,52 @@ extension KeyedDecodingContainer {
 }
 
 /// All known specs, keyed by command name. User specs override built-in ones.
-public final class SpecRegistry: @unchecked Sendable {
-    private var specs: [String: CompletionSpec] = [:]
-    private let lock = NSLock()
-    /// Imported Fig specs: command → (file, description). Loaded on first use.
-    private var lazyIndex: [String: (file: URL, description: String)] = [:]
-    private var lazyFailed: Set<String> = []
-    public private(set) var loadErrors: [String] = []
+public final class SpecRegistry: Sendable {
+    /// Imported Fig specs are indexed by name and loaded on first use.
+    private struct LazySpec: Sendable { let file: URL; let description: String }
+    private struct State: Sendable {
+        var specs: [String: CompletionSpec] = [:]
+        var lazyIndex: [String: LazySpec] = [:]
+        var lazyFailed: Set<String> = []
+        var loadErrors: [String] = []
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     public init() {}
 
+    public var loadErrors: [String] { state.withLock { $0.loadErrors } }
+
     public func spec(for command: String) -> CompletionSpec? {
-        lock.lock()
-        if let s = specs[command] { lock.unlock(); return s }
-        guard let entry = lazyIndex[command], !lazyFailed.contains(command) else { lock.unlock(); return nil }
-        lock.unlock()
-        guard let data = try? Data(contentsOf: entry.file),
+        enum Lookup { case found(CompletionSpec), lazy(URL), none }
+        let lookup: Lookup = state.withLock { st in
+            if let s = st.specs[command] { return .found(s) }
+            guard let entry = st.lazyIndex[command], !st.lazyFailed.contains(command) else { return .none }
+            return .lazy(entry.file)
+        }
+        let file: URL
+        switch lookup {
+        case .found(let s): return s
+        case .none: return nil
+        case .lazy(let f): file = f
+        }
+        // Read and decode outside the lock.
+        guard let data = try? Data(contentsOf: file),
               let spec = try? JSONDecoder().decode(CompletionSpec.self, from: data) else {
-            lock.withLock { _ = lazyFailed.insert(command) }
+            state.withLock { _ = $0.lazyFailed.insert(command) }
             return nil
         }
-        lock.withLock {
+        return state.withLock { st in
             // Hand-written specs registered earlier win over imported ones.
-            for n in spec.names where specs[n] == nil { specs[n] = spec }
+            for n in spec.names where st.specs[n] == nil { st.specs[n] = spec }
+            return st.specs[command]
         }
-        return lock.withLock { specs[command] }
     }
 
     /// A short description of a command, without loading its full spec.
     public func describe(_ command: String) -> String? {
-        lock.withLock {
-            if let d = specs[command]?.description, !d.isEmpty { return d }
-            if let d = lazyIndex[command]?.description, !d.isEmpty { return d }
+        state.withLock { st in
+            if let d = st.specs[command]?.description, !d.isEmpty { return d }
+            if let d = st.lazyIndex[command]?.description, !d.isEmpty { return d }
             return nil
         }
     }
@@ -192,21 +207,19 @@ public final class SpecRegistry: @unchecked Sendable {
     public func loadLazy(directory: URL) {
         guard let data = try? Data(contentsOf: directory.appendingPathComponent("index.json")),
               let raw = try? JSONSerialization.jsonObject(with: data) as? [String: [String: String]] else { return }
-        lock.withLock {
-            for (name, v) in raw {
-                guard let file = v["file"] else { continue }
-                lazyIndex[name] = (directory.appendingPathComponent(file + ".json"), v["description"] ?? "")
-            }
+        let entries = raw.compactMap { name, v -> (String, LazySpec)? in
+            guard let file = v["file"] else { return nil }
+            return (name, LazySpec(file: directory.appendingPathComponent(file + ".json"), description: v["description"] ?? ""))
         }
+        state.withLock { st in for (name, e) in entries { st.lazyIndex[name] = e } }
     }
 
-    public var lazyCount: Int { lock.withLock { lazyIndex.count } }
+    public var lazyCount: Int { state.withLock { $0.lazyIndex.count } }
 
-    public var commandNames: [String] { lock.lock(); defer { lock.unlock() }; return Array(specs.keys) }
+    public var commandNames: [String] { state.withLock { Array($0.specs.keys) } }
 
     public func register(_ spec: CompletionSpec) {
-        lock.lock(); defer { lock.unlock() }
-        for n in spec.names { specs[n] = spec }
+        state.withLock { st in for n in spec.names { st.specs[n] = spec } }
     }
 
     /// Loads every `*.json` spec file in a directory. Each file holds one spec or an array.
@@ -228,7 +241,8 @@ public final class SpecRegistry: @unchecked Sendable {
                 register(try JSONDecoder().decode(CompletionSpec.self, from: data))
             }
         } catch {
-            lock.lock(); loadErrors.append("\(file.lastPathComponent): \(error)"); lock.unlock()
+            let message = "\(file.lastPathComponent): \(error)"
+            state.withLock { $0.loadErrors.append(message) }
         }
     }
 

@@ -4,10 +4,15 @@ import AppKit
 final class BarView: NSView {
     var fill: NSColor = .windowBackgroundColor
     var separator: NSColor = .separatorColor
+    /// Sitting right under the output (no band; the line still marks where input starts).
+    var floating = false { didSet { if floating != oldValue { needsDisplay = true } } }
 
     override func draw(_ dirtyRect: NSRect) {
-        fill.setFill()
-        bounds.fill()
+        if !floating {
+            fill.setFill()
+            bounds.fill()
+        }
+        // A line across the top sets the input apart from the output above it.
         separator.setFill()
         NSRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1).fill()
     }
@@ -121,6 +126,10 @@ final class ChipView: NSView {
     /// Filled pill look (used for action chips like "Fix").
     var filled: NSColor? { didSet { needsDisplay = true } }
     var onClick: (() -> Void)?
+    /// The right-click (or ⌃-click) menu, if this chip has one.
+    var menuProvider: (() -> NSMenu?)?
+
+    override func menu(for event: NSEvent) -> NSMenu? { menuProvider?() ?? super.menu(for: event) }
 
     init() {
         super.init(frame: .zero)
@@ -199,6 +208,11 @@ enum PathDisplay {
     static func short(_ path: String, max: Int = 36) -> String {
         var p = path
         let home = NSHomeDirectory()
+        let tmp = (NSTemporaryDirectory() as NSString).standardizingPath
+        for t in [tmp, "/private" + tmp] where p == t || p.hasPrefix(t + "/") {
+            p = "$TMPDIR" + p.dropFirst(t.count)
+            break
+        }
         if p.hasPrefix(home) { p = "~" + p.dropFirst(home.count) }
         guard p.count > max else { return p }
         let parts = p.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
@@ -284,3 +298,4 @@ final class PaneHeaderView: NSView {
     @objc private func zoom() { if let pane { pane.windowController?.toggleZoom(pane) } }
     @objc private func close() { if let pane { pane.windowController?.closeAsking(pane) } }
 }
+

@@ -12,6 +12,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         /// Set when you rename the tab; otherwise the title follows the shell.
         var customTitle: String?
         var color: String?
+        /// Color from a matching profile (Settings → Profiles); a color you pick wins.
+        var profileColor: String?
+        /// What you type in one pane goes to every pane in this tab.
+        var broadcasting = false
         /// A command finished / failed here while you were looking elsewhere.
         var unseenDone = false
         var unseenFailure = false
@@ -22,7 +26,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
 
     /// A saved split layout: panes (with their folders) and splits.
     indirect enum Layout: Codable {
-        case pane(cwd: String)
+        /// `session`: the kept shell's id (anser-session), so it comes back after a restart.
+        case pane(cwd: String, session: String? = nil)
         case split(vertical: Bool, children: [Layout], sizes: [Double])
     }
 
@@ -37,12 +42,17 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     let sidebar = SidebarView()
     private var sidebarWidth: NSLayoutConstraint!
     static let sidebarDefaultWidth: CGFloat = 230
+    let notebookPanel = NotebookPanelView()
+    private var notebookWidth: NSLayoutConstraint!
+    var notebookPanelVisible: Bool { notebookWidth.constant > 0 }
     var sidebarVisible: Bool { sidebarWidth.constant > 0 }
     private let content = NSView()
-    private var picker: PickerPanel?
+    var picker: PickerPanel?
     private(set) var tabs: [Tab] = []
     private(set) var selectedIndex = 0
     private var tabBarHeight: NSLayoutConstraint!
+    /// The drop-down window from the global shortcut (not saved with the session).
+    var isQuickTerminal = false
 
     var selectedTab: Tab? { tabs.indices.contains(selectedIndex) ? tabs[selectedIndex] : nil }
     var focusedPane: PaneView? { selectedTab?.focusedPane ?? allPanes.first }
@@ -67,7 +77,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         window.contentView = container
         tabBar.controller = self
         sidebar.controller = self
-        for v in [tabBar, sidebar, content] {
+        notebookPanel.controller = self
+        for v in [tabBar, sidebar, content, notebookPanel] {
             v.translatesAutoresizingMaskIntoConstraints = false
             container.addSubview(v)
         }
@@ -76,6 +87,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         sidebarWidth = sidebar.widthAnchor.constraint(equalToConstant: showSidebar ? Self.sidebarDefaultWidth : 0)
         sidebarWidth.isActive = true
         sidebar.isHidden = !showSidebar
+        let showNotebook = UserDefaults.standard.bool(forKey: "AnserNotebookPanel") && ProcessInfo.processInfo.environment["ANSER_SELFTEST"] == nil
+        notebookWidth = notebookPanel.widthAnchor.constraint(equalToConstant: showNotebook ? NotebookPanelView.defaultWidth : 0)
+        notebookWidth.isActive = true
+        notebookPanel.isHidden = !showNotebook
+        if showNotebook { notebookPanel.reload() }
         NSLayoutConstraint.activate([
             tabBar.topAnchor.constraint(equalTo: container.topAnchor),
             tabBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -86,7 +102,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             sidebar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             sidebar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             content.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            content.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            content.trailingAnchor.constraint(equalTo: notebookPanel.leadingAnchor),
+            notebookPanel.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+            notebookPanel.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            notebookPanel.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             content.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
@@ -127,17 +146,17 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         tabBar.reload()
     }
 
-    private func makePane(cwd: String?) -> PaneView {
-        let p = PaneView(cwd: cwd)
+    private func makePane(cwd: String?, sessionID: String? = nil) -> PaneView {
+        let p = PaneView(cwd: cwd, sessionID: sessionID)
         p.windowController = self
         return p
     }
 
     private func build(_ node: Layout) -> NSView {
         switch node {
-        case let .pane(cwd):
+        case let .pane(cwd, session):
             let path = FileManager.default.fileExists(atPath: cwd) ? cwd : NSHomeDirectory()
-            return makePane(cwd: path)
+            return makePane(cwd: path, sessionID: session)
         case let .split(vertical, children, _):
             let split = makeSplit(vertical: vertical)
             for c in children { split.addArrangedSubview(build(c)) }
@@ -167,7 +186,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func layout(of root: NSView) -> Layout {
-        if let p = root as? PaneView { return .pane(cwd: p.session.cwd) }
+        if let p = root as? PaneView { return .pane(cwd: p.session.cwd, session: p.session.persistent ? p.session.id : nil) }
         if let s = root as? NSSplitView {
             let total = max(1, s.isVertical ? s.bounds.width : s.bounds.height)
             return .split(vertical: s.isVertical, children: s.arrangedSubviews.map(layout(of:)),
@@ -222,6 +241,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         // Set the final width directly (so it always takes effect), and let
         // the layout pass inside the animation group slide it in.
         sidebarWidth.constant = show ? Self.sidebarDefaultWidth : 0
+        tabBar.updateSidebarButton()
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.18
             ctx.allowsImplicitAnimation = true
@@ -232,6 +252,25 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         })
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST"] == nil {
             UserDefaults.standard.set(show, forKey: "AnserSidebar")
+        }
+    }
+
+    /// The Command Notebook panel on the right (⌥⌘N, or the book at the right of the tab bar).
+    func toggleNotebookPanel() {
+        let show = !notebookPanelVisible
+        if show { notebookPanel.isHidden = false; notebookPanel.reload() }
+        notebookWidth.constant = show ? NotebookPanelView.defaultWidth : 0
+        tabBar.updateSidebarButton()
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.18
+            ctx.allowsImplicitAnimation = true
+            window?.contentView?.layoutSubtreeIfNeeded()
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            if !self.notebookPanelVisible { self.notebookPanel.isHidden = true }
+        })
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST"] == nil {
+            UserDefaults.standard.set(show, forKey: "AnserNotebookPanel")
         }
     }
 
@@ -371,6 +410,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
 
     func beginRenamingSelectedTab() { tabBar.beginEditing(selectedIndex) }
 
+    /// Tests: a tab built from a saved layout (as session restore does).
+    func addTab(restoring layout: Layout) {
+        let tab = Tab(root: build(layout))
+        tabs.append(tab)
+        attach(tab.root)
+        selectTab(tabs.count - 1)
+    }
+
     func setTabColor(_ index: Int, _ color: String?) {
         guard tabs.indices.contains(index) else { return }
         tabs[index].color = color
@@ -457,7 +504,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: Splits
 
-    func split(_ pane: PaneView, vertical: Bool) {
+    /// Splits `pane` in two. `before`: the new pane goes on the left (or above) instead of right (or below).
+    func split(_ pane: PaneView, vertical: Bool, before: Bool = false) {
         guard let tab = tab(for: pane) else { return }
         if tab.zoom != nil { toggleZoom(tab.zoom!.pane) }
         let newPane = makePane(cwd: pane.session.cwd)
@@ -472,8 +520,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         } else {
             replaceRoot(of: tab, with: split)
         }
-        split.addArrangedSubview(pane)
-        split.addArrangedSubview(newPane)
+        split.addArrangedSubview(before ? newPane : pane)
+        split.addArrangedSubview(before ? pane : newPane)
         split.layoutSubtreeIfNeeded()
         let total = vertical ? split.bounds.width : split.bounds.height
         split.setPosition(total / 2, ofDividerAt: 0)
@@ -530,434 +578,6 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         tabBar.reload()
     }
 
-    // MARK: Pickers
-
-    func showHistorySearch(for pane: PaneView) {
-        let history = Services.shared.history
-        let sessionBlocks = pane.session.blocks
-        presentPicker(PickerPanel.Config(
-            title: "History",
-            placeholder: "Search every command you've run…",
-            scopes: HistoryScope.allCases.map(\.title),
-            hint: "⏎ edit   ⌘⏎ run   ⌘C copy   ⌥⏎ copy output   ⌘⌫ forget   ⇥ scope",
-            provider: { query, scope in
-                let scopeValue = HistoryScope(rawValue: scope) ?? .all
-                if scopeValue == .session {
-                    // This tab: every run in order, with exit status and timing.
-                    let blocks = Array(sessionBlocks.enumerated().reversed())
-                    return blocks.compactMap { idx, b -> PickerItem? in
-                        guard let m = Fuzzy.match(query, b.command) else { return nil }
-                        let ok = (b.exitCode ?? 0) == 0
-                        let outputIndex = sessionBlocks.count - 1 - idx
-                        return PickerItem(
-                            title: b.command,
-                            subtitle: "\(Self.relative(b.started)) · \(Self.shortPath(b.cwd))\(b.duration.map { " · " + Services.formatDuration($0) } ?? "")",
-                            accessory: ok ? "✓" : "✗ \(b.exitCode ?? 0)",
-                            accessoryColor: ok ? .systemGreen : .systemRed,
-                            positions: m.positions,
-                            payload: ["command": b.command, "output": outputIndex])
-                    }
-                }
-                return history.search(query, scope: scopeValue, cwd: pane.session.cwd, session: pane.session.id).map { c, m in
-                    let failed = (c.lastExit ?? 0) != 0
-                    return PickerItem(
-                        title: c.command,
-                        subtitle: "\(c.count)× · \(Self.relative(c.lastUsed))\(c.lastCwd.map { " · " + Self.shortPath($0) } ?? "")",
-                        accessory: c.lastExit == nil ? nil : (failed ? "✗" : "✓"),
-                        accessoryColor: failed ? .systemRed : .systemGreen,
-                        positions: m.positions,
-                        payload: ["command": c.command])
-                }
-            },
-            onAccept: { [weak pane] item, mods in
-                guard let pane, let payload = item.payload as? [String: Any], let cmd = payload["command"] as? String else { return }
-                if mods.contains(.option), let idx = payload["output"] as? Int {
-                    if let out = pane.output(ofBlock: pane.session.blocks.count - 1 - idx) { Self.copy(out) } else { NSSound.beep() }
-                    return
-                }
-                if mods.contains(.command) { pane.insertIntoEditor(cmd, run: true) } else { pane.insertIntoEditor(cmd) }
-            },
-            onCopy: { item in (item.payload as? [String: Any])?["command"] as? String },
-            onDelete: { item in
-                if let cmd = (item.payload as? [String: Any])?["command"] as? String { history.delete(command: cmd) }
-            },
-            preview: { [weak pane] item in
-                guard let payload = item.payload as? [String: Any], let cmd = payload["command"] as? String else { return nil }
-                if let idx = payload["output"] as? Int, let pane, let out = pane.output(ofBlock: pane.session.blocks.count - 1 - idx) {
-                    return PickerPanel.previewText("$ " + cmd + "\n\n" + out)
-                }
-                let c = history.search(cmd, scope: .all, limit: 50).first { $0.0.command == cmd }?.0
-                var lines = ["$ " + cmd, ""]
-                if let c {
-                    lines.append("Run \(c.count) time\(c.count == 1 ? "" : "s"), last \(Self.relative(c.lastUsed))")
-                    if let e = c.lastExit { lines.append(e == 0 ? "Last run succeeded" : "Last run failed with exit \(e)") }
-                    if !c.cwds.isEmpty { lines += ["", "Folders:"] + c.cwds.sorted().prefix(12).map { "  " + Self.shortPath($0) } }
-                }
-                return PickerPanel.previewText(lines.joined(separator: "\n"))
-            }), pane: pane)
-    }
-
-    /// Every command run in this tab, newest first: jump to it, copy its output, or re-run it.
-    func showBlocks(for pane: PaneView) {
-        let blocks = pane.session.blocks
-        presentPicker(PickerPanel.Config(
-            title: "Commands in this tab",
-            placeholder: "Filter commands…",
-            scopes: ["All", "Failed", "Slow (>5s)"],
-            hint: "⏎ jump to it   ⌘C copy output   ⌥⏎ copy command   ⌘⏎ run again",
-            provider: { query, scope in
-                blocks.enumerated().reversed().compactMap { idx, b -> PickerItem? in
-                    if scope == 1, (b.exitCode ?? 0) == 0 { return nil }
-                    if scope == 2, (b.duration ?? 0) < 5 { return nil }
-                    guard let m = Fuzzy.match(query, b.command) else { return nil }
-                    let ok = (b.exitCode ?? 0) == 0
-                    return PickerItem(
-                        title: b.command,
-                        subtitle: "\(Self.relative(b.started)) · \(Self.shortPath(b.cwd))\(b.duration.map { " · " + Services.formatDuration($0) } ?? "")",
-                        accessory: ok ? "✓" : "✗ \(b.exitCode ?? 0)",
-                        accessoryColor: ok ? .systemGreen : .systemRed,
-                        positions: m.positions,
-                        payload: (b.command, blocks.count - 1 - idx))
-                }
-            },
-            onAccept: { [weak pane] item, mods in
-                guard let pane, let (cmd, index) = item.payload as? (String, Int) else { return }
-                if mods.contains(.command) { pane.insertIntoEditor(cmd, run: true); return }
-                if mods.contains(.option) { Self.copy(cmd); return }
-                pane.surfaceView.binding("scroll_to_bottom")
-                pane.surfaceView.binding("jump_to_prompt:-\(index + 1)")
-            },
-            onCopy: { [weak pane] item in
-                guard let (_, index) = item.payload as? (String, Int) else { return nil }
-                guard let pane else { return nil }
-                return pane.output(ofBlock: pane.session.blocks.count - 1 - index)
-            },
-            onDelete: nil,
-            preview: { [weak pane] item in
-                guard let (cmd, index) = item.payload as? (String, Int) else { return nil }
-                let out = pane.flatMap { $0.output(ofBlock: $0.session.blocks.count - 1 - index) } ?? "(output not available)"
-                return PickerPanel.previewText("$ " + cmd + "\n\n" + out)
-            }), pane: pane)
-    }
-
-    /// Folders found by the disk scan, kept for a minute so ⌘J reopens instantly.
-    private static var folderScan: (date: Date, root: String, paths: [String])?
-    static func resetFolderScanCache() { folderScan = nil }
-
-    /// Jump to a folder: ones you've used, `cd` targets from your shell
-    /// history, and a quick scan of this folder and your home folder.
-    func showFolderJumper(for pane: PaneView) {
-        guard !pane.session.isRemote else { NSSound.beep(); return }
-        let fm = FileManager.default
-        let home = NSHomeDirectory()
-        let current = pane.session.cwd
-        let history = Services.shared.history
-
-        final class Box: @unchecked Sendable { var candidates: [FolderIndex.Candidate] = []; var scanning = true }
-        let box = Box()
-        var seen = Set<String>([current])
-        func add(_ path: String, _ boost: Double, _ note: String?) {
-            guard seen.insert(path).inserted else { return }
-            box.candidates.append(.init(path: path, boost: boost, note: note))
-        }
-        // 1. Folders you've used in Anser (strongest signal).
-        for (i, d) in history.recentDirectories(limit: 200).enumerated() where fm.fileExists(atPath: d.path) {
-            add(d.path, max(1, 6 - Double(i) * 0.05), "\(d.count) command\(d.count == 1 ? "" : "s") · \(Self.relative(d.last))")
-        }
-        // 2. Absolute folders from cd/pushd in your shell history.
-        let cdCommands = history.recentCommands(withPrefix: "cd ", limit: 3000) + history.recentCommands(withPrefix: "pushd ", limit: 500)
-        for p in FolderIndex.cdTargets(from: cdCommands, home: home) {
-            var isDir: ObjCBool = false
-            if fm.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue { add(p, 1.5, "from your shell history") }
-        }
-        add(home, 1, "home")
-        // 3. Recent scan, if fresh.
-        if let cached = Self.folderScan, Date().timeIntervalSince(cached.date) < 60, cached.root == current {
-            cached.paths.forEach { add($0, 0, nil) }
-            box.scanning = false
-        }
-
-        let picker = presentPickerReturning(PickerPanel.Config(
-            title: "Jump to folder",
-            placeholder: "Type part of a folder name, or a path like ~/dev…",
-            scopes: [],
-            hint: "⏎ cd there   ⌘⏎ new tab there   ⌥⏎ open in Finder   ⌘C copy path",
-            provider: { query, _ in
-                var items: [PickerItem] = []
-                // A typed path that exists goes first.
-                var typed = query.trimmingCharacters(in: .whitespaces)
-                if typed.hasPrefix("~") { typed = home + typed.dropFirst() }
-                var isDir: ObjCBool = false
-                if typed.hasPrefix("/"), fm.fileExists(atPath: typed, isDirectory: &isDir), isDir.boolValue {
-                    items.append(PickerItem(title: Self.shortPath(typed), subtitle: "typed path", accessory: "go", accessoryColor: .systemGreen,
-                                            positions: [], payload: (typed as NSString).standardizingPath))
-                }
-                for (c, m, shown) in FolderIndex.rank(query, box.candidates, home: home) {
-                    let inHere = c.path.hasPrefix(current + "/")
-                    let sub = c.note ?? (inHere ? "inside " + (current as NSString).lastPathComponent : nil)
-                    items.append(PickerItem(title: shown, subtitle: sub, accessory: nil, accessoryColor: nil, positions: m.positions, payload: c.path))
-                }
-                if items.isEmpty && box.scanning {
-                    items.append(PickerItem(title: "Searching folders…", subtitle: nil, accessory: nil, accessoryColor: nil, positions: [], payload: ""))
-                }
-                return items
-            },
-            onAccept: { [weak self, weak pane] item, mods in
-                guard let pane, let path = item.payload as? String, !path.isEmpty else { return }
-                if mods.contains(.option) { NSWorkspace.shared.open(URL(fileURLWithPath: path)); return }
-                if mods.contains(.command) || !pane.session.atPrompt { self?.addTab(cwd: path); return }
-                pane.run("cd " + ShellLexer.escape(path))
-            },
-            onCopy: { ($0.payload as? String).flatMap { $0.isEmpty ? nil : $0 } },
-            onDelete: nil,
-            preview: { item in
-                guard let path = item.payload as? String, !path.isEmpty else { return nil }
-                let entries = ((try? FileManager.default.contentsOfDirectory(atPath: path)) ?? [])
-                    .filter { !$0.hasPrefix(".") }.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-                var lines = [Self.shortPath(path), ""]
-                for e in entries.prefix(80) {
-                    var isDir: ObjCBool = false
-                    FileManager.default.fileExists(atPath: path + "/" + e, isDirectory: &isDir)
-                    lines.append((isDir.boolValue ? "▸ " : "  ") + e + (isDir.boolValue ? "/" : ""))
-                }
-                if entries.count > 80 { lines.append("  … \(entries.count - 80) more") }
-                return PickerPanel.previewText(lines.joined(separator: "\n"))
-            }), pane: pane)
-
-        // 4. Scan the disk in the background, then refresh the list.
-        guard box.scanning else { return }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let found = FolderIndex.scan(roots: [(current, 4), (home, 3)], limit: 15000, deadline: Date().addingTimeInterval(2.0))
-            DispatchQueue.main.async { [weak picker] in
-                Self.folderScan = (Date(), current, found)
-                found.forEach { add($0, 0, nil) }
-                box.scanning = false
-                picker?.refresh()
-            }
-        }
-    }
-
-    /// Branches, most recent first. Enter switches; typing a new name offers to create it.
-    func showBranchSwitcher(for pane: PaneView) {
-        guard pane.session.gitBranch != nil else { NSSound.beep(); return }
-        let current = pane.session.gitBranch ?? ""
-        Task { @MainActor [weak self, weak pane] in
-            guard let pane else { return }
-            let locals = await Generators.run("git_local_branches", cwd: pane.session.cwd, env: pane.session.env)
-            let remotes = await Generators.run("git_remote_branches", cwd: pane.session.cwd, env: pane.session.env)
-            let localNames = Set(locals.map(\.name))
-            // Remote branches that already exist locally add nothing.
-            let branches = locals + remotes.filter { r in !localNames.contains(String(r.name.split(separator: "/", maxSplits: 1).last ?? "")) }
-            let remoteNames = Set(remotes.map(\.name))
-            self?.presentPicker(PickerPanel.Config(
-                title: "Switch branch  ·  on \(current)",
-                placeholder: "Find a branch, or type a new name to create it…",
-                scopes: ["All", "Local", "Remote"],
-                hint: "⏎ switch   ⌥⏎ put name in editor   ⌘C copy name",
-                provider: { query, scope in
-                    var items: [PickerItem] = []
-                    let q = query.trimmingCharacters(in: .whitespaces)
-                    let known = Set(branches.map(\.name))
-                    if !q.isEmpty, !known.contains(q), !q.contains(" ") {
-                        items.append(PickerItem(title: "Create branch “\(q)”", subtitle: "git switch -c \(q)", accessory: "new",
-                                                accessoryColor: .systemGreen, positions: [], payload: ("create", q)))
-                    }
-                    for b in branches {
-                        let remote = remoteNames.contains(b.name) && !localNames.contains(b.name)
-                        if scope == 1 && remote { continue }
-                        if scope == 2 && !remote { continue }
-                        guard let m = Fuzzy.match(q, b.name) else { continue }
-                        let isCurrent = b.name == current
-                        items.append(PickerItem(title: b.name, subtitle: b.description, accessory: isCurrent ? "● current" : (remote ? "remote" : nil),
-                                                accessoryColor: isCurrent ? .systemGreen : nil, positions: m.positions, payload: ("switch", b.name)))
-                    }
-                    return items
-                },
-                onAccept: { [weak pane] item, mods in
-                    guard let pane, let (kind, name) = item.payload as? (String, String) else { return }
-                    // "origin/feature" → switch to a local "feature" that tracks it.
-                    let target = kind == "switch" && remoteNames.contains(name) && !localNames.contains(name)
-                        ? String(name.split(separator: "/", maxSplits: 1).last ?? Substring(name)) : name
-                    let cmd = kind == "create" ? "git switch -c " + ShellLexer.escape(target) : "git switch " + ShellLexer.escape(target)
-                    if mods.contains(.option) { pane.insertIntoEditor(pane.editor.string + target); return }
-                    if pane.session.atPrompt { pane.run(cmd) } else { NSSound.beep() }
-                },
-                onCopy: { item in (item.payload as? (String, String))?.1 },
-                onDelete: nil,
-                preview: { [weak pane] item in
-                    guard let pane, let (kind, name) = item.payload as? (String, String) else { return nil }
-                    if kind == "create" { return PickerPanel.previewText("Creates a new branch “\(name)” from \(current) and switches to it.") }
-                    let log = await ScriptRunner.shared.run("git log --format='%h  %s  (%cr, %an)' -25 \(ShellLexer.escape(name)) --",
-                                                            cwd: pane.session.cwd, env: pane.session.env, timeout: 3)
-                    let counts = await ScriptRunner.shared.run("git rev-list --left-right --count \(ShellLexer.escape(current))...\(ShellLexer.escape(name)) 2>/dev/null",
-                                                               cwd: pane.session.cwd, env: pane.session.env, timeout: 3)
-                    var head = name
-                    let parts = (counts ?? "").split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" })
-                    if parts.count == 2, name != current { head += "  ·  \(parts[1]) ahead, \(parts[0]) behind \(current)" }
-                    return PickerPanel.previewText(head + "\n\n" + (log ?? ""))
-                }), pane: pane)
-        }
-    }
-
-    /// Changed files in the repo: view the diff, stage/unstage, or open.
-    func showChanges(for pane: PaneView) {
-        guard pane.session.gitBranch != nil else { NSSound.beep(); return }
-        Task { @MainActor [weak self, weak pane] in
-            guard let pane else { return }
-            let changes = await Generators.gitChanges(cwd: pane.session.cwd, env: pane.session.env)
-            guard !changes.isEmpty else { NSSound.beep(); return }
-            self?.presentPicker(PickerPanel.Config(
-                title: "Changed files  ·  \(changes.count)",
-                placeholder: "Filter changed files…",
-                scopes: ["All", "Unstaged", "Staged"],
-                hint: "⏎ show diff   ⌘⏎ stage / unstage   ⌥⏎ open in $EDITOR   ⌘C copy path",
-                provider: { query, scope in
-                    changes.compactMap { c in
-                        if scope == 1 && c.staged && !c.untracked { return nil }
-                        if scope == 2 && !c.staged { return nil }
-                        guard let m = Fuzzy.match(query, c.path) else { return nil }
-                        let color: NSColor = c.untracked ? .systemGreen : (c.code.contains("D") ? .systemRed : .systemOrange)
-                        return PickerItem(title: c.path, subtitle: c.summary, accessory: c.code.trimmingCharacters(in: .whitespaces),
-                                          accessoryColor: color, positions: m.positions, payload: c)
-                    }
-                },
-                onAccept: { [weak pane] item, mods in
-                    guard let pane, let c = item.payload as? GitChange else { return }
-                    guard pane.session.atPrompt else { NSSound.beep(); return }
-                    let f = ShellLexer.escape(c.path)
-                    if mods.contains(.command) {
-                        pane.run(c.staged ? "git restore --staged -- \(f)" : "git add -- \(f)")
-                    } else if mods.contains(.option) {
-                        pane.run("${VISUAL:-${EDITOR:-vi}} \(f)")
-                    } else if c.untracked {
-                        pane.run("cat -- \(f)")
-                    } else {
-                        pane.run(c.staged ? "git diff --cached -- \(f)" : "git diff -- \(f)")
-                    }
-                },
-                onCopy: { ($0.payload as? GitChange)?.path },
-                onDelete: nil,
-                preview: { [weak pane] item in
-                    guard let pane, let c = item.payload as? GitChange else { return nil }
-                    let f = ShellLexer.escape(c.path)
-                    if c.untracked {
-                        let text = (try? String(contentsOfFile: (pane.session.cwd as NSString).appendingPathComponent(c.path), encoding: .utf8)) ?? "(binary or unreadable file)"
-                        return PickerPanel.previewText("New file: \(c.path)\n\n" + String(text.prefix(20000)))
-                    }
-                    let diff = await ScriptRunner.shared.run(c.staged ? "git diff --cached -- \(f)" : "git diff -- \(f)",
-                                                             cwd: pane.session.cwd, env: pane.session.env, timeout: 3)
-                    return PickerPanel.previewText(diff ?? "", diff: true)
-                }), pane: pane)
-        }
-    }
-
-    func showClipboardHistory(for pane: PaneView) {
-        let clip = Services.shared.clipboard
-        presentPicker(PickerPanel.Config(
-            title: "Clipboard",
-            placeholder: "Search clipboard history…",
-            scopes: [],
-            hint: "⏎ insert   ⌘⏎ paste into terminal   ⌘C copy   ⌘⌫ remove",
-            provider: { query, _ in
-                clip.items.compactMap { item in
-                    let oneLine = item.text.replacingOccurrences(of: "\n", with: " ⏎ ")
-                    guard let m = Fuzzy.match(query, oneLine) else { return nil }
-                    let lines = item.text.components(separatedBy: "\n").count
-                    return PickerItem(title: String(oneLine.prefix(300)), subtitle: "\(Self.relative(item.date))\(lines > 1 ? " · \(lines) lines" : "") · \(item.text.count) chars",
-                                      accessory: nil, accessoryColor: nil, positions: m.positions, payload: item.text)
-                }
-            },
-            onAccept: { [weak pane] item, mods in
-                guard let pane, let text = item.payload as? String else { return }
-                if mods.contains(.command) || !pane.editorUsable { pane.surfaceView.sendText(text) } else { pane.insertIntoEditor(text) }
-            },
-            onCopy: { $0.payload as? String },
-            onDelete: { item in if let t = item.payload as? String { clip.remove(t) } }), pane: pane)
-    }
-
-    func showCommandPalette(for pane: PaneView) {
-        let cfg = Services.shared.config
-        let shortcuts = AppDelegate.shared.shortcutLabels
-        presentPicker(PickerPanel.Config(
-            title: "Commands",
-            placeholder: "Run an action or insert a snippet…",
-            scopes: [],
-            hint: "⏎ run",
-            provider: { query, _ in
-                var out: [(PickerItem, Int)] = []
-                let recent = Self.recentActions
-                for a in AnserAction.allCases {
-                    if let m = Fuzzy.match(query, a.title) {
-                        // Recently used actions float to the top.
-                        let boost = recent.firstIndex(of: a.rawValue).map { 400 - $0 * 40 } ?? 0
-                        let accessory = shortcuts[a] ?? (boost > 0 ? "recent" : nil)
-                        out.append((PickerItem(title: a.title, subtitle: boost > 0 && query.isEmpty ? "recently used" : nil, accessory: accessory,
-                                               accessoryColor: nil, positions: m.positions, payload: a), m.score + 5 + boost))
-                    }
-                }
-                for s in cfg.snippets {
-                    if let m = Fuzzy.match(query, s.name) ?? Fuzzy.match(query, s.command) {
-                        out.append((PickerItem(title: s.name, subtitle: s.command, accessory: "snippet", accessoryColor: .systemYellow, positions: Fuzzy.match(query, s.name)?.positions ?? [], payload: s), m.score))
-                    }
-                }
-                return out.sorted { $0.1 > $1.1 }.map(\.0)
-            },
-            onAccept: { [weak pane] item, _ in
-                guard let pane else { return }
-                if let a = item.payload as? AnserAction { Self.noteRecentAction(a); AppDelegate.shared.perform(a, pane: pane) }
-                if let s = item.payload as? AnserConfig.Snippet { pane.insertIntoEditor(s.command) }
-            },
-            onCopy: { item in (item.payload as? AnserConfig.Snippet)?.command },
-            onDelete: nil), pane: pane)
-    }
-
-    static var recentActions: [String] { UserDefaults.standard.stringArray(forKey: "AnserRecentActions") ?? [] }
-
-    static func noteRecentAction(_ a: AnserAction) {
-        guard ProcessInfo.processInfo.environment["ANSER_SELFTEST"] == nil else { return }
-        var list = recentActions.filter { $0 != a.rawValue }
-        list.insert(a.rawValue, at: 0)
-        UserDefaults.standard.set(Array(list.prefix(8)), forKey: "AnserRecentActions")
-    }
-
-    func showPicker(_ config: PickerPanel.Config, pane: PaneView) { presentPicker(config, pane: pane) }
-
-    /// Like presentPicker, but returns the panel (for live updates).
-    @discardableResult
-    private func presentPickerReturning(_ config: PickerPanel.Config, pane: PaneView) -> PickerPanel? {
-        presentPicker(config, pane: pane)
-        return picker
-    }
-
-    private func presentPicker(_ config: PickerPanel.Config, pane: PaneView) {
-        picker?.close()
-        guard let window else { return }
-        let p = PickerPanel(config: config)
-        p.onClose = { [weak self, weak pane] in
-            self?.picker = nil
-            pane?.focus()
-        }
-        picker = p
-        p.present(over: window)
-    }
-
-    static func copy(_ s: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(s, forType: .string)
-    }
-
-    static func relative(_ d: Date) -> String {
-        if d.timeIntervalSince1970 < 1 { return "imported" }
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .short
-        return f.localizedString(for: d, relativeTo: Date())
-    }
-
-    static func shortPath(_ p: String) -> String {
-        let home = NSHomeDirectory()
-        return p.hasPrefix(home) ? "~" + p.dropFirst(home.count) : p
-    }
-
     // MARK: Window
 
     func windowDidBecomeKey(_ notification: Notification) {
@@ -995,5 +615,40 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         picker?.close()
         allPanesEverywhere.forEach { $0.teardown() }
         AppDelegate.shared.windowClosed(self)
+    }
+}
+
+
+/// Local and remote branches for the switcher. A class, so a background
+/// fetch can update the list the open picker reads.
+@MainActor
+final class BranchList {
+    private(set) var locals: [Suggestion] = []
+    private(set) var remotes: [Suggestion] = []
+    private(set) var remoteNames: [String] = []
+    var hasRemotes: Bool { !remoteNames.isEmpty }
+
+    func load(cwd: String, env: ShellEnvironment) async {
+        locals = await Generators.run("git_local_branches", cwd: cwd, env: env)
+        remotes = await Generators.run("git_remote_branches", cwd: cwd, env: env)
+        remoteNames = (await ScriptRunner.shared.run("git remote", cwd: cwd, env: env) ?? "")
+            .split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        // Remote names come first ("origin/feature"); drop bare "origin" (its HEAD).
+        remotes = remotes.filter { r in !remoteNames.contains(r.name) && r.name.contains("/") }
+    }
+
+    /// `git fetch` from every remote. Never asks for a password (it fails instead).
+    /// Returns true when it failed or timed out.
+    func fetch(cwd: String, env: ShellEnvironment) async -> Bool {
+        let out = await ScriptRunner.shared.run(
+            "GIT_SSH_COMMAND=\"${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=8}\" git fetch --all --prune --quiet 2>&1; echo \"exit=$?\"",
+            cwd: cwd, env: env, timeout: 25)
+        Generators.forgetCache(cwd: cwd)
+        return !(out ?? "").contains("exit=0")
+    }
+
+    /// "origin/feature/x" → "feature/x".
+    nonisolated static func shortName(_ remoteBranch: String) -> String {
+        String(remoteBranch.split(separator: "/", maxSplits: 1).last ?? Substring(remoteBranch))
     }
 }

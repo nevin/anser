@@ -1,15 +1,45 @@
 import Foundation
 
-/// Optional AI help through the Claude API (Messages API over HTTPS; Swift has
-/// no official Anthropic SDK). Nothing is sent unless the user asks:
+/// Optional AI help, from Claude (the Claude API over HTTPS; Swift has no
+/// official Anthropic SDK), GitHub Copilot (the `copilot` command-line tool,
+/// with every tool turned off so it can only answer) or a local model through
+/// Ollama (nothing leaves the Mac). Nothing is sent unless the user asks:
 /// "Explain this error" or "Generate a command".
-public final class AIHelp: @unchecked Sendable {
+public final class AIHelp: Sendable {
+    public enum Provider: String, CaseIterable, Sendable {
+        case claude, copilot, ollama
+        public var displayName: String {
+            switch self {
+            case .claude: "Claude"
+            case .copilot: "GitHub Copilot"
+            case .ollama: "Local AI"
+            }
+        }
+        /// Where the request goes, for the privacy note.
+        public var destination: String {
+            switch self {
+            case .claude: "Sent to Anthropic"
+            case .copilot: "Sent to GitHub Copilot"
+            case .ollama: "Sent to Ollama on this Mac (nothing leaves it)"
+            }
+        }
+    }
+
+    /// Runs the Copilot CLI: (argv, timeout) → (exit status, output, timed out). Replaceable in tests.
+    public typealias CopilotRunner = @Sendable ([String], TimeInterval) async -> (status: Int32?, output: String, timedOut: Bool)
+
     public enum AIError: Error, LocalizedError, Equatable {
         case noAPIKey
         case refused(String?)
         case http(Int, String)
         case badResponse
         case network(String)
+        case copilotNotInstalled
+        case copilotNotSignedIn
+        case copilot(String)
+        case ollamaNotRunning
+        case ollamaNoModel
+        case ollama(String)
 
         public var errorDescription: String? {
             switch self {
@@ -18,6 +48,12 @@ public final class AIHelp: @unchecked Sendable {
             case .http(let code, let msg): "The Claude API returned an error (\(code)): \(msg)"
             case .badResponse: "Couldn't read the response from the Claude API."
             case .network(let m): "Couldn't reach the Claude API: \(m)"
+            case .copilotNotInstalled: "GitHub Copilot CLI isn't installed. Install it with: brew install --cask copilot-cli"
+            case .copilotNotSignedIn: "Sign in to GitHub Copilot first: Settings → AI → Sign In… (runs copilot login)."
+            case .copilot(let m): "GitHub Copilot: \(m)"
+            case .ollamaNotRunning: "Ollama isn't running. Install it (brew install ollama), then start it: Settings → AI → Start Ollama."
+            case .ollamaNoModel: "Ollama has no models yet. Settings → AI → Get a Model… downloads one."
+            case .ollama(let m): "Ollama: \(m)"
             }
         }
     }
@@ -36,15 +72,59 @@ public final class AIHelp: @unchecked Sendable {
     public static let model = "claude-opus-5-5"
     public static let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
 
+    public let provider: Provider
     private let apiKey: @Sendable () -> String?
     private let transport: Transport
+    private let copilotPath: @Sendable () -> String?
+    private let copilotModel: String?
+    private let copilotRunner: CopilotRunner
+    private let ollamaBase: URL
+    private let ollamaModel: String?
 
+    public static let defaultOllamaURL = URL(string: "http://localhost:11434")!
+
+    /// Claude, through the Claude API with your key.
     public init(apiKey: @escaping @Sendable () -> String?, transport: Transport? = nil) {
+        provider = .claude
         self.apiKey = apiKey
         self.transport = transport ?? { req in
             let (data, resp) = try await URLSession.shared.data(for: req)
             return ((resp as? HTTPURLResponse)?.statusCode ?? 0, data)
         }
+        copilotPath = { nil }
+        copilotModel = nil
+        copilotRunner = Self.runCopilot
+        ollamaBase = Self.defaultOllamaURL
+        ollamaModel = nil
+    }
+
+    /// A local model through Ollama's HTTP API. Requests stay on this Mac.
+    public init(ollamaURL: URL? = nil, ollamaModel model: String?, transport: Transport? = nil) {
+        provider = .ollama
+        apiKey = { nil }
+        self.transport = transport ?? Self.urlSession
+        copilotPath = { nil }
+        copilotModel = nil
+        copilotRunner = Self.runCopilot
+        ollamaBase = ollamaURL ?? Self.defaultOllamaURL
+        ollamaModel = model.flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+    }
+
+    static let urlSession: Transport = { req in
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        return ((resp as? HTTPURLResponse)?.statusCode ?? 0, data)
+    }
+
+    /// GitHub Copilot, through the `copilot` CLI and its own sign-in.
+    public init(copilotPath: @escaping @Sendable () -> String? = { AIHelp.findCopilot() }, model: String? = nil, runner: CopilotRunner? = nil) {
+        provider = .copilot
+        apiKey = { nil }
+        transport = { _ in (0, Data()) }
+        self.copilotPath = copilotPath
+        copilotModel = model.flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+        copilotRunner = runner ?? Self.runCopilot
+        ollamaBase = Self.defaultOllamaURL
+        ollamaModel = nil
     }
 
     // MARK: Requests
@@ -117,6 +197,8 @@ public final class AIHelp: @unchecked Sendable {
     }
 
     private func send(_ prompt: String, effort: String) async throws -> Answer {
+        if provider == .copilot { return try await sendCopilot(prompt, effort: effort) }
+        if provider == .ollama { return try await sendOllama(prompt) }
         guard let key = apiKey(), !key.isEmpty else { throw AIError.noAPIKey }
         var req = URLRequest(url: Self.endpoint)
         req.httpMethod = "POST"
@@ -145,6 +227,142 @@ public final class AIHelp: @unchecked Sendable {
         let text = blocks.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n")
         guard !text.isEmpty else { throw AIError.badResponse }
         return Answer(text: text, commands: codeBlocks(text), model: json["model"] as? String)
+    }
+
+    // MARK: Ollama (local)
+
+    /// Installed Ollama models, or nil when Ollama isn't reachable.
+    public static func ollamaModels(base: URL = defaultOllamaURL, transport: Transport? = nil) async -> [String]? {
+        var req = URLRequest(url: base.appendingPathComponent("api/tags"))
+        req.timeoutInterval = 3
+        guard let (status, data) = try? await (transport ?? urlSession)(req), (200..<300).contains(status),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return (json["models"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }
+    }
+
+    /// The JSON body for an Ollama chat request (exposed for tests).
+    public static func ollamaBody(prompt: String, model: String) -> [String: Any] {
+        ["model": model, "stream": false, "options": ["temperature": 0.2],
+         "messages": [["role": "system", "content": system], ["role": "user", "content": prompt]]]
+    }
+
+    private func sendOllama(_ prompt: String) async throws -> Answer {
+        var model = ollamaModel
+        if model == nil {
+            guard let installed = await Self.ollamaModels(base: ollamaBase, transport: transport) else { throw AIError.ollamaNotRunning }
+            guard let first = installed.first else { throw AIError.ollamaNoModel }
+            model = first
+        }
+        var req = URLRequest(url: ollamaBase.appendingPathComponent("api/chat"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 300
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: Self.ollamaBody(prompt: prompt, model: model!))
+        let (status, data): (Int, Data)
+        do { (status, data) = try await transport(req) } catch {
+            let ns = error as NSError
+            if ns.domain == NSURLErrorDomain, [NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost, NSURLErrorNetworkConnectionLost].contains(ns.code) {
+                throw AIError.ollamaNotRunning
+            }
+            throw AIError.ollama(error.localizedDescription)
+        }
+        return try Self.parseOllama(status: status, data: data)
+    }
+
+    /// Reads an Ollama /api/chat reply.
+    public static func parseOllama(status: Int, data: Data) throws -> Answer {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw AIError.badResponse }
+        if let err = json["error"] as? String {
+            if err.lowercased().contains("not found") { throw AIError.ollama("\(err). Pick an installed model in Settings → AI.") }
+            throw AIError.ollama(err)
+        }
+        guard (200..<300).contains(status) else { throw AIError.ollama("HTTP \(status)") }
+        var text = ((json["message"] as? [String: Any])?["content"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        // Reasoning models put their thinking in <think>…</think>; keep only the answer.
+        if let r = text.range(of: "</think>") { text = String(text[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard !text.isEmpty else { throw AIError.badResponse }
+        return Answer(text: text, commands: codeBlocks(text), model: (json["model"] as? String).map { "Local · \($0)" } ?? "Local AI")
+    }
+
+    // MARK: GitHub Copilot
+
+    /// The arguments for one answer-only Copilot run (exposed for tests).
+    /// No tools (no shell, no file edits, no MCP servers): it can only reply.
+    public static func copilotArguments(path: String, prompt: String, effort: String, model: String?) -> [String] {
+        // (No --reasoning-effort: Copilot rejects it when it picks the model itself.)
+        var a = [path, "-s", "-p", system + "\n\n" + prompt,
+                 "--disable-builtin-mcps", "--disable-client-telemetry", "--stream", "off",
+                 // JSON events keep the answer's Markdown (the text mode reformats code blocks).
+                 "--output-format", "json"]
+        if let model { a += ["--model", model] }
+        // Last, because it takes a list: an empty list means no tools at all.
+        a.append("--available-tools")
+        return a
+    }
+
+    private func sendCopilot(_ prompt: String, effort: String) async throws -> Answer {
+        guard let path = copilotPath() else { throw AIError.copilotNotInstalled }
+        let args = Self.copilotArguments(path: path, prompt: prompt, effort: effort, model: copilotModel)
+        let r = await copilotRunner(args, 120)
+        return try Self.parseCopilot(status: r.status, output: r.output, timedOut: r.timedOut)
+    }
+
+    /// Reads a Copilot CLI run (JSON events, one per line): the assistant's
+    /// messages are the answer; anything else on a failed run is the error.
+    public static func parseCopilot(status: Int32?, output: String, timedOut: Bool) throws -> Answer {
+        if timedOut { throw AIError.copilot("no answer within 2 minutes.") }
+        var messages: [String] = [], model: String?, other: [String] = []
+        for line in output.split(separator: "\n") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty { other.append(t) }
+                continue
+            }
+            let data = obj["data"] as? [String: Any]
+            switch obj["type"] as? String {
+            case "assistant.message":
+                if let c = data?["content"] as? String, !c.isEmpty { messages.append(c) }
+                if let m = data?["model"] as? String { model = m }
+            case let t? where t.hasSuffix("error"):
+                if let m = data?["message"] as? String { other.append(m) }
+            default: break
+            }
+        }
+        let text = messages.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if status != 0 || text.isEmpty {
+            let detail = other.joined(separator: " ")
+            let l = detail.lowercased()
+            if l.contains("login") || l.contains("log in") || l.contains("sign in") || l.contains("not authenticated") || l.contains("authenticate") {
+                throw AIError.copilotNotSignedIn
+            }
+            if status == 0 { throw AIError.badResponse }
+            throw AIError.copilot(detail.isEmpty ? "it stopped with exit code \(status.map(String.init) ?? "?")." : String(detail.suffix(300)))
+        }
+        return Answer(text: text, commands: codeBlocks(text), model: model.map { "GitHub Copilot · \($0)" } ?? "GitHub Copilot")
+    }
+
+    /// Where the `copilot` command is, if installed.
+    public static func findCopilot(path: [String] = ShellEnvironment.defaultPath) -> String? {
+        let extra = [NSHomeDirectory() + "/.local/bin", NSHomeDirectory() + "/.npm-global/bin"]
+        for dir in path + extra {
+            let f = dir + "/copilot"
+            if FileManager.default.isExecutableFile(atPath: f) { return f }
+        }
+        return nil
+    }
+
+    /// Runs Copilot from an empty folder, so no project's instructions or files are read.
+    static let runCopilot: CopilotRunner = { argv, timeout in
+        await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("anser-copilot")
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                var env = ProcessInfo.processInfo.environment
+                env["NO_COLOR"] = "1"
+                let r = ProcessRunner.run(argv, cwd: dir.path, environment: env, timeout: timeout)
+                cont.resume(returning: (r?.exitStatus, String(decoding: r?.output ?? Data(), as: UTF8.self), r?.timedOut ?? false))
+            }
+        }
     }
 
     // MARK: Helpers

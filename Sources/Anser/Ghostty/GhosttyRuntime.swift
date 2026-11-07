@@ -8,6 +8,8 @@ final class GhosttyRuntime {
 
     private(set) var app: ghostty_app_t?
     private(set) var config: ghostty_config_t?
+    /// The settings Anser generated for the terminal (for tests and diagnostics).
+    private(set) var configText = ""
     private var tickScheduled = false
     private(set) var theme = Theme.fallback
 
@@ -47,6 +49,7 @@ final class GhosttyRuntime {
         app = ghostty_app_new(&rt, config)
         guard app != nil else { NSLog("Anser: ghostty_app_new failed"); return false }
         applyColorScheme()
+        watchSystemAppearance()
         return true
     }
 
@@ -69,12 +72,19 @@ final class GhosttyRuntime {
             "window-padding-x = 10",
             "confirm-close-surface = false",
             "quit-after-last-window-closed = true",
+            // Programs may copy to your clipboard (OSC 52) only after you agree;
+            // reading it already asks. Override in [ghostty] lines if you like.
+            "clipboard-write = ask",
+            "clipboard-read = ask",
         ]
         lines.append("clipboard-paste-protection = \(Services.shared.config.editor.confirmMultilinePaste)")
+        // Scrollback per tab (Settings → Behavior); the biggest memory use with many tabs.
+        lines.append("scrollback-limit = \(Services.shared.config.scrollbackMB * 1_000_000)")
         if Services.shared.config.copyOnSelect { lines.append("copy-on-select = clipboard") }
-        lines += Services.shared.config.appearance.ghosttyLines
+        lines += Services.shared.config.appearance.ghosttyLines(systemIsDark: Self.systemIsDark)
         lines += Services.shared.config.ghostty
-        try? lines.joined(separator: "\n").appending("\n").write(to: file, atomically: true, encoding: .utf8)
+        configText = lines.joined(separator: "\n").appending("\n")
+        try? configText.write(to: file, atomically: true, encoding: .utf8)
         ghostty_config_load_file(cfg, file.path)
         ghostty_config_finalize(cfg)
 
@@ -92,13 +102,49 @@ final class GhosttyRuntime {
         if let old = config { ghostty_config_free(old) }
         config = newConfig
         theme = Theme(config: newConfig)
+        applyColorScheme()
         NotificationCenter.default.post(name: .anserThemeChanged, object: nil)
     }
 
+    /// Whether macOS itself is in dark mode (ignoring Anser's own override).
+    static var systemIsDark: Bool {
+        UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+    }
+
+    /// Applies Settings → Appearance mode: the window chrome, Ghostty's color
+    /// scheme, and (when the theme depends on light/dark) the terminal theme.
     func applyColorScheme() {
+        let look = Services.shared.config.appearance
+        switch look.mode {
+        case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+        case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        default: NSApp.appearance = nil
+        }
         guard let app else { return }
-        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let dark = look.mode == nil ? Self.systemIsDark : look.usesDark(systemIsDark: Self.systemIsDark)
         ghostty_app_set_color_scheme(app, dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
+    }
+
+    private var appearanceObserver: NSObjectProtocol?
+    private var lastSystemDark: Bool?
+
+    /// Follows macOS switching between light and dark while Anser runs.
+    func watchSystemAppearance() {
+        lastSystemDark = Self.systemIsDark
+        appearanceObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.systemAppearanceChanged() }
+        }
+    }
+
+    func systemAppearanceChanged() {
+        let dark = Self.systemIsDark
+        guard dark != lastSystemDark else { return }
+        lastSystemDark = dark
+        applyColorScheme()
+        // The theme only changes with macOS when following the system with two themes.
+        let look = Services.shared.config.appearance
+        if look.mode == "system", look.themeName(systemIsDark: true) != look.themeName(systemIsDark: false) { reloadConfig() }
     }
 
     func scheduleTick() {
@@ -121,8 +167,9 @@ final class GhosttyRuntime {
                 let title = String(cString: ptr)
                 // In-band events from Anser's hooks on an ssh host (not a real title).
                 if title.hasPrefix("\u{E000}anser:") {
-                    let fields = String(title.dropFirst("\u{E000}anser:".count)).components(separatedBy: "\u{E001}")
-                    DispatchQueue.main.async { pane?.session.handleRemote(fields) }
+                    var fields = String(title.dropFirst("\u{E000}anser:".count)).components(separatedBy: "\u{E001}")
+                    let token = fields.isEmpty ? "" : fields.removeFirst()
+                    DispatchQueue.main.async { pane?.session.handleRemote(token: token, fields) }
                     return true
                 }
                 DispatchQueue.main.async { pane?.titleChanged(title) }
@@ -144,11 +191,7 @@ final class GhosttyRuntime {
             let u = action.action.open_url
             if let ptr = u.url {
                 let s = String(data: Data(bytes: ptr, count: Int(u.len)), encoding: .utf8) ?? ""
-                if let url = URL(string: s), url.scheme != nil {
-                    NSWorkspace.shared.open(url)
-                } else {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: s))
-                }
+                DispatchQueue.main.async { Self.openLink(s, from: view?.window) }
             }
             return true
         case GHOSTTY_ACTION_RING_BELL:
@@ -222,6 +265,34 @@ final class GhosttyRuntime {
         default:
             return false
         }
+    }
+
+    // MARK: Links
+
+    /// Opens a link a program printed. Web and mail links open directly; file
+    /// links follow the same rules as ⌘-click (scripts and apps are only
+    /// revealed); any other scheme asks first, since it can launch an app.
+    static func openLink(_ s: String, from window: NSWindow?) {
+        let url: URL
+        if let u = URL(string: s), let scheme = u.scheme?.lowercased(), !scheme.isEmpty, scheme != "file" {
+            url = u
+        } else {
+            let path = URL(string: s)?.scheme?.lowercased() == "file" ? (URL(string: s)?.path ?? s) : s
+            if OpenSafety.canOpenDirectly(path: path) {
+                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+            } else {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            }
+            return
+        }
+        if OpenSafety.quietSchemes.contains(url.scheme?.lowercased() ?? "") { NSWorkspace.shared.open(url); return }
+        let a = NSAlert()
+        a.messageText = "Open this link?"
+        a.informativeText = "A program in the terminal printed a “\(url.scheme ?? "")” link, which opens another app:\n\n\(s.prefix(300))"
+        a.addButton(withTitle: "Open")
+        a.addButton(withTitle: "Cancel")
+        let respond: (NSApplication.ModalResponse) -> Void = { r in if r == .alertFirstButtonReturn { NSWorkspace.shared.open(url) } }
+        if let window { a.beginSheetModal(for: window, completionHandler: respond) } else { respond(a.runModal()) }
     }
 
     // MARK: Clipboard

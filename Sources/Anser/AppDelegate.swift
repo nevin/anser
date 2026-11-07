@@ -2,14 +2,18 @@ import AppKit
 import Carbon.HIToolbox
 import GhosttyKit
 import AnserCore
+import UserNotifications
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSMenuDelegate, UNUserNotificationCenterDelegate {
     static var shared: AppDelegate!
 
     private var windows: [TerminalWindowController] = []
     private var keyMonitor: Any?
     private var keybindings: [String: String] = [:]
     private(set) var isActive = true
+    /// Files and links opened before the first window existed.
+    var pendingOpenURLs: [URL] = []
+    private(set) var didFinishLaunching = false
     private(set) var isTerminating = false
     private var configWatcher: DispatchSourceFileSystemObject?
 
@@ -27,17 +31,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             NSApp.terminate(nil)
             return
         }
+        UNUserNotificationCenter.current().delegate = self
         buildMenu()
         loadKeybindings()
         installKeyMonitor()
         watchConfig()
+        QuickTerminal.shared.configure(Services.shared.config.quickTerminalHotkey)
+        Updater.shared.start()
+        // Count menu use (only when usage counting is on; stays on this Mac).
+        NotificationCenter.default.addObserver(forName: NSMenu.didSendActionNotification, object: nil, queue: .main) { n in
+            guard let item = n.userInfo?["MenuItem"] as? NSMenuItem, item.representedObject == nil else { return }
+            Services.shared.record("menu." + item.title.replacingOccurrences(of: "…", with: ""))
+        }
         let selfTest = ProcessInfo.processInfo.environment["ANSER_SELFTEST"] != nil
         let restored = !selfTest && Services.shared.config.restoreSession && restoreSession()
         if !restored { newWindow(cwd: nil) }
+        // Shells left from before that no window came back to are ended.
+        if SessionHost.shared.helperPath != nil {
+            SessionHost.shared.keepOnly(Set(allPanes.filter(\.session.persistent).map(\.session.id)))
+        }
+        startAutosave()
         if !selfTest, !UserDefaults.standard.bool(forKey: "AnserWelcomeShown") { currentPane?.showWelcome() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.offerCrashReport() }
         NSApp.activate(ignoringOtherApps: true)
         if let err = Services.shared.configError { showConfigError(err) }
+        didFinishLaunching = true
+        openPendingURLs()
         SelfTest.runIfRequested()
     }
 
@@ -51,7 +70,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if let app = GhosttyRuntime.shared.app { ghostty_app_set_focus(app, false) }
     }
 
+    /// Set by "Quit and End All Shells".
+    private(set) var endShellsOnQuit = false
+    /// Shells survive this quit (anser-session keeps them for the next launch).
+    var keepingShellsOnQuit: Bool { SessionHost.shared.keepOnQuit && !endShellsOnQuit && !Services.isSelfTest }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Nothing stops when shells are kept, so there's nothing to warn about.
+        if keepingShellsOnQuit { isTerminating = true; return .terminateNow }
         let busy = windows.flatMap(\.allPanesEverywhere).filter(\.hasRunningProcess)
         if busy.isEmpty || ProcessInfo.processInfo.environment["ANSER_SELFTEST"] != nil { isTerminating = true; return .terminateNow }
         let a = NSAlert()
@@ -65,6 +91,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationWillTerminate(_ notification: Notification) {
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST"] == nil { saveSession() }
+        let panes = allPanes.filter(\.session.persistent)
+        if keepingShellsOnQuit {
+            panes.forEach { SessionHost.shared.save($0.session) }
+        } else {
+            for p in panes { SessionHost.shared.request(["cmd": "kill", "id": p.session.id], timeout: 0.5) }
+        }
+    }
+
+    @objc func quitEndingShells(_ s: Any?) {
+        endShellsOnQuit = true
+        NSApp.terminate(nil)
+        endShellsOnQuit = false   // still here: the quit was cancelled
+    }
+
+    /// Saves windows and kept shells every so often, so even a crash or forced
+    /// quit brings your shells back.
+    private func startAutosave() {
+        guard ProcessInfo.processInfo.environment["ANSER_SELFTEST"] == nil else { return }
+        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            guard let self, SessionHost.shared.keepOnQuit, !self.isTerminating else { return }
+            self.saveSession()
+            self.allPanes.filter(\.session.persistent).forEach { SessionHost.shared.save($0.session) }
+        }
     }
 
     // MARK: Session restore
@@ -81,7 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func saveSession() {
         var saved: [SavedWindow] = []
-        for wc in windows {
+        for wc in windows where !wc.isQuickTerminal {
             guard let w = wc.window else { continue }
             let tabs = wc.snapshotTabs()
             if !tabs.isEmpty { saved.append(SavedWindow(frame: NSStringFromRect(w.frame), tabs: tabs, selected: wc.selectedIndex)) }
@@ -103,6 +152,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // MARK: Dock menu
+
+    /// Right-click (or click and hold) the Dock icon: New Window, New Tab.
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let m = NSMenu()
+        let win = NSMenuItem(title: "New Window", action: #selector(dockNewWindow(_:)), keyEquivalent: "")
+        let tab = NSMenuItem(title: "New Tab", action: #selector(dockNewTab(_:)), keyEquivalent: "")
+        for i in [win, tab] { i.target = self; m.addItem(i) }
+        if QuickTerminal.shared.hotKey != nil {
+            let q = NSMenuItem(title: QuickTerminal.shared.isShown ? "Hide Quick Terminal" : "Show Quick Terminal", action: #selector(dockQuickTerminal(_:)), keyEquivalent: "")
+            q.target = self
+            m.addItem(q)
+        }
+        return m
+    }
+
+    @objc func dockNewWindow(_ s: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
+        newWindow(cwd: nil)
+    }
+
+    /// A tab in the frontmost regular window (a new window if there is none).
+    @objc func dockNewTab(_ s: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
+        let front = NSApp.orderedWindows.compactMap { $0.windowController as? TerminalWindowController }
+            .first { !$0.isQuickTerminal && ($0.window?.isVisible ?? false) }
+        guard let wc = front else { newWindow(cwd: nil); return }
+        wc.window?.makeKeyAndOrderFront(nil)
+        wc.addTab(cwd: wc.focusedPane?.session.cwd)
+    }
+
+    @objc func dockQuickTerminal(_ s: Any?) { QuickTerminal.shared.toggle() }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { newWindow(cwd: nil) }
@@ -132,8 +214,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         wc.addTab(cwd: pane?.session.cwd ?? wc.focusedPane?.session.cwd)
     }
 
+    /// Opens a tab and runs a command in it (e.g. installing or signing in to a tool).
+    func runInNewTab(_ command: String) {
+        newTab(from: currentPane)
+        guard let wc = currentController else { return }
+        let start = Date()
+        func attempt() {
+            if let p = wc.focusedPane, p.session.atPrompt { p.run(command); wc.window?.makeKeyAndOrderFront(nil); return }
+            if Date().timeIntervalSince(start) < 8 { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { attempt() } }
+        }
+        attempt()
+    }
+
     func windowClosed(_ wc: TerminalWindowController) {
         windows.removeAll { $0 === wc }
+        QuickTerminal.shared.windowClosed(wc)
+    }
+
+    /// Registers a window without showing it (the quick terminal shows itself).
+    func adoptQuietly(_ wc: TerminalWindowController) {
+        windows.append(wc)
+    }
+
+    /// Every pane in every window.
+    var allPanes: [PaneView] { windows.flatMap(\.allPanesEverywhere) }
+
+    // MARK: Notifications
+
+    /// Clicking "Command finished" brings you to that tab.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler done: @escaping () -> Void) {
+        let id = response.notification.request.content.userInfo["session"] as? String
+        DispatchQueue.main.async { [weak self] in
+            if let id { self?.reveal(sessionID: id) }
+            done()
+        }
+    }
+
+    /// Shown even while Anser is in front (the command's tab may be hidden).
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+        done([.banner, .sound])
+    }
+
+    /// Brings the window and tab running a session to the front.
+    @discardableResult
+    func reveal(sessionID: String) -> Bool {
+        guard let pane = allPanes.first(where: { $0.session.id == sessionID }), let wc = pane.windowController,
+              let tab = wc.tab(for: pane), let i = wc.tabs.firstIndex(where: { $0 === tab }) else { return false }
+        NSApp.activate(ignoringOtherApps: true)
+        if wc.isQuickTerminal { QuickTerminal.shared.show() }
+        wc.selectTab(i)
+        wc.window?.makeKeyAndOrderFront(nil)
+        pane.focus()
+        return true
     }
 
     // MARK: Menu
@@ -147,20 +280,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             if let qa, !key.isEmpty { shortcutLabels[qa] = Self.label(key: key, mods: mods) }
             return i
         }
+        /// A menu item that runs an AnserAction (so menus, palette and keybindings share one path).
+        func actionItem(_ a: AnserAction, _ title: String, _ key: String, _ mods: NSEvent.ModifierFlags = .command) -> NSMenuItem {
+            let i = item(title, #selector(performMenuAction(_:)), key, mods, for: a)
+            i.representedObject = a.rawValue
+            return i
+        }
 
         // App
         let appItem = NSMenuItem()
         let app = NSMenu()
         app.addItem(item("About Anser", #selector(NSApplication.orderFrontStandardAboutPanel(_:))))
+        app.addItem(actionItem(.checkForUpdates, "Check for Updates…", ""))
+        app.addItem(.separator())
+        app.addItem(item("Make Anser the Default Terminal…", #selector(toggleDefaultTerminal(_:))))
         app.addItem(.separator())
         app.addItem(item("Settings…", #selector(openSettings(_:)), ",", for: .openSettings))
         app.addItem(item("Open Config File", #selector(openConfig(_:)), ",", [.command, .option], for: .openConfig))
         app.addItem(item("Reload Config", #selector(reloadConfig(_:)), ",", [.command, .shift], for: .reloadConfig))
+        app.addItem(actionItem(.importSettings, "Import from iTerm2 or Warp…", ""))
         app.addItem(.separator())
         app.addItem(item("Hide Anser", #selector(NSApplication.hide(_:)), "h"))
         app.addItem(item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]))
         app.addItem(.separator())
         app.addItem(item("Quit Anser", #selector(NSApplication.terminate(_:)), "q"))
+        let endAll = item("Quit and End All Shells", #selector(quitEndingShells(_:)), "q", [.command, .option])
+        endAll.isAlternate = true
+        app.addItem(endAll)
         appItem.submenu = app
         main.addItem(appItem)
 
@@ -172,14 +318,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         shell.addItem(.separator())
         shell.addItem(item("Split Right", #selector(splitRight(_:)), "d", for: .splitRight))
         shell.addItem(item("Split Down", #selector(splitDown(_:)), "d", [.command, .shift], for: .splitDown))
+        shell.addItem(actionItem(.splitLeft, "Split Left", ""))
+        shell.addItem(actionItem(.splitUp, "Split Up", ""))
         shell.addItem(.separator())
         shell.addItem(item("Re-run Last Command", #selector(rerunLast(_:)), "r", [.command, .shift], for: .rerunLastCommand))
-        shell.addItem(item("Run Workflow…", #selector(runWorkflow(_:)), "r", [.command, .option], for: .runWorkflow))
-        shell.addItem(item("Ask Claude for a Command…", #selector(askClaude(_:)), "i", for: .askClaude))
-        shell.addItem(item("Explain Last Error with Claude", #selector(explainError(_:)), "i", [.command, .option], for: .explainError))
-        shell.addItem(item("Save Commands as Workflow…", #selector(saveWorkflow(_:)), "", for: .saveWorkflow))
+        shell.addItem(actionItem(.broadcastInput, "Type in All Panes of This Tab", "b", [.command, .option, .shift]))
+        shell.addItem(actionItem(.shareTab, "Share This Tab (Read-Only)…", ""))
         shell.addItem(.separator())
-        shell.addItem(item("Export Tab as Markdown…", #selector(exportMarkdown(_:)), "s", [.command, .shift], for: .exportMarkdown))
+        shell.addItem(item("Export Tab…", #selector(exportMarkdown(_:)), "s", [.command, .shift], for: .exportMarkdown))
+        shell.addItem(actionItem(.exportLastOutput, "Export Last Command’s Output…", "s", [.command, .option, .shift]))
         shell.addItem(item("Copy Tab as Markdown", #selector(copyMarkdown(_:)), "", for: .copyMarkdown))
         shell.addItem(item("Toggle Command Editor", #selector(toggleEditor(_:)), "e", for: .toggleEditor))
         shell.addItem(item("Expand Command Editor", #selector(toggleExpandedEditor(_:)), "e", [.command, .shift], for: .expandEditor))
@@ -206,6 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         edit.addItem(item("Clipboard History…", #selector(clipboardHistory(_:)), "v", [.command, .shift], for: .clipboardHistory))
         edit.addItem(.separator())
         edit.addItem(item("Find…", #selector(findInTerminal(_:)), "f", for: .findInTerminal))
+        edit.addItem(actionItem(.searchAllTabs, "Find in All Tabs…", "f", [.command, .shift]))
         edit.addItem(item("Pause History for This Tab", #selector(pauseHistory(_:)), "", for: .pauseHistory))
         editItem.submenu = edit
         main.addItem(editItem)
@@ -219,7 +367,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         view.addItem(.separator())
         view.addItem(item("Toggle Sidebar", #selector(toggleSidebar(_:)), "s", [.command, .control], for: .toggleSidebar))
         view.addItem(.separator())
-        view.addItem(item("Clear Screen", #selector(clearScreen(_:)), "k", for: .clearScreen))
+        view.addItem(item("Clear", #selector(clearScreen(_:)), "k", for: .clearScreen))
+        view.addItem(actionItem(.deepClean, "Deep Clean…", "k", [.command, .shift]))
         view.addItem(item("Jump to Previous Prompt", #selector(jumpPrev(_:)), String(Character(UnicodeScalar(NSUpArrowFunctionKey)!)), for: .jumpToPreviousPrompt))
         view.addItem(item("Jump to Next Prompt", #selector(jumpNext(_:)), String(Character(UnicodeScalar(NSDownArrowFunctionKey)!)), for: .jumpToNextPrompt))
         view.addItem(.separator())
@@ -231,18 +380,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let goItem = NSMenuItem()
         let go = NSMenu(title: "Go")
         go.addItem(item("Search History…", #selector(historySearch(_:)), "r", for: .historySearch))
+        go.addItem(actionItem(.searchOutput, "Search Command Output…", "f", [.command, .option, .shift]))
         go.addItem(item("Command Palette…", #selector(commandPalette(_:)), "p", [.command, .shift], for: .commandPalette))
         go.addItem(item("Commands in This Tab…", #selector(blockNavigator(_:)), "b", for: .blockNavigator))
         go.addItem(item("Jump to Folder…", #selector(jumpToFolder(_:)), "j", for: .jumpToFolder))
         go.addItem(.separator())
-        go.addItem(item("Switch Branch…", #selector(switchBranch(_:)), "b", [.command, .shift], for: .switchBranch))
-        go.addItem(item("Changed Files…", #selector(changedFiles(_:)), "g", [.command, .shift], for: .changedFiles))
         go.addItem(.separator())
         go.addItem(item("Next Pane", #selector(nextPane(_:)), "]", for: .focusNextPane))
         go.addItem(item("Previous Pane", #selector(prevPane(_:)), "[", for: .focusPreviousPane))
         go.addItem(item("Zoom Pane", #selector(zoomPane(_:)), "\r", [.command, .shift], for: .zoomPane))
         goItem.submenu = go
         main.addItem(goItem)
+
+        // Git
+        let gitItem = NSMenuItem()
+        let git = NSMenu(title: "Git")
+        git.addItem(item("Switch Branch…", #selector(switchBranch(_:)), "b", [.command, .shift], for: .switchBranch))
+        git.addItem(item("Changed Files…", #selector(changedFiles(_:)), "g", [.command, .shift], for: .changedFiles))
+        git.addItem(actionItem(.gitHistory, "Commit History…", "l", [.command, .shift]))
+        git.addItem(actionItem(.gitStashes, "Stashes…", ""))
+        git.addItem(actionItem(.gitBlame, "Blame File…", "l", [.command, .option, .shift]))
+        git.addItem(actionItem(.resolveConflicts, "Resolve Conflicts…", ""))
+        git.addItem(actionItem(.openPullRequest, "Open Pull Request", ""))
+        git.addItem(.separator())
+        git.addItem(actionItem(.gitFetch, "Fetch", ""))
+        git.addItem(actionItem(.gitPull, "Pull", ""))
+        git.addItem(actionItem(.gitPush, "Push", ""))
+        gitItem.submenu = git
+        main.addItem(gitItem)
+
+        // Tools
+        let toolsItem = NSMenuItem()
+        let tools = NSMenu(title: "Tools")
+        tools.addItem(actionItem(.notebook, "Command Notebook", "n", [.command, .option]))
+        tools.addItem(actionItem(.editNotebook, "Edit Notebook…", ""))
+        tools.addItem(actionItem(.saveToNotebook, "Save Command to Notebook", "s", [.command, .option]))
+        tools.addItem(.separator())
+        tools.addItem(item("Workflows…", #selector(runWorkflow(_:)), "r", [.command, .option], for: .runWorkflow))
+        tools.addItem(item("Save Commands as Workflow…", #selector(saveWorkflow(_:)), "", for: .saveWorkflow))
+        tools.addItem(actionItem(.openWorkflowsFolder, "Open Workflows Folder", ""))
+        tools.addItem(.separator())
+        tools.addItem(item("Ask AI for a Command…", #selector(askClaude(_:)), "i", for: .askClaude))
+        tools.addItem(item("Explain Last Error with AI", #selector(explainError(_:)), "i", [.command, .option], for: .explainError))
+        toolsItem.submenu = tools
+        main.addItem(toolsItem)
 
         // Window
         let winItem = NSMenuItem()
@@ -257,13 +438,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         win.addItem(item("Move Tab Right", #selector(moveTabRight(_:)), String(Character(UnicodeScalar(NSRightArrowFunctionKey)!)), [.command, .option], for: .moveTabRight))
         win.addItem(item("Move Tab to New Window", #selector(moveTabToNewWindow(_:)), "", for: .moveTabToNewWindow))
         win.addItem(item("Close Tab", #selector(closeTab(_:)), "w", [.command, .shift], for: .closeTab))
-        for n in 1...9 {
-            let it = item("Tab \(n)", #selector(selectTabN(_:)), "\(n)")
-            it.tag = n
-            it.isAlternate = false
-            win.addItem(it)
-        }
+        win.addItem(actionItem(.quickTerminal, "Quick Terminal", ""))
+        win.addItem(item("Show Last Tab", #selector(selectLastTab(_:)), "9"))
+        // The front window's tabs are listed here, rebuilt each time (see menuNeedsUpdate).
         win.addItem(.separator())
+        win.delegate = self
         win.addItem(item("Bring All to Front", #selector(NSApplication.arrangeInFront(_:))))
         winItem.submenu = win
         main.addItem(winItem)
@@ -275,6 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         help.addItem(item("Show Welcome Tips", #selector(showWelcomeTips(_:))))
         help.addItem(.separator())
         help.addItem(item("Report a Problem…", #selector(reportProblem(_:))))
+        help.addItem(actionItem(.showUsage, "Your Feature Usage…", ""))
         help.addItem(item("Show Logs in Finder", #selector(showLogs(_:))))
         helpItem.submenu = help
         main.addItem(helpItem)
@@ -306,8 +486,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if menuItem.action == #selector(toggleExpandedEditor(_:)) {
             menuItem.state = (currentPane?.editorExpanded ?? false) ? .on : .off
         }
+        if menuItem.action == #selector(askClaude(_:)) {
+            menuItem.title = Services.shared.aiEnabled ? "Ask \(Services.shared.aiName) for a Command…" : "Ask AI for a Command…"
+        }
+        if menuItem.action == #selector(explainError(_:)) {
+            menuItem.title = Services.shared.aiEnabled ? "Explain Last Error with \(Services.shared.aiName)" : "Explain Last Error with AI"
+        }
+        if menuItem.action == #selector(toggleSidebar(_:)) {
+            menuItem.title = (currentController?.sidebarVisible ?? false) ? "Hide Sidebar" : "Show Sidebar"
+        }
         if menuItem.action == #selector(pauseHistory(_:)) {
             menuItem.state = (currentPane?.session.historyPaused ?? false) ? .on : .off
+        }
+        if menuItem.action == #selector(quitEndingShells(_:)) { return SessionHost.shared.keepOnQuit }
+        if menuItem.action == #selector(toggleDefaultTerminal(_:)) {
+            let isDefault = isDefaultTerminal
+            menuItem.state = isDefault ? .on : .off
+            menuItem.title = isDefault ? "Anser Is the Default Terminal" : "Make Anser the Default Terminal…"
+        }
+        switch (menuItem.representedObject as? String).flatMap(AnserAction.init(rawValue:)) {
+        case .quickTerminal?:
+            let key = QuickTerminal.shared.hotKey.map { "  (\($0.display))" } ?? ""
+            menuItem.title = (QuickTerminal.shared.isShown ? "Hide Quick Terminal" : "Show Quick Terminal") + key
+        case .broadcastInput?:
+            menuItem.state = currentPane.map { currentController?.isBroadcasting($0) ?? false } == true ? .on : .off
+        case .shareTab?:
+            let sharing = currentPane.flatMap { TabShare.share(for: $0) } != nil
+            menuItem.title = sharing ? "Sharing This Tab (Read-Only)…" : "Share This Tab (Read-Only)…"
+            menuItem.state = sharing ? .on : .off
+        default: break
         }
         return true
     }
@@ -334,6 +541,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func findInTerminal(_ s: Any?) { currentPane?.showFind() }
     @objc func jumpToFolder(_ s: Any?) { if let p = currentPane { currentController?.showFolderJumper(for: p) } }
+    @objc func performMenuAction(_ s: NSMenuItem) {
+        guard let raw = s.representedObject as? String, let a = AnserAction(rawValue: raw) else { return }
+        if a == .editNotebook { MainActor.assumeIsolated { NotebookWindow.shared.show() }; return }
+        guard let p = currentPane else { NSSound.beep(); return }
+        perform(a, pane: p)
+    }
     @objc func switchBranch(_ s: Any?) { if let p = currentPane { currentController?.showBranchSwitcher(for: p) } }
     @objc func changedFiles(_ s: Any?) { if let p = currentPane { currentController?.showChanges(for: p) } }
     @objc func showShortcuts(_ s: Any?) { ShortcutsPanel.toggle(over: currentController?.window) }
@@ -343,7 +556,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func explainError(_ s: Any?) { currentPane?.explainLastError() }
     @objc func runWorkflow(_ s: Any?) { if let p = currentPane { currentController?.showWorkflows(for: p) } }
     @objc func saveWorkflow(_ s: Any?) { if let p = currentPane { currentController?.showSaveWorkflow(for: p) } }
-    @objc func exportMarkdown(_ s: Any?) { if let p = currentPane { currentController?.exportMarkdown(for: p, copy: false) } }
+    @objc func exportMarkdown(_ s: Any?) { if let p = currentPane { currentController?.exportOutput(for: p, onlyLast: false) } }
     @objc func copyMarkdown(_ s: Any?) { if let p = currentPane { currentController?.exportMarkdown(for: p, copy: true) } }
     @objc func showLogs(_ s: Any?) { NSWorkspace.shared.activateFileViewerSelecting([Diagnostics.logURL]) }
 
@@ -376,9 +589,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func renameTab(_ s: Any?) { currentController?.beginRenamingSelectedTab() }
     @objc func closeTab(_ s: Any?) { if let c = currentController { c.closeTabAsking(c.selectedIndex) } }
     @objc func selectTabN(_ s: NSMenuItem) {
-        guard let c = currentController else { return }
-        // ⌘9 always means the last tab, like browsers.
-        c.selectTab(s.tag == 9 ? c.tabs.count - 1 : s.tag - 1)
+        guard let c = currentController, s.tag >= Self.tabItemTag else { return }
+        c.selectTab(min(s.tag - Self.tabItemTag, c.tabs.count - 1))
+    }
+    /// ⌘9 always means the last tab, like browsers.
+    @objc func selectLastTab(_ s: Any?) {
+        guard let c = currentController, !c.tabs.isEmpty else { return }
+        c.selectTab(c.tabs.count - 1)
+    }
+
+    static let tabItemTag = 1000
+
+    /// Lists the front window's tabs in the Window menu: real names, a check on the
+    /// current one, ⌘1–⌘8 on the first eight. AppKit also calls this before matching
+    /// key equivalents, so the shortcuts work without opening the menu.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === NSApp.windowsMenu else { return }
+        for it in menu.items where it.tag >= Self.tabItemTag { menu.removeItem(it) }
+        guard let c = currentController,
+              let anchor = menu.items.firstIndex(where: { $0.action == #selector(selectLastTab(_:)) }) else { return }
+        var at = anchor + 2   // after "Show Last Tab" and its separator
+        for (i, tab) in c.tabs.enumerated() {
+            let it = NSMenuItem(title: c.title(of: tab), action: #selector(selectTabN(_:)), keyEquivalent: i < 8 ? "\(i + 1)" : "")
+            it.keyEquivalentModifierMask = .command
+            it.tag = Self.tabItemTag + i
+            it.target = self
+            it.state = i == c.selectedIndex ? .on : .off
+            menu.insertItem(it, at: at)
+            at += 1
+        }
+        let sep = NSMenuItem.separator()
+        sep.tag = Self.tabItemTag + 999
+        menu.insertItem(sep, at: at)
     }
     @objc func toggleExpandedEditor(_ s: Any?) { currentPane?.toggleExpanded() }
     @objc func formatCommand(_ s: Any?) { currentPane?.formatCommand() }
@@ -441,12 +683,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func reloadConfig(_ s: Any?) {
         Services.shared.loadConfig()
+        QuickTerminal.shared.configure(Services.shared.config.quickTerminalHotkey)
+        allPanes.forEach { $0.updateProfile() }
         loadKeybindings()
         GhosttyRuntime.shared.reloadConfig()
         if let err = Services.shared.configError { showConfigError(err) }
     }
 
     func perform(_ a: AnserAction, pane: PaneView) {
+        Services.shared.record("action." + a.rawValue)
         switch a {
         case .historySearch: currentController?.showHistorySearch(for: pane)
         case .clipboardHistory: currentController?.showClipboardHistory(for: pane)
@@ -457,6 +702,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case .newWindow: newWindow(cwd: pane.session.cwd)
         case .splitRight: pane.windowController?.split(pane, vertical: true)
         case .splitDown: pane.windowController?.split(pane, vertical: false)
+        case .splitLeft: pane.windowController?.split(pane, vertical: true, before: true)
+        case .splitUp: pane.windowController?.split(pane, vertical: false, before: true)
         case .closePane: pane.windowController?.closeAsking(pane)
         case .focusNextPane: pane.windowController?.focusPane(relativeTo: pane, forward: true)
         case .focusPreviousPane: pane.windowController?.focusPane(relativeTo: pane, forward: false)
@@ -482,7 +729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case .explainError: pane.explainLastError()
         case .runWorkflow: currentController?.showWorkflows(for: pane)
         case .saveWorkflow: currentController?.showSaveWorkflow(for: pane)
-        case .exportMarkdown: currentController?.exportMarkdown(for: pane, copy: false)
+        case .exportMarkdown: currentController?.exportOutput(for: pane, onlyLast: false)
         case .copyMarkdown: currentController?.exportMarkdown(for: pane, copy: true)
         case .reportProblem: ReportProblemWindowController.shared.show()
         case .zoomPane: currentController?.toggleZoom(pane)
@@ -497,13 +744,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case .expandEditor: pane.toggleExpanded()
         case .formatCommand: pane.formatCommand()
         case .externalEditor: pane.editInExternalEditor()
+        case .notebook: currentController?.toggleNotebookPanel()
+        case .editNotebook: MainActor.assumeIsolated { NotebookWindow.shared.show() }
+        case .saveToNotebook: pane.saveToNotebook()
+        case .exportLastOutput: currentController?.exportOutput(for: pane, onlyLast: true)
+        case .openWorkflowsFolder: TerminalWindowController.openWorkflowsFolder()
+        case .gitHistory: currentController?.showGitHistory(for: pane)
+        case .gitStashes: currentController?.showStashes(for: pane)
+        case .gitFetch: currentController?.runGit(.fetch, in: pane)
+        case .gitPull: currentController?.runGit(.pull, in: pane)
+        case .gitPush: currentController?.runGit(.push, in: pane); PaneView.forgetPullRequests()
+        case .quickTerminal: QuickTerminal.shared.toggle()
+        case .broadcastInput: pane.windowController?.toggleBroadcast(for: pane)
+        case .searchOutput: pane.windowController?.showHistorySearch(for: pane, scope: .output)
+        case .resolveConflicts: pane.windowController?.showConflicts(for: pane)
+        case .openPullRequest: pane.openPullRequest()
+        case .importSettings: importSettings()
+        case .checkForUpdates: Updater.shared.checkForUpdates(nil)
+        case .showUsage: showUsage()
+        case .gitBlame: pane.windowController?.showBlameFilePicker(for: pane)
+        case .searchAllTabs: pane.windowController?.showSearchAllTabs(for: pane)
+        case .shareTab: pane.shareTab()
+        case .deepClean: pane.confirmDeepClean()
         }
     }
 
     // MARK: Feedback
 
     func flash(_ pane: PaneView, _ text: String) {
+        // A new message replaces the one still showing.
+        let flashID = NSUserInterfaceItemIdentifier("anser-flash")
+        pane.subviews.filter { $0.identifier == flashID }.forEach { $0.removeFromSuperview() }
         let label = NSTextField(labelWithString: text)
+        label.identifier = flashID
         label.font = .systemFont(ofSize: 12, weight: .medium)
         label.textColor = .white
         label.alignment = .center
@@ -558,7 +831,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case "run": pane.run(arg)
         case "insert": pane.insertIntoEditor(pane.editor.string + arg)
         case "snippet":
+            // A Command Notebook entry by title (or an old config.json snippet).
             if let s = Services.shared.config.snippets.first(where: { $0.name == arg }) { pane.insertIntoEditor(s.command) }
+            else if let e = ((try? Notebook.load(from: NotebookWindow.fileURL)) ?? Notebook()).entry(titled: arg) { pane.insertIntoEditor(e.command) }
+            else { NSSound.beep() }
         case "action":
             if let a = AnserAction(rawValue: arg) { perform(a, pane: pane) } else { NSSound.beep() }
         case "ghostty": pane.surfaceView.binding(arg)

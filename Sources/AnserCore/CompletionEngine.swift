@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 public struct Completion: Sendable, Hashable {
     public enum Kind: String, Sendable {
@@ -25,11 +26,21 @@ public struct Completion: Sendable, Hashable {
     }
 }
 
-public final class CompletionEngine: @unchecked Sendable {
+public final class CompletionEngine: Sendable {
     public let specs: SpecRegistry
     public let history: HistoryStore?
-    public var snippets: [(name: String, command: String)] = []
-    public var maxResults = 60
+    /// Replaced on the main thread when the config reloads, read during completion.
+    private let snippetStore = OSAllocatedUnfairLock(initialState: [Snippet]())
+    public struct Snippet: Sendable {
+        public let name: String
+        public let command: String
+        public init(name: String, command: String) { self.name = name; self.command = command }
+    }
+    public var snippets: [Snippet] {
+        get { snippetStore.withLock { $0 } }
+        set { snippetStore.withLock { $0 = newValue } }
+    }
+    public let maxResults = 60
 
     public init(specs: SpecRegistry, history: HistoryStore?) {
         self.specs = specs
@@ -77,7 +88,14 @@ public final class CompletionEngine: @unchecked Sendable {
         results += historyLines(ctx)
 
         if let spec = specs.spec(for: command) ?? specs.spec(for: (command as NSString).lastPathComponent) {
-            results += await fromSpec(spec, words: Array(words.dropFirst()), ctx: ctx, env: env, commandName: command)
+            var fromSpec = await fromSpec(spec, words: Array(words.dropFirst()), ctx: ctx, env: env, commandName: command)
+            // The subcommand being typed (`git com` → commit) goes above history lines.
+            if !prefix.isEmpty, let i = fromSpec.indices
+                .filter({ fromSpec[$0].kind == .subcommand && fromSpec[$0].insert.hasPrefix(prefix) })
+                .max(by: { fromSpec[$0].score < fromSpec[$1].score }) {
+                fromSpec[i].score = max(fromSpec[i].score, 1250)
+            }
+            results += fromSpec
         } else if prefix.hasPrefix("-"), !env.isRemote {
             let opts = await HelpParser.shared.options(for: command, env: env)
             results += optionCompletions(opts, used: Set(words), ctx: ctx)
@@ -339,7 +357,7 @@ public final class CompletionEngine: @unchecked Sendable {
         for name in env.functions where !name.hasPrefix("_") { add(name, .function, "function") }
         for (name, desc) in ShellBuiltins.all { add(name, .builtin, desc) }
         for name in CommandIndex.shared.commands(env: env) { add(name, .command, specs.describe(name)) }
-        for s in snippets {
+        for s in snippets {  // one locked copy
             if let m = Fuzzy.match(prefix, s.name) {
                 out.append(Completion(kind: .snippet, insert: s.command, display: s.name, detail: s.command, score: Double(m.score) - 50, positions: m.positions, appendSpace: false, replacesLine: true))
             }
@@ -352,10 +370,35 @@ public final class CompletionEngine: @unchecked Sendable {
         guard let history else { return [] }
         let typed = String(utf16CodeUnits: Array(ctx.line.utf16.prefix(ctx.cursor)), count: min(ctx.cursor, ctx.line.utf16.count))
         guard typed.trimmingCharacters(in: .whitespaces).count >= 2 else { return [] }
-        let matches = history.recentCommands(withPrefix: typed, limit: 4)
-        return matches.enumerated().map { i, cmd in
-            Completion(kind: .history, insert: cmd, display: cmd, detail: "history", score: 1200 - Double(i) * 10, positions: Array(0..<typed.count), appendSpace: false, replacesLine: true)
+        // Leave out likely typos; commands that failed last time go after the ones that worked.
+        // An unknown subcommand (`git commmit`) is hidden once it's known to have failed;
+        // from imported history (no exit code) it could be an alias, so it only goes lower.
+        var ok: [String] = [], failed: [String] = []
+        var failedForSure = Set<String>()
+        for cmd in history.recentCommands(withPrefix: typed, limit: 16) {
+            let exit = history.lastExit(for: cmd)
+            let unknown = isUnknownSubcommand(cmd)
+            if history.isLikelyMistake(cmd) || (unknown && (exit ?? 0) != 0) { continue }
+            if (exit ?? 0) != 0 { failedForSure.insert(cmd) }
+            if (exit ?? 0) != 0 || unknown { failed.append(cmd) } else { ok.append(cmd) }
+            if ok.count >= 4 { break }
         }
+        let picked = Array(ok.prefix(4))
+        let extra = Array(failed.prefix(max(0, 4 - picked.count)))
+        return picked.enumerated().map { i, cmd in
+            Completion(kind: .history, insert: cmd, display: cmd, detail: "history", score: 1200 - Double(i) * 10, positions: Array(0..<typed.count), appendSpace: false, replacesLine: true)
+        } + extra.enumerated().map { i, cmd in
+            Completion(kind: .history, insert: cmd, display: cmd, detail: failedForSure.contains(cmd) ? "history · failed" : "history", score: 600 - Double(i) * 10, positions: Array(0..<typed.count), appendSpace: false, replacesLine: true)
+        }
+    }
+
+    /// `git commmit …`: the program has known subcommands and the second word isn't one.
+    func isUnknownSubcommand(_ line: String) -> Bool {
+        let words = ShellLexer.tokenize(line).filter { $0.kind == .word }.map(\.value)
+        guard words.count >= 2, !words[1].hasPrefix("-"),
+              let spec = specs.spec(for: words[0]) ?? specs.spec(for: (words[0] as NSString).lastPathComponent),
+              !spec.subcommands.isEmpty else { return false }
+        return spec.subcommand(named: words[1]) == nil
     }
 
     /// File and folder names for the current word.

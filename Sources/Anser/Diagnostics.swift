@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import MetricKit
+import AnserCore
 
 /// Crash, hang and activity logging, all kept locally in ~/Library/Logs/Anser.
 /// Nothing is sent anywhere; Help → Report a Problem lets you review and share it.
@@ -155,6 +156,10 @@ final class Diagnostics: NSObject, MXMetricManagerSubscriber {
         r.append("- Shell: \(ShellSession.userShell)")
         r.append("- Screens: \(NSScreen.screens.map { "\(Int($0.frame.width))×\(Int($0.frame.height))@\($0.backingScaleFactor)x" }.joined(separator: ", "))")
         r.append("- Windows: \(NSApp.windows.filter { $0.windowController is TerminalWindowController }.count)")
+        r.append("- Helper commands that timed out: \(ScriptRunner.timeoutCount)")
+        let mem = MemoryUse.footprint()
+        let kept = AppDelegate.shared.allPanes.reduce(0) { $0 + $1.session.outputBytes }
+        r.append("- Memory: \(MemoryUse.megabytes(mem.current)) now, \(MemoryUse.megabytes(mem.peak)) peak · command output kept: \(MemoryUse.megabytes(UInt64(kept))) · memory warnings: \(MemoryManager.shared.pressureEvents)")
         r.append("")
         let crashes = ((try? FileManager.default.contentsOfDirectory(at: Self.directory, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
             .filter { $0.lastPathComponent.hasPrefix("crash-") }
@@ -163,6 +168,13 @@ final class Diagnostics: NSObject, MXMetricManagerSubscriber {
             r.append("## Most recent crash (\(latest.lastPathComponent))")
             r.append("```")
             r.append(String(text.prefix(12000)))
+            r.append("```")
+            r.append("")
+        }
+        if Services.shared.config.usageStats {
+            r.append("## Feature usage (counted on this Mac because usage counting is on)")
+            r.append("```")
+            r.append(Services.shared.usage.report())
             r.append("```")
             r.append("")
         }

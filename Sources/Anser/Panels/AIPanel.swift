@@ -62,7 +62,7 @@ final class AIPanel: NSPanel, NSTextFieldDelegate {
         title.font = .systemFont(ofSize: 14, weight: .semibold)
         switch mode {
         case .explain(let cmd, let code, _): title.stringValue = "✨ Why did this fail?  ·  \(cmd.prefix(50)) (exit \(code))"
-        case .generate: title.stringValue = "✨ Ask Claude for a command"
+        case .generate: title.stringValue = "✨ Ask \(Services.shared.aiName) for a command"
         }
         self.title = "AI help"
 
@@ -91,9 +91,10 @@ final class AIPanel: NSPanel, NSTextFieldDelegate {
 
         privacy.font = .systemFont(ofSize: 10.5)
         privacy.textColor = .tertiaryLabelColor
+        let dest = Services.shared.ai.provider.destination
         switch mode {
-        case .explain: privacy.stringValue = "Sent to Anthropic: the command, the last 200 lines of its output, your shell and folder name. Things that look like secrets are removed first."
-        case .generate: privacy.stringValue = "Sent to Anthropic: your description, your shell and folder name. Suggested commands are only inserted when you click Insert; nothing runs on its own."
+        case .explain: privacy.stringValue = "\(dest): the command, the last 200 lines of its output, your shell and folder name. Things that look like secrets are removed first. Suggested fixes run only when you click Run."
+        case .generate: privacy.stringValue = "\(dest): your description, your shell and folder name. Suggested commands are only inserted or run when you click; nothing runs on its own."
         }
 
         let stack = NSStackView(views: [title, askField, NSStackView(views: [spinner, status]), scroll, commandsStack, privacy])
@@ -138,11 +139,11 @@ final class AIPanel: NSPanel, NSTextFieldDelegate {
     private func start(_ request: String?) {
         task?.cancel()
         if case .generate = mode, (request ?? "").trimmingCharacters(in: .whitespaces).isEmpty { NSSound.beep(); return }
+        let ai = Services.shared.ai
         spinner.startAnimation(nil)
-        status.stringValue = "Asking Claude…"
+        status.stringValue = "Asking \(ai.provider.displayName)…"
         answerView.string = ""
         commandsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let ai = Services.shared.ai
         let ctx = context()
         let mode = self.mode
         Diagnostics.shared.log("ai request: \(request == nil ? "explain" : "generate")")
@@ -178,13 +179,28 @@ final class AIPanel: NSPanel, NSTextFieldDelegate {
             let button = NSButton(title: "Insert", target: self, action: #selector(insertTapped(_:)))
             button.controlSize = .small
             button.identifier = NSUserInterfaceItemIdentifier(cmd)
-            let row = NSStackView(views: [button, label])
+            button.toolTip = "Put it in the editor to check or change first"
+            let runButton = NSButton(title: isExplain ? "Fix & Retry" : "Run", target: self, action: #selector(runTapped(_:)))
+            runButton.controlSize = .small
+            runButton.identifier = NSUserInterfaceItemIdentifier(cmd)
+            runButton.toolTip = "Run it now in this tab"
+            let row = NSStackView(views: [button, runButton, label])
             row.spacing = 8
             commandsStack.addArrangedSubview(row)
         }
     }
 
     @objc private func insertTapped(_ b: NSButton) { if let cmd = b.identifier?.rawValue { insert(cmd) } }
+
+    private var isExplain: Bool { if case .explain = mode { return true } else { return false } }
+
+    @objc private func runTapped(_ b: NSButton) {
+        guard let cmd = b.identifier?.rawValue, let pane, pane.session.atPrompt else { NSSound.beep(); return }
+        Services.shared.record(isExplain ? "ai.fixRetry" : "ai.run")
+        close()
+        pane.submitFromEditor(cmd)   // profiles that ask first still ask
+        pane.focus()
+    }
 
     func insert(_ cmd: String) {
         pane?.insertIntoEditor(cmd)

@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// What the completion engine knows about the shell a pane is running.
 public struct ShellEnvironment: Sendable {
@@ -36,21 +37,28 @@ public struct ShellEnvironment: Sendable {
 }
 
 /// Runs short helper commands with a timeout and caches their output.
-public final class ScriptRunner: @unchecked Sendable {
+public final class ScriptRunner: Sendable {
     public static let shared = ScriptRunner()
-    private var cache: [String: (Date, String)] = [:]
-    private let lock = NSLock()
+    private let cache = OSAllocatedUnfairLock(initialState: [String: (Date, String)]())
 
     public func run(_ script: String, cwd: String, env: ShellEnvironment, timeout: TimeInterval = 2.0, cacheSeconds: Double = 0) async -> String? {
         let key = cwd + "\u{0}" + script
-        if cacheSeconds > 0, let hit = lock.withLock({ cache[key] }), Date().timeIntervalSince(hit.0) < cacheSeconds {
+        if cacheSeconds > 0, let hit = cache.withLock({ $0[key] }), Date().timeIntervalSince(hit.0) < cacheSeconds {
             return hit.1
         }
         let out = await Self.execute(["/bin/sh", "-c", script], cwd: cwd, env: env, timeout: timeout)
         if cacheSeconds > 0, let out {
-            lock.withLock { cache[key] = (Date(), out) }
+            cache.withLock { $0[key] = (Date(), out) }
         }
         return out
+    }
+
+    /// Drops cached output for one folder (after something like `git fetch` changed it).
+    /// Drops every cached result (when memory is short).
+    public func forgetAll() { cache.withLock { $0.removeAll() } }
+
+    public func forget(cwd: String) {
+        cache.withLock { c in c = c.filter { !$0.key.hasPrefix(cwd + "\u{0}") } }
     }
 
     public func run(argv: [String], cwd: String, env: ShellEnvironment, timeout: TimeInterval = 2.0) async -> String? {
@@ -60,32 +68,27 @@ public final class ScriptRunner: @unchecked Sendable {
     static func execute(_ argv: [String], cwd: String, env: ShellEnvironment, timeout: TimeInterval) async -> String? {
         await withCheckedContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: argv[0])
-                p.arguments = Array(argv.dropFirst())
-                p.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.fileExists(atPath: cwd) ? cwd : env.home)
+                let dir = FileManager.default.fileExists(atPath: cwd) ? cwd : env.home
                 var e = ProcessInfo.processInfo.environment
                 e["PATH"] = env.pathString
-                e["GIT_OPTIONAL_LOCKS"] = "0"
+                // Neutralize repo config that would make git run programs.
+                for (k, v) in GitSafety.environment { e[k] = v }
                 e["NO_COLOR"] = "1"
                 e["PAGER"] = "cat"
                 e["MANPAGER"] = "cat"
                 e["TERM"] = "dumb"
-                p.environment = e
-                let out = Pipe()
-                p.standardOutput = out
-                p.standardError = out
-                p.standardInput = FileHandle.nullDevice
-                do { try p.run() } catch { cont.resume(returning: nil); return }
-                let timer = DispatchWorkItem { if p.isRunning { p.terminate() } }
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
-                let data = out.fileHandleForReading.readDataToEndOfFile()
-                p.waitUntilExit()
-                timer.cancel()
-                cont.resume(returning: String(decoding: data, as: UTF8.self))
+                guard let r = ProcessRunner.run(argv, cwd: dir, environment: e, timeout: timeout) else {
+                    cont.resume(returning: nil); return
+                }
+                if r.timedOut { Self.timeouts.withLock { $0 += 1 } }
+                cont.resume(returning: String(decoding: r.output, as: UTF8.self))
             }
         }
     }
+
+    /// How many helper commands hit their time limit (shown in problem reports and tests).
+    static let timeouts = OSAllocatedUnfairLock(initialState: 0)
+    public static var timeoutCount: Int { timeouts.withLock { $0 } }
 }
 
 /// Native generators that specs can reference by name.
@@ -97,7 +100,11 @@ public enum Generators {
         "brew_installed", "docker_containers", "docker_images", "just_recipes",
     ]
 
+    public static func forgetCache(cwd: String) { ScriptRunner.shared.forget(cwd: cwd) }
+
     public static func run(_ name: String, cwd: String, env: ShellEnvironment) async -> [Suggestion] {
+        // Don't run git automatically in a repo whose config could run programs.
+        if name.hasPrefix("git_"), GitSafety.isRisky(cwd: cwd) { return [] }
         let r = ScriptRunner.shared
         func lines(_ s: String?) -> [String] {
             (s ?? "").split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
@@ -105,13 +112,15 @@ public enum Generators {
         switch name {
         case "git_branches", "git_local_branches", "git_remote_branches":
             let refs = name == "git_local_branches" ? "refs/heads" : name == "git_remote_branches" ? "refs/remotes" : "refs/heads refs/remotes"
-            let out = await r.run("git for-each-ref --sort=-committerdate --format='%(refname:short)\t%(committerdate:relative) · %(subject)' \(refs)", cwd: cwd, env: env, cacheSeconds: 3)
+            let out = await r.run("git for-each-ref --sort=-committerdate --format='%(refname:short)\t%(committerdate:unix)\t%(subject)' \(refs)", cwd: cwd, env: env, cacheSeconds: 3)
             var seen = Set<String>()
             var res: [Suggestion] = []
             for l in lines(out) {
-                let parts = l.split(separator: "\t", maxSplits: 1).map(String.init)
+                let parts = l.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
                 guard let n = parts.first, !n.hasSuffix("/HEAD"), n != "origin", seen.insert(n).inserted else { continue }
-                res.append(Suggestion(name: n, description: parts.count > 1 ? String(parts[1].prefix(80)) : nil))
+                let when = parts.count > 1 ? RelativeTime.format(unix: parts[1]) : nil
+                let desc = [when, parts.count > 2 ? parts[2] : nil].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+                res.append(Suggestion(name: n, description: desc.isEmpty ? nil : String(desc.prefix(80))))
             }
             return res
         case "git_remotes":
@@ -144,9 +153,11 @@ public enum Generators {
                 return Suggestion(name: p[0], description: p.count > 1 ? p[1] : nil)
             }
         case "git_commits":
-            return lines(await r.run("git log --format='%h\t%s · %cr' -40", cwd: cwd, env: env, cacheSeconds: 3)).map { l in
-                let p = l.split(separator: "\t", maxSplits: 1).map(String.init)
-                return Suggestion(name: p[0], description: p.count > 1 ? String(p[1].prefix(80)) : nil)
+            return lines(await r.run("git log --format='%h\t%ct\t%s' -40", cwd: cwd, env: env, cacheSeconds: 3)).map { l in
+                let p = l.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+                let when = p.count > 1 ? RelativeTime.format(unix: p[1]) : nil
+                let desc = [p.count > 2 ? p[2] : nil, when].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+                return Suggestion(name: p[0], description: desc.isEmpty ? nil : String(desc.prefix(80)))
             }
         case "git_aliases":
             return lines(await r.run("git config --get-regexp '^alias\\.'", cwd: cwd, env: env, cacheSeconds: 30)).compactMap { l in
@@ -302,6 +313,7 @@ public struct GitChange: Sendable, Equatable {
 extension Generators {
     /// Changed files in the repo containing `cwd`, with paths relative to `cwd`.
     public static func gitChanges(cwd: String, env: ShellEnvironment) async -> [GitChange] {
+        if GitSafety.isRisky(cwd: cwd) { return [] }
         let out = await ScriptRunner.shared.run("git status --porcelain=v1 -uall", cwd: cwd, env: env, timeout: 3)
         return GitChange.parse(out ?? "").map { c in
             var c = c
@@ -312,14 +324,13 @@ extension Generators {
 }
 
 /// Executables on PATH, cached briefly.
-public final class CommandIndex: @unchecked Sendable {
+public final class CommandIndex: Sendable {
     public static let shared = CommandIndex()
-    private var cache: [String: (Date, [String], Set<String>)] = [:]
-    private let lock = NSLock()
+    private let cache = OSAllocatedUnfairLock(initialState: [String: (Date, [String], Set<String>)]())
 
     private func load(_ env: ShellEnvironment) -> ([String], Set<String>) {
         let key = env.pathString
-        if let hit = lock.withLock({ cache[key] }), Date().timeIntervalSince(hit.0) < 30 { return (hit.1, hit.2) }
+        if let hit = cache.withLock({ $0[key] }), Date().timeIntervalSince(hit.0) < 30 { return (hit.1, hit.2) }
         var set = Set<String>()
         let fm = FileManager.default
         for dir in env.path {
@@ -328,9 +339,9 @@ public final class CommandIndex: @unchecked Sendable {
                 if fm.isExecutableFile(atPath: dir + "/" + item) { set.insert(item) }
             }
         }
-        let list = set.sorted()
-        lock.withLock { cache[key] = (Date(), list, set) }
-        return (list, set)
+        let list = set.sorted(), found = set
+        cache.withLock { $0[key] = (Date(), list, found) }
+        return (list, found)
     }
 
     public func commands(env: ShellEnvironment) -> [String] { load(env).0 }
@@ -383,15 +394,19 @@ public final class CommandIndex: @unchecked Sendable {
 
 /// Learns a command's options from its man page, or from `--help` for
 /// commands known to handle `--help` safely.
-public final class HelpParser: @unchecked Sendable {
+public final class HelpParser: Sendable {
     public static let shared = HelpParser()
-    private var cache: [String: [OptionSpec]] = [:]
-    private var inFlight: Set<String> = []
-    private let lock = NSLock()
+    private struct State: Sendable {
+        var cache: [String: [OptionSpec]] = [:]
+        var inFlight: Set<String> = []
+        var allowlist = HelpParser.defaultAllowlist
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     /// Commands it's safe to run with `--help`. Anything else only gets its
     /// man page read, because an unknown script might ignore `--help` and run.
-    public var helpAllowlist: Set<String> = [
+    public var helpAllowlist: Set<String> { state.withLock { $0.allowlist } }
+    static let defaultAllowlist: Set<String> = [
         "git", "npm", "npx", "node", "deno", "bun", "yarn", "pnpm", "python3", "python", "pip", "pip3", "uv",
         "cargo", "rustc", "rustup", "go", "swift", "xcodebuild", "xcrun", "docker", "kubectl", "helm", "brew", "gh",
         "curl", "wget", "rg", "fd", "bat", "eza", "lsd", "jq", "yq", "fzf", "terraform", "aws", "gcloud", "az",
@@ -402,28 +417,29 @@ public final class HelpParser: @unchecked Sendable {
 
     /// Returns cached options immediately if known.
     public func cached(_ command: String) -> [OptionSpec]? {
-        lock.withLock { cache[command] }
+        state.withLock { $0.cache[command] }
     }
 
     public func options(for command: String, env: ShellEnvironment) async -> [OptionSpec] {
         if let c = cached(command) { return c }
         // Only plain command names that exist; never arbitrary paths.
         guard !command.contains("/"), CommandIndex.shared.contains(command, env: env) else { return [] }
-        let started = lock.withLock { inFlight.insert(command).inserted }
+        let started = state.withLock { $0.inFlight.insert(command).inserted }
         if !started { return [] }
 
         // The man page is always safe to read.
         var opts = await fromMan(command, env: env)
-        if opts.count < 3, lock.withLock({ helpAllowlist.contains(command) }) {
+        if opts.count < 3, helpAllowlist.contains(command) {
             let help = HelpParser.parse(await ScriptRunner.shared.run(argv: ["/usr/bin/env", command, "--help"], cwd: NSTemporaryDirectory(), env: env, timeout: 1.5) ?? "")
             if help.count > opts.count { opts = help }
         }
-        lock.withLock { cache[command] = opts; inFlight.remove(command) }
+        let found = opts
+        state.withLock { $0.cache[command] = found; $0.inFlight.remove(command) }
         return opts
     }
 
     public func allow(_ commands: [String]) {
-        lock.withLock { helpAllowlist.formUnion(commands) }
+        state.withLock { $0.allowlist.formUnion(commands) }
     }
 
     private func fromMan(_ command: String, env: ShellEnvironment) async -> [OptionSpec] {

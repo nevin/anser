@@ -13,17 +13,44 @@ final class CommandEditor: NSTextView {
     private(set) var ghostSuffix = "" { didSet { if ghostSuffix != oldValue { needsDisplay = true } } }
 
     let popup = CompletionPopup()
-    private var popupContext: CompletionContext?
-    private var popupUserNavigated = false
+    var popupContext: CompletionContext?
+    var popupUserNavigated = false
     private var completionTask: Task<Void, Never>?
     private var completionGeneration = 0
 
     private var historyItems: [String] = []
-    private var historyIndex = -1
+    var historyIndex = -1
     private var historyDraft = ""
-    private var programmatic = false
+    var programmatic = false
 
     var theme: Theme = GhosttyRuntime.shared.theme { didSet { applyTheme() } }
+
+    // Mistakes as you type (CommandEditor+Power.swift).
+    var issues: [CommandLint.Issue] = []
+    var bracketPair: (Int, Int)?
+    // More cursors: ⌥-click, ⌥-drag, ⌥⌘D, ⌃⌘G.
+    var extraSelections: [NSRange] = [] {
+        didSet {
+            needsDisplay = true
+            if extraSelections.count != oldValue.count {
+                // VoiceOver: say how many cursors there are now.
+                let n = extraSelections.count + 1
+                NSAccessibility.post(element: self, notification: .announcementRequested,
+                                     userInfo: [.announcement: n == 1 ? "One cursor" : "\(n) cursors", .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+            }
+        }
+    }
+    var columnDragStart: Int?
+    var multiEditing = false
+    // ⌃R: history right under the editor.
+    var inlineHistory = false
+    // Vim keys (Settings → Editor).
+    var vimNormal = false { didSet { if vimNormal != oldValue { needsDisplay = true; pane?.updateHint() } } }
+    var vimPending = ""
+    // "# describe it" then Tab: AI writes the command.
+    var aiTask: Task<Void, Never>?
+    var aiBusy = false
+    var aiNote: String?
 
     var lineHeight: CGFloat {
         guard let font else { return 17 }
@@ -117,17 +144,33 @@ final class CommandEditor: NSTextView {
     // MARK: Text changes
 
     func setCommand(_ s: String, selectPlaceholder: Bool = false) {
+        extraSelections = []
         programmatic = true
-        defer { programmatic = false }
-        let full = NSRange(location: 0, length: (string as NSString).length)
-        if shouldChangeText(in: full, replacementString: s) {
-            replaceCharacters(in: full, with: s)
-            didChangeText()
-        }
-        let len = (s as NSString).length
-        setSelectedRange(NSRange(location: len, length: 0))
+        replaceWholeText(s, caret: (s as NSString).length)
+        programmatic = false
         if selectPlaceholder, let r = Highlighter.nextPlaceholder(in: s, after: 0) { setSelectedRange(r) }
         hidePopup()
+    }
+
+    /// Replaces everything as one undo step of its own (⌘Z puts back exactly what was there).
+    /// macOS closes its automatic undo group only when a real event (key, click)
+    /// ends, so a change made from code outside one (an AI answer, say) gets its
+    /// own closed group; during a key press it joins that key press's step.
+    func replaceWholeText(_ text: String, caret: Int, length: Int = 0) {
+        let full = NSRange(location: 0, length: (string as NSString).length)
+        if string != text {
+            let um = undoManager
+            let ownGroup = (um?.groupingLevel ?? 1) == 0
+            if ownGroup { um?.groupsByEvent = false; um?.beginUndoGrouping() }
+            breakUndoCoalescing()
+            if shouldChangeText(in: full, replacementString: text) {
+                replaceCharacters(in: full, with: text)
+                didChangeText()
+            }
+            breakUndoCoalescing()
+            if ownGroup { um?.endUndoGrouping(); um?.groupsByEvent = true }
+        }
+        setSelectedRange(NSRange(location: min(caret, (text as NSString).length), length: length))
     }
 
     func clear() {
@@ -139,11 +182,12 @@ final class CommandEditor: NSTextView {
         super.didChangeText()
         highlight()
         updateGhost()
+        if !programmatic { aiNote = nil }
         pane?.editorContentChanged()
         pane?.updateHint()
-        if !programmatic {
+        if !programmatic, !multiEditing {
             resetHistoryNavigation()
-            scheduleCompletion(explicit: false)
+            if inlineHistory { refreshInlineHistory() } else { scheduleCompletion(explicit: false) }
         }
     }
 
@@ -152,6 +196,8 @@ final class CommandEditor: NSTextView {
         updateGhost()
         if !stillSelecting { pane?.updateHint() }
         if charRange != lastExpanded { selectionStack.removeAll() }
+        updateBracketMatch()
+        applyIssueStyles()
         needsDisplay = true
     }
 
@@ -186,6 +232,7 @@ final class CommandEditor: NSTextView {
         }
         ts.endEditing()
         typingAttributes = [.font: font, .foregroundColor: theme.foreground]
+        lint()
     }
 
     private func updateGhost() {
@@ -203,10 +250,13 @@ final class CommandEditor: NSTextView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        drawBracketMatch()
         super.draw(dirtyRect)
+        drawExtraSelections()
         if string.isEmpty, let font, pane?.editorUsable == true {
             let x = textContainerOrigin.x + (textContainer?.lineFragmentPadding ?? 5)
-            ("Type a command" as NSString).draw(at: NSPoint(x: x, y: textContainerOrigin.y),
+            let room = bounds.width - x - 8
+            ((pane?.placeholder(fitting: room, font: font) ?? "Type a command") as NSString).draw(at: NSPoint(x: x, y: textContainerOrigin.y),
                                                 withAttributes: [.font: font, .foregroundColor: theme.foreground.withAlphaComponent(0.28)])
         }
         guard !ghostSuffix.isEmpty, let lm = layoutManager, let tc = textContainer, let font else { return }
@@ -220,6 +270,7 @@ final class CommandEditor: NSTextView {
 
     private func acceptGhost(wordOnly: Bool) -> Bool {
         guard !ghostSuffix.isEmpty, !ghostSuffix.hasSuffix(" …") || wordOnly else { return false }
+        Services.shared.record("ghost.accepted")
         var add = ghostSuffix.hasSuffix(" …") ? String(ghostSuffix.dropLast(2)) : ghostSuffix
         if wordOnly {
             // Up to and including the next word boundary.
@@ -241,6 +292,7 @@ final class CommandEditor: NSTextView {
     override func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let key = Int(event.keyCode)
+        if handlePowerKeys(event) { return }
 
         // Shift/Option-Return: newline instead of running.
         if key == kVK_Return || key == kVK_ANSI_KeypadEnter, flags.contains(.shift) || flags.contains(.option) {
@@ -261,7 +313,10 @@ final class CommandEditor: NSTextView {
                 return
             case "d":
                 if string.isEmpty { pane?.sendControl("d"); return }
-            case "r": pane?.showHistorySearch(); return
+            case "r":
+                // ⌃R: history right under the editor; again for older matches.
+                if inlineHistory, popup.isVisible { popup.move(1); popupUserNavigated = true } else { startInlineHistory() }
+                return
             case "l": pane?.clearScreen(); return
             case "u":
                 let sel = selectedRange()
@@ -280,13 +335,16 @@ final class CommandEditor: NSTextView {
     override func doCommand(by selector: Selector) {
         switch selector {
         case #selector(insertNewline(_:)):
-            if popup.isVisible, popupUserNavigated, let c = popup.selected { accept(c); return }
+            if popup.isVisible, popupUserNavigated || inlineHistory, let c = popup.selected { accept(c); return }
+            extraSelections = []
             hidePopup()
             if needsContinuation(string) { insertText("\n", replacementRange: selectedRange()); return }
             submit()
 
         case #selector(insertTab(_:)):
             if popup.isVisible, let c = popup.selected { accept(c); return }
+            // "# what you want" then Tab: AI writes the command.
+            if isAIRequest { askAIInline(); return }
             if let r = Highlighter.nextPlaceholder(in: string, after: NSMaxRange(selectedRange())) { setSelectedRange(r); return }
             scheduleCompletion(explicit: true)
 
@@ -312,6 +370,8 @@ final class CommandEditor: NSTextView {
             super.doCommand(by: selector)
 
         case #selector(cancelOperation(_:)):
+            if aiBusy { cancelAIInline(); return }
+            if !extraSelections.isEmpty { extraSelections = []; return }
             if popup.isVisible { hidePopup(); return }
             if historyIndex >= 0 { setCommand(historyDraft); resetHistoryNavigation(); return }
             if selectedRange().length > 0 { setSelectedRange(NSRange(location: NSMaxRange(selectedRange()), length: 0)); return }
@@ -335,6 +395,11 @@ final class CommandEditor: NSTextView {
     private static let closers: Set<Character> = [")", "]", "}", "\"", "'", "`"]
 
     override func insertText(_ string: Any, replacementRange: NSRange) {
+        if !extraSelections.isEmpty, !multiEditing, !programmatic, let s = (string as? String) ?? (string as? NSAttributedString)?.string,
+           replacementRange.location == NSNotFound || replacementRange == selectedRange() {
+            insertAtAllCursors(s)
+            return
+        }
         guard let s = string as? String, s.count == 1, let ch = s.first, !programmatic,
               replacementRange.location == NSNotFound || replacementRange == selectedRange() else {
             super.insertText(string, replacementRange: replacementRange)
@@ -379,6 +444,7 @@ final class CommandEditor: NSTextView {
     }
 
     override func deleteBackward(_ sender: Any?) {
+        if !extraSelections.isEmpty, !multiEditing { deleteAtAllCursors(forward: false); return }
         // Backspace between an empty pair removes both.
         let sel = selectedRange()
         let ns = string as NSString
@@ -499,14 +565,14 @@ final class CommandEditor: NSTextView {
         return sel.length == 0 && sel.location == (string as NSString).length
     }
 
-    private var caretOnFirstLine: Bool {
+    var caretOnFirstLine: Bool {
         let loc = selectedRange().location
         let ns = string as NSString
         let nl = ns.range(of: "\n")
         return nl.location == NSNotFound || loc <= nl.location
     }
 
-    private var caretOnLastLine: Bool {
+    var caretOnLastLine: Bool {
         let loc = selectedRange().location
         let ns = string as NSString
         let nl = ns.range(of: "\n", options: .backwards)
@@ -521,14 +587,16 @@ final class CommandEditor: NSTextView {
         return trimmed.hasSuffix("|") || trimmed.hasSuffix("&&") || trimmed.hasSuffix("||")
     }
 
-    private func submit() {
+    func submit() {
+        extraSelections = []
+        if Services.shared.config.editor.vimMode { vimNormal = false }
         var cmd = string
         // Expand an abbreviation typed as the whole command ("gst⏎").
         let trimmed = cmd.trimmingCharacters(in: .whitespaces)
         if let exp = Services.shared.config.abbreviations[trimmed] { cmd = exp }
         hidePopup()
         resetHistoryNavigation()
-        pane?.run(cmd)
+        pane?.submitFromEditor(cmd)
         programmatic = true
         let full = NSRange(location: 0, length: (string as NSString).length)
         if shouldChangeText(in: full, replacementString: "") { replaceCharacters(in: full, with: ""); didChangeText() }
@@ -555,7 +623,8 @@ final class CommandEditor: NSTextView {
         historyItems = []
     }
 
-    private func historyBack() {
+    func historyBack() {
+        Services.shared.tip(in: pane) { $0.historyArrow() }
         if historyIndex == -1 {
             historyDraft = string
             historyItems = Services.shared.history.recentCommands(withPrefix: string.trimmingCharacters(in: .whitespaces))
@@ -567,7 +636,7 @@ final class CommandEditor: NSTextView {
         (historyIndex, historyItems, historyDraft) = saved
     }
 
-    private func historyForward() {
+    func historyForward() {
         let saved = (historyItems, historyDraft)
         if historyIndex <= 0 {
             setCommand(historyDraft)
@@ -639,12 +708,14 @@ final class CommandEditor: NSTextView {
     }
 
     func hidePopup() {
+        inlineHistory = false
         completionTask?.cancel()
         popup.hide()
         popupUserNavigated = false
     }
 
-    private func accept(_ c: Completion) {
+    func accept(_ c: Completion) {
+        Services.shared.record("completion.accepted")
         guard let ctx = popupContext else { return }
         hidePopup()
         if c.replacesLine {
@@ -668,6 +739,7 @@ final class CommandEditor: NSTextView {
     // MARK: Paste & drop
 
     override func paste(_ sender: Any?) {
+        if !extraSelections.isEmpty, let text = NSPasteboard.general.string(forType: .string) { pasteAtAllCursors(text); return }
         if insertFileURLs(from: .general) { return }
         pasteAsPlainText(sender)
     }

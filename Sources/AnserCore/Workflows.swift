@@ -190,3 +190,41 @@ public enum MarkdownExport {
         return md.joined(separator: "\n")
     }
 }
+
+import CryptoKit
+
+/// Workflows in a repo's .anser/workflows come with the code you cloned, so
+/// they run only after you've seen their steps and trusted them. Trust is tied
+/// to the file's exact contents: any change asks again.
+public struct WorkflowTrust {
+    let defaults: UserDefaults
+    static let key = "trustedProjectWorkflows"
+
+    public init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    static func fingerprint(_ file: URL) -> String? {
+        guard let data = try? Data(contentsOf: file) else { return nil }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Personal workflows are always trusted (you wrote them).
+    public func isTrusted(_ w: Workflow) -> Bool {
+        guard w.source == .project else { return true }
+        guard let f = w.file, let fp = Self.fingerprint(f) else { return false }
+        return (defaults.dictionary(forKey: Self.key) as? [String: String])?[f.standardizedFileURL.path] == fp
+    }
+
+    public func forget(_ w: Workflow) {
+        guard let f = w.file else { return }
+        var all = (defaults.dictionary(forKey: Self.key) as? [String: String]) ?? [:]
+        all[f.standardizedFileURL.path] = nil
+        defaults.set(all, forKey: Self.key)
+    }
+
+    public func trust(_ w: Workflow) {
+        guard let f = w.file, let fp = Self.fingerprint(f) else { return }
+        var all = (defaults.dictionary(forKey: Self.key) as? [String: String]) ?? [:]
+        all[f.standardizedFileURL.path] = fp
+        defaults.set(all, forKey: Self.key)
+    }
+}

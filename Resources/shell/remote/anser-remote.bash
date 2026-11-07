@@ -7,8 +7,9 @@ if [ -r "$HOME/.bashrc" ] && ! grep -qs bashrc "$_ar_rc" 2>/dev/null; then . "$H
 unset _ar_rc
 [ -n "$ANSER_REMOTE_DIR" ] && trap 'command rm -rf -- "$ANSER_REMOTE_DIR"' EXIT
 
+_ar_tok=${ANSER_REMOTE_TOKEN:-none}; unset ANSER_REMOTE_TOKEN
 _ar_mark=$(printf '\356\200\200'); _ar_sep=$(printf '\356\200\201')
-_ar_emit() { printf '\033]2;%sanser:%s\007' "$_ar_mark" "$1"; }
+_ar_emit() { printf '\033]2;%sanser:%s%s%s\007' "$_ar_mark" "$_ar_tok" "$_ar_sep" "$1"; }
 _ar_ready=0
 _ar_ec=0
 # PROMPT_COMMAND = _ar_start; (user's commands); _ar_end - so $? is the

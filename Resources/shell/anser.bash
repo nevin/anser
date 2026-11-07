@@ -1,6 +1,12 @@
 # Anser shell integration for bash. Anser starts bash with --rcfile pointing
 # here, so first load the user's startup files like a login shell would.
 
+# Nothing but macOS's "Last login: …" line has been printed yet; clear it.
+if [ -n "$ANSER_HIDE_LOGIN" ]; then
+    case $- in *i*) builtin printf '\033[H\033[2J' ;; esac
+    unset ANSER_HIDE_LOGIN
+fi
+
 [ -r /etc/profile ] && builtin source /etc/profile
 for _anser_rc in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
     if [ -r "$_anser_rc" ]; then builtin source "$_anser_rc"; break; fi
@@ -34,6 +40,12 @@ if [[ -z "${bash_preexec_imported:-}${__bp_imported:-}" && -r "$ANSER_GHOSTTY_IN
     builtin source "$ANSER_GHOSTTY_INTEGRATION/bash/bash-preexec.sh"
 fi
 
+# `imgcat FILE` shows pictures, unless you have an imgcat of your own.
+if [[ -n "$ANSER_HELPER" && -x "$ANSER_HELPER" ]] && ! type -P imgcat >/dev/null 2>&1; then
+    _anser_helper=$ANSER_HELPER
+    imgcat() { "$_anser_helper" imgcat "$@"; }
+fi
+unset ANSER_HELPER
 if [[ -n "$ANSER_FIFO" && -p "$ANSER_FIFO" ]] && exec 249<>"$ANSER_FIFO"; then
     unset ANSER_FIFO ANSER_SHELL_DIR ANSER_GHOSTTY_INTEGRATION
     _anser_path=""
@@ -72,6 +84,9 @@ if [[ -n "$ANSER_FIFO" && -p "$ANSER_FIFO" ]] && exec 249<>"$ANSER_FIFO"; then
     # ssh: add Anser's hooks to an interactive remote session (see anser.zsh).
     if [ -r "$ANSER_SSH_BOOTSTRAP" ]; then
         _anser_ssh_boot=$ANSER_SSH_BOOTSTRAP
+        _anser_tok=$ANSER_REMOTE_TOKEN
+        unset ANSER_REMOTE_TOKEN
+        _anser_ssh_command() { local b; b=$(cat "$_anser_ssh_boot"); printf '%s\n' "${b//@@TOKEN@@/$_anser_tok}"; }
         ssh() {
             local a host="" i=0
             local -a args=("$@")
@@ -89,7 +104,7 @@ if [[ -n "$ANSER_FIFO" && -p "$ANSER_FIFO" ]] && exec 249<>"$ANSER_FIFO"; then
                 esac
             done
             if [ -z "$host" ] || [ ! -t 0 ] || [ ! -t 1 ]; then command ssh "$@"; return; fi
-            command ssh -t "$@" "$(cat "$_anser_ssh_boot")"
+            command ssh -t "$@" "$(_anser_ssh_command)"
         }
     fi
 

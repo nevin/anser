@@ -23,6 +23,10 @@ public struct AnserConfig: Codable, Sendable {
         public var fontFamily: String?
         /// Delay before the popup appears (ms).
         public var popupDelayMs: Int = 60
+        /// Underline mistakes (unknown commands, open quotes and brackets) and warn about risky commands.
+        public var lint: Bool = true
+        /// vi keys in the editor: Esc for normal mode, i to type again.
+        public var vimMode: Bool = false
 
         public init() {}
         public init(from decoder: Decoder) throws {
@@ -35,6 +39,8 @@ public struct AnserConfig: Codable, Sendable {
             fontSize = try c.decodeIfPresent(Double.self, forKey: .fontSize) ?? d.fontSize
             fontFamily = try c.decodeIfPresent(String.self, forKey: .fontFamily)
             popupDelayMs = try c.decodeIfPresent(Int.self, forKey: .popupDelayMs) ?? d.popupDelayMs
+            lint = try c.decodeIfPresent(Bool.self, forKey: .lint) ?? d.lint
+            vimMode = try c.decodeIfPresent(Bool.self, forKey: .vimMode) ?? d.vimMode
         }
     }
 
@@ -43,7 +49,36 @@ public struct AnserConfig: Codable, Sendable {
         public var fontFamily: String?
         public var fontSize: Double?
         /// A Ghostty theme name, e.g. "Catppuccin Mocha", "GitHub Dark".
+        /// Without `mode` this is the one theme always used (and the window follows macOS).
         public var theme: String?
+        /// "system" (follow macOS), "dark" or "light". Sets the window chrome and
+        /// picks `darkTheme` / `lightTheme` for the terminal. nil keeps the old single-theme behavior.
+        public var mode: String?
+        /// Terminal theme in dark mode (falls back to `theme`, then Ghostty's default).
+        public var darkTheme: String?
+        /// Terminal theme in light mode (falls back to "Xcode Light").
+        public var lightTheme: String?
+
+        public static let defaultLightTheme = "Xcode Light"
+
+        public init(mode: String?) { self.mode = mode }
+
+        /// Whether the dark look applies, given whether macOS itself is in dark mode.
+        public func usesDark(systemIsDark: Bool) -> Bool {
+            switch mode {
+            case "dark": true
+            case "light": false
+            default: systemIsDark
+            }
+        }
+
+        /// The terminal theme to use right now, or nil for whatever Ghostty would pick.
+        public func themeName(systemIsDark: Bool) -> String? {
+            func nonEmpty(_ s: String?) -> String? { s.flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 } }
+            guard mode != nil else { return nonEmpty(theme) }
+            if usesDark(systemIsDark: systemIsDark) { return nonEmpty(darkTheme) ?? nonEmpty(theme) }
+            return nonEmpty(lightTheme) ?? Self.defaultLightTheme
+        }
         /// 0.3–1.0
         public var backgroundOpacity: Double?
         /// "block", "bar", "underline", "block_hollow"
@@ -55,12 +90,14 @@ public struct AnserConfig: Codable, Sendable {
 
         public init() {}
 
-        /// The Ghostty config lines for these settings.
-        public var ghosttyLines: [String] {
+        /// The Ghostty config lines for these settings (dark macOS assumed when not given).
+        public var ghosttyLines: [String] { ghosttyLines(systemIsDark: true) }
+
+        public func ghosttyLines(systemIsDark: Bool) -> [String] {
             var l: [String] = []
             if let f = fontFamily, !f.isEmpty { l += ["font-family = \"\"", "font-family = \(f)"] }
             if let s = fontSize { l.append("font-size = \(s)") }
-            if let t = theme, !t.isEmpty { l.append("theme = \(t)") }
+            if let t = themeName(systemIsDark: systemIsDark) { l.append("theme = \(t)") }
             if let o = backgroundOpacity { l.append("background-opacity = \(min(1, max(0.2, o)))") }
             if let c = cursorStyle, !c.isEmpty { l.append("cursor-style = \(c)") }
             if let b = cursorBlink { l.append("cursor-style-blink = \(b)") }
@@ -80,9 +117,37 @@ public struct AnserConfig: Codable, Sendable {
     public var openFilesWith: String?
     /// Colored bars beside each command's output, with hover actions.
     public var commandBlocks: Bool = true
-    /// Optional AI help (explain errors, generate commands) via the Claude API.
+    /// Optional AI help (explain errors, generate commands) via Claude or GitHub Copilot (`aiProvider`).
     /// Off until you turn it on; the API key lives in the Keychain.
     public var aiEnabled: Bool = false
+    /// Which AI answers: "claude" (Claude API, your key) or "copilot" (GitHub Copilot CLI, your GitHub sign-in).
+    public var aiProvider: String = "claude"
+    /// Optional Copilot model (e.g. "claude-sonnet-4.5", "gpt-5"); empty lets Copilot choose.
+    public var copilotModel: String?
+    /// Ollama model for local AI (e.g. "qwen2.5-coder:7b"); empty uses the first installed model.
+    public var ollamaModel: String?
+    /// Where Ollama listens (default http://localhost:11434).
+    public var ollamaURL: String?
+    /// A key that shows or hides a drop-down terminal from any app, e.g. "ctrl+`" or "alt+space". nil = off.
+    public var quickTerminalHotkey: String?
+    /// Height of the drop-down terminal as a share of the screen (0.2–0.9).
+    public var quickTerminalHeight: Double = 0.45
+    /// Per-folder / per-ssh-host settings: tab color, a badge, extra environment.
+    public var profiles: [Profile] = []
+    /// Hovering a file path printed in the output shows a Quick Look preview.
+    public var previewFilesOnHover: Bool = true
+    /// Shells keep running when Anser quits, restarts or updates, and come back
+    /// with their tabs (needs `restoreSession`). Closing a tab or pane still ends its shell.
+    public var keepShellsRunning: Bool = true
+    /// Show the branch's pull request and its checks next to the branch (needs the GitHub CLI, `gh`).
+    public var showPullRequests: Bool = true
+    /// Keep each command's output (secrets removed) so History → Output can search it. Stays on this Mac.
+    public var saveOutput: Bool = true
+    /// Count which features you use, only on this Mac (Help → Usage). Off until you turn it on.
+    public var usageStats: Bool = false
+    /// Where the Command Notebook lives: nil = ~/.config/anser/notebook.json, "icloud" = iCloud Drive/Anser,
+    /// or a folder path (e.g. a git repo you sync yourself).
+    public var notebookLocation: String?
     public var editor = Editor()
     /// Expanded when you press space after them, fish-style: "gco" → "git checkout".
     public var abbreviations: [String: String] = [:]
@@ -99,6 +164,8 @@ public struct AnserConfig: Codable, Sendable {
     public var ghostty: [String] = []
     /// Number of clipboard items to remember.
     public var clipboardHistorySize: Int = 50
+    /// Scrollback each tab keeps, in MB (the terminal drops the oldest lines past this).
+    public var scrollbackMB: Int = 10
     /// Extra commands that may be run with `--help` to learn their flags.
     public var helpCommands: [String] = []
     /// Commands matching any of these patterns (* and ? wildcards, case-insensitive)
@@ -108,6 +175,14 @@ public struct AnserConfig: Codable, Sendable {
     public var restoreSession: Bool = true
     /// Replace the shell's prompt with a short "❯", since the bar already shows folder and branch.
     public var compactPrompt: Bool = false
+    /// The editor sits right under the last output line until the screen
+    /// fills, instead of at the bottom of the window.
+    public var editorFollowsOutput: Bool = true
+    /// Show macOS's "Last login: …" line when a tab opens.
+    public var showLoginMessage: Bool = false
+    /// Keyboard tips under an empty editor. "auto" shows them while you're new
+    /// (your first few hundred commands), then hides them.
+    public var keyTips: String = "auto"
     /// Hide the command bar while these full-screen programs run.
     public var fullscreenApps: [String] = AnserConfig.defaultFullscreenApps
 
@@ -150,6 +225,19 @@ public struct AnserConfig: Codable, Sendable {
         openFilesWith = try c.decodeIfPresent(String.self, forKey: .openFilesWith)
         commandBlocks = try c.decodeIfPresent(Bool.self, forKey: .commandBlocks) ?? d.commandBlocks
         aiEnabled = try c.decodeIfPresent(Bool.self, forKey: .aiEnabled) ?? d.aiEnabled
+        aiProvider = try c.decodeIfPresent(String.self, forKey: .aiProvider) ?? d.aiProvider
+        copilotModel = try c.decodeIfPresent(String.self, forKey: .copilotModel)
+        ollamaModel = try c.decodeIfPresent(String.self, forKey: .ollamaModel)
+        ollamaURL = try c.decodeIfPresent(String.self, forKey: .ollamaURL)
+        quickTerminalHotkey = try c.decodeIfPresent(String.self, forKey: .quickTerminalHotkey)
+        quickTerminalHeight = try c.decodeIfPresent(Double.self, forKey: .quickTerminalHeight) ?? d.quickTerminalHeight
+        profiles = try c.decodeIfPresent([Profile].self, forKey: .profiles) ?? []
+        saveOutput = try c.decodeIfPresent(Bool.self, forKey: .saveOutput) ?? d.saveOutput
+        showPullRequests = try c.decodeIfPresent(Bool.self, forKey: .showPullRequests) ?? d.showPullRequests
+        keepShellsRunning = try c.decodeIfPresent(Bool.self, forKey: .keepShellsRunning) ?? d.keepShellsRunning
+        previewFilesOnHover = try c.decodeIfPresent(Bool.self, forKey: .previewFilesOnHover) ?? d.previewFilesOnHover
+        usageStats = try c.decodeIfPresent(Bool.self, forKey: .usageStats) ?? d.usageStats
+        notebookLocation = try c.decodeIfPresent(String.self, forKey: .notebookLocation)
         abbreviations = try c.decodeIfPresent([String: String].self, forKey: .abbreviations) ?? [:]
         snippets = try c.decodeIfPresent([Snippet].self, forKey: .snippets) ?? []
         keybindings = try c.decodeIfPresent([String: String].self, forKey: .keybindings) ?? [:]
@@ -157,12 +245,16 @@ public struct AnserConfig: Codable, Sendable {
         copyOnSelect = try c.decodeIfPresent(Bool.self, forKey: .copyOnSelect) ?? d.copyOnSelect
         ghostty = try c.decodeIfPresent([String].self, forKey: .ghostty) ?? []
         clipboardHistorySize = try c.decodeIfPresent(Int.self, forKey: .clipboardHistorySize) ?? d.clipboardHistorySize
+        scrollbackMB = min(1000, max(1, try c.decodeIfPresent(Int.self, forKey: .scrollbackMB) ?? d.scrollbackMB))
         helpCommands = try c.decodeIfPresent([String].self, forKey: .helpCommands) ?? []
         historyIgnore = try c.decodeIfPresent([String].self, forKey: .historyIgnore) ?? d.historyIgnore
         restoreSession = try c.decodeIfPresent(Bool.self, forKey: .restoreSession) ?? d.restoreSession
         compactPrompt = try c.decodeIfPresent(Bool.self, forKey: .compactPrompt) ?? d.compactPrompt
         shellPrompt = try c.decodeIfPresent(String.self, forKey: .shellPrompt) ?? (compactPrompt ? "compact" : d.shellPrompt)
         fullscreenApps = try c.decodeIfPresent([String].self, forKey: .fullscreenApps) ?? d.fullscreenApps
+        editorFollowsOutput = try c.decodeIfPresent(Bool.self, forKey: .editorFollowsOutput) ?? d.editorFollowsOutput
+        showLoginMessage = try c.decodeIfPresent(Bool.self, forKey: .showLoginMessage) ?? d.showLoginMessage
+        keyTips = try c.decodeIfPresent(String.self, forKey: .keyTips) ?? d.keyTips
     }
 
     public static var directory: URL {
@@ -218,11 +310,8 @@ public struct AnserConfig: Codable, Sendable {
         "gp": "git push",
         "gl": "git log --oneline --graph -20"
       },
-      "snippets": [
-        { "name": "Kill process on port", "command": "lsof -ti tcp:{{port}} | xargs kill" },
-        { "name": "Find files by name", "command": "find . -name '{{pattern}}' -not -path '*/node_modules/*'" },
-        { "name": "Undo last commit (keep changes)", "command": "git reset --soft HEAD~1" },
-        { "name": "New branch from main", "command": "git switch main && git pull && git switch -c {{branch}}" }
+      "profiles": [
+        { "host": "prod-*", "tabColor": "red", "badge": "PROD" }
       ],
       "keybindings": {
         "ctrl+g": "insert:git ",
@@ -232,10 +321,15 @@ public struct AnserConfig: Codable, Sendable {
       "helpCommands": [],
       "restoreSession": true,
       "shellPrompt": "hidden",
+      "editorFollowsOutput": true,
+      "showLoginMessage": false,
+      "keyTips": "auto",
       "appearance": {
         "fontFamily": null,
         "fontSize": null,
-        "theme": null,
+        "mode": "system",
+        "darkTheme": null,
+        "lightTheme": null,
         "backgroundOpacity": null,
         "cursorStyle": null
       },
@@ -272,7 +366,7 @@ public struct AnserConfig: Codable, Sendable {
 /// Named actions that keybindings and the command palette can trigger.
 public enum AnserAction: String, CaseIterable, Sendable {
     case historySearch, clipboardHistory, commandPalette, copyLastOutput, copyLastCommand
-    case newTab, newWindow, splitRight, splitDown, closePane, focusNextPane, focusPreviousPane
+    case newTab, newWindow, splitRight, splitDown, splitLeft, splitUp, closePane, focusNextPane, focusPreviousPane
     case clearScreen, toggleEditor, rerunLastCommand, openConfig, reloadConfig, jumpToPreviousPrompt, jumpToNextPrompt
     case increaseFontSize, decreaseFontSize, resetFontSize
     case findInTerminal, blockNavigator, pauseHistory, openSettings
@@ -283,6 +377,11 @@ public enum AnserAction: String, CaseIterable, Sendable {
     case zoomPane, toggleSidebar
     case runWorkflow, saveWorkflow, exportMarkdown, copyMarkdown, reportProblem
     case explainError, askClaude
+    case notebook, editNotebook, saveToNotebook, exportLastOutput, openWorkflowsFolder
+    case gitHistory, gitStashes, gitFetch, gitPull, gitPush
+    case quickTerminal, broadcastInput, searchOutput, resolveConflicts, openPullRequest
+    case importSettings, checkForUpdates, showUsage
+    case gitBlame, searchAllTabs, shareTab, deepClean
 
     public var title: String {
         switch self {
@@ -295,10 +394,12 @@ public enum AnserAction: String, CaseIterable, Sendable {
         case .newWindow: "New Window"
         case .splitRight: "Split Right"
         case .splitDown: "Split Down"
+        case .splitLeft: "Split Left"
+        case .splitUp: "Split Up"
         case .closePane: "Close Pane"
         case .focusNextPane: "Next Pane"
         case .focusPreviousPane: "Previous Pane"
-        case .clearScreen: "Clear Screen"
+        case .clearScreen: "Clear"
         case .toggleEditor: "Toggle Command Editor"
         case .rerunLastCommand: "Re-run Last Command"
         case .openConfig: "Open Config File"
@@ -328,13 +429,35 @@ public enum AnserAction: String, CaseIterable, Sendable {
         case .moveTabToNewWindow: "Move Tab to New Window"
         case .zoomPane: "Zoom Pane / Restore Split"
         case .toggleSidebar: "Toggle Sidebar"
-        case .runWorkflow: "Run Workflow"
+        case .runWorkflow: "Workflows (view and run)"
         case .saveWorkflow: "Save Commands as Workflow"
-        case .exportMarkdown: "Export Tab as Markdown"
+        case .exportMarkdown: "Export Tab (Markdown, JSON, PDF…)"
         case .copyMarkdown: "Copy Tab as Markdown"
         case .reportProblem: "Report a Problem"
-        case .explainError: "Explain Last Error with Claude"
-        case .askClaude: "Ask Claude for a Command"
+        case .explainError: "Explain Last Error with AI"
+        case .askClaude: "Ask AI for a Command"
+        case .notebook: "Command Notebook (side panel)"
+        case .editNotebook: "Edit Notebook"
+        case .saveToNotebook: "Save Command to Notebook"
+        case .exportLastOutput: "Export Last Command's Output"
+        case .openWorkflowsFolder: "Open Workflows Folder"
+        case .gitHistory: "Git: Commit History"
+        case .gitStashes: "Git: Stashes"
+        case .gitFetch: "Git: Fetch"
+        case .gitPull: "Git: Pull"
+        case .gitPush: "Git: Push"
+        case .quickTerminal: "Show / Hide Quick Terminal"
+        case .broadcastInput: "Type in All Panes of This Tab"
+        case .searchOutput: "Search Command Output"
+        case .resolveConflicts: "Git: Resolve Conflicts"
+        case .openPullRequest: "Git: Open Pull Request"
+        case .importSettings: "Import from iTerm2 or Warp"
+        case .checkForUpdates: "Check for Updates"
+        case .showUsage: "Your Feature Usage"
+        case .gitBlame: "Git: Blame File"
+        case .searchAllTabs: "Find in All Tabs"
+        case .shareTab: "Share This Tab (Read-Only)"
+        case .deepClean: "Deep Clean (reset and forget this tab's output)"
         }
     }
 }

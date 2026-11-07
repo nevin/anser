@@ -2,6 +2,12 @@
 # Restore the user's real ZDOTDIR, run their .zshenv, then load the hooks.
 # Everything after this (.zprofile, .zshrc, .zlogin) loads from the user's own ZDOTDIR.
 
+# Nothing but macOS's "Last login: …" line has been printed yet; clear it.
+if [[ -n "$ANSER_HIDE_LOGIN" ]]; then
+    [[ -o interactive ]] && 'builtin' 'print' -n $'\e[H\e[2J'
+    'builtin' 'unset' 'ANSER_HIDE_LOGIN'
+fi
+
 if [[ -n "${ANSER_ORIG_ZDOTDIR+X}" ]]; then
     'builtin' 'export' ZDOTDIR="$ANSER_ORIG_ZDOTDIR"
     'builtin' 'unset' 'ANSER_ORIG_ZDOTDIR'

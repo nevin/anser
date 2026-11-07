@@ -32,19 +32,23 @@ public struct HistoryCommand: Sendable, Hashable {
 }
 
 public enum HistoryScope: Int, Sendable, CaseIterable {
-    case all, directory, session, failed
+    case all, directory, session, failed, output
     public var title: String {
         switch self {
         case .all: "All"
         case .directory: "This folder"
         case .session: "This tab"
         case .failed: "Failed"
+        case .output: "Output"
         }
     }
 }
 
 /// Persistent command history in SQLite, with an in-memory index of distinct
 /// commands for instant suggestions.
+/// Thread-safe by convention, not by the compiler: every public method takes
+/// `lock` before touching `db` or the in-memory index, and private helpers are
+/// only called with it held. Keep it that way when adding methods.
 public final class HistoryStore: @unchecked Sendable {
     private var db: OpaquePointer?
     private let lock = NSRecursiveLock()
@@ -78,6 +82,8 @@ public final class HistoryStore: @unchecked Sendable {
         exec("CREATE INDEX IF NOT EXISTS idx_history_started ON history(started)")
         exec("CREATE INDEX IF NOT EXISTS idx_history_command ON history(command)")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        // Saved command output (the end of it, secrets removed), for searching.
+        exec("CREATE TABLE IF NOT EXISTS output(history_id INTEGER PRIMARY KEY, text TEXT NOT NULL)")
         loadIndex()
     }
 
@@ -117,6 +123,31 @@ public final class HistoryStore: @unchecked Sendable {
     }
 
     /// Deletes every occurrence of a command (for removing secrets or typos).
+    /// Removes specific runs (and their saved output), e.g. one tab's commands after Deep Clean.
+    /// A command stays in suggestions while other runs of it remain.
+    public func delete(ids: [Int64]) {
+        let ids = ids.filter { $0 > 0 }
+        guard !ids.isEmpty else { return }
+        var commandsTouched: Set<String> = []
+        lock.lock()
+        for id in ids { if let c = commandFor(id: id) { commandsTouched.insert(c) } }
+        let list = ids.map(String.init).joined(separator: ",")
+        exec("DELETE FROM history WHERE id IN (\(list))")
+        exec("DELETE FROM output WHERE history_id IN (\(list))")
+        lock.unlock()
+        // Commands with no runs left disappear from suggestions too.
+        for c in commandsTouched where !hasRuns(of: c) { delete(command: c) }
+    }
+
+    private func hasRuns(of command: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM history WHERE command=? LIMIT 1", -1, &st, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(st) }
+        bindText(st, 1, command)
+        return sqlite3_step(st) == SQLITE_ROW
+    }
+
     public func delete(command: String) {
         lock.lock(); defer { lock.unlock() }
         var st: OpaquePointer?
@@ -125,6 +156,7 @@ public final class HistoryStore: @unchecked Sendable {
             sqlite3_step(st)
         }
         sqlite3_finalize(st)
+        exec("DELETE FROM output WHERE history_id NOT IN (SELECT id FROM history)")
         if let c = commands[command], let name = Self.programName(command) {
             nameFrequency[name, default: 0] -= c.count
             if nameFrequency[name, default: 0] <= 0 { nameFrequency[name] = nil }
@@ -144,7 +176,7 @@ public final class HistoryStore: @unchecked Sendable {
         let now = Date()
         var best: (String, Double)?
         func consider(_ cmd: String) {
-            guard cmd.count > prefix.count, let c = commands[cmd] else { return }
+            guard cmd.count > prefix.count, let c = commands[cmd], !Self.isMistake(c) else { return }
             let s = c.frecency(now: now, cwd: cwd)
             if best == nil || s > best!.1 { best = (cmd, s) }
         }
@@ -183,6 +215,23 @@ public final class HistoryStore: @unchecked Sendable {
         return lo
     }
 
+    /// The exit code of the last run of `command`, if known.
+    public func lastExit(for command: String) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        return commands[command]?.lastExit
+    }
+
+    /// Whether `command` failed the only time it ran, or wasn't found: likely a typo.
+    public func isLikelyMistake(_ command: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return commands[command].map(Self.isMistake) ?? false
+    }
+
+    static func isMistake(_ c: HistoryCommand) -> Bool {
+        guard let e = c.lastExit, e != 0 else { return false }
+        return e == 127 || c.count == 1
+    }
+
     /// Distinct commands starting with `prefix`, most recent first (for Up/Down).
     public func recentCommands(withPrefix prefix: String, limit: Int = 500) -> [String] {
         lock.lock(); defer { lock.unlock() }
@@ -208,6 +257,9 @@ public final class HistoryStore: @unchecked Sendable {
         case .session:
             let set = Set(entries(session: session, limit: 5000).map(\.command))
             pool = pool.filter { set.contains($0.command) }
+        case .output:
+            // Searched with searchOutput (matches the output, not the command).
+            return []
         }
         let now = Date()
         var scored: [(HistoryCommand, Fuzzy.Match, Double)] = []
@@ -223,6 +275,111 @@ public final class HistoryStore: @unchecked Sendable {
             scored.sort { $0.2 > $1.2 }
         }
         return scored.prefix(limit).map { ($0.0, $0.1) }
+    }
+
+    // MARK: Timing
+
+    public struct Timing: Sendable, Equatable {
+        /// Median of recent successful runs.
+        public var typical: Double
+        public var runs: Int
+        public var fastest: Double
+        public var slowest: Double
+    }
+
+    /// How long this exact command usually takes (its last 10 successful runs).
+    /// nil until it has run successfully at least twice.
+    public func timing(for command: String) -> Timing? {
+        let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cmd.isEmpty else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        let sql = "SELECT duration FROM history WHERE command=? AND exit_code=0 AND duration IS NOT NULL ORDER BY started DESC LIMIT 10"
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(st) }
+        bindText(st, 1, cmd)
+        var d: [Double] = []
+        while sqlite3_step(st) == SQLITE_ROW { d.append(sqlite3_column_double(st, 0)) }
+        guard d.count >= 2 else { return nil }
+        let sorted = d.sorted()
+        let mid = sorted.count / 2
+        let median = sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+        return Timing(typical: median, runs: d.count, fastest: sorted.first!, slowest: sorted.last!)
+    }
+
+    // MARK: Output
+
+    /// The most kept per command (its last part) and the number of commands kept.
+    public static let maxOutputCharacters = 32_000
+    public static let maxOutputs = 3_000
+    private var outputSaves = 0
+
+    /// Keeps a finished command's output so it can be searched later. Callers
+    /// remove secrets first; this keeps only the end of long output.
+    public func saveOutput(_ text: String, forHistoryID id: Int64) {
+        guard id > 0 else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        if trimmed.isEmpty {
+            guard sqlite3_prepare_v2(db, "DELETE FROM output WHERE history_id=?", -1, &st, nil) == SQLITE_OK else { return }
+            sqlite3_bind_int64(st, 1, id)
+        } else {
+            guard sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO output(history_id, text) VALUES(?,?)", -1, &st, nil) == SQLITE_OK else { return }
+            sqlite3_bind_int64(st, 1, id)
+            bindText(st, 2, String(trimmed.suffix(Self.maxOutputCharacters)))
+        }
+        sqlite3_step(st)
+        sqlite3_finalize(st)
+        outputSaves += 1
+        if outputSaves % 50 == 1 {
+            exec("DELETE FROM output WHERE history_id NOT IN (SELECT history_id FROM output ORDER BY history_id DESC LIMIT \(Self.maxOutputs))")
+        }
+    }
+
+    public func output(forHistoryID id: Int64) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT text FROM output WHERE history_id=?", -1, &st, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(st) }
+        sqlite3_bind_int64(st, 1, id)
+        guard sqlite3_step(st) == SQLITE_ROW, let c = sqlite3_column_text(st, 0) else { return nil }
+        return String(cString: c)
+    }
+
+    public struct OutputHit: Sendable, Equatable {
+        public var entry: HistoryEntry
+        /// The matching line (or the first line for an empty search).
+        public var line: String
+    }
+
+    /// Commands whose saved output contains `query` (case-insensitive), newest first.
+    /// An empty query lists the latest outputs.
+    public func searchOutput(_ query: String, limit: Int = 150) -> [OutputHit] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        let sql = """
+        SELECT h.id, h.command, h.cwd, h.session, h.started, h.duration, h.exit_code, h.branch, o.text
+        FROM output o JOIN history h ON h.id = o.history_id
+        \(q.isEmpty ? "" : "WHERE instr(lower(o.text), lower(?)) > 0")
+        ORDER BY h.id DESC LIMIT ?
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(st) }
+        var i: Int32 = 1
+        if !q.isEmpty { bindText(st, i, q); i += 1 }
+        sqlite3_bind_int(st, i, Int32(limit))
+        var out: [OutputHit] = []
+        let lq = q.lowercased()
+        while sqlite3_step(st) == SQLITE_ROW {
+            let entry = readEntry(st)
+            let text = sqlite3_column_text(st, 8).map { String(cString: $0) } ?? ""
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+            let line = (lq.isEmpty ? lines.first : lines.first { $0.lowercased().contains(lq) }) ?? lines.first ?? ""
+            out.append(OutputHit(entry: entry, line: String(line.trimmingCharacters(in: .whitespaces).prefix(300))))
+        }
+        return out
     }
 
     /// Raw entries for one session, newest first.

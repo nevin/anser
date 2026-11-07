@@ -8,11 +8,13 @@ struct PickerItem {
     var accessoryColor: NSColor?
     var positions: [Int]
     var payload: Any
+    /// Names (workflows, folders…) read better in the system font; commands stay monospaced.
+    var proportional = false
 }
 
 /// A search-as-you-type list used for history, clipboard history and the
 /// command palette.
-final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate {
     struct Config {
         var title: String
         var placeholder: String
@@ -24,6 +26,21 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
         var onDelete: ((PickerItem) -> Void)?
         /// Optional right-hand preview for the selected item (diff, output, log…).
         var preview: ((PickerItem) async -> NSAttributedString?)? = nil
+        /// What you can do with an item: shown when you right-click it, and the
+        /// ones marked `button` also as buttons at the bottom (for the selected item).
+        var actions: [Action] = []
+    }
+
+    struct Action {
+        var title: String
+        var symbol: String
+        var button = false
+        /// Shown only for items this returns true for.
+        var applies: (PickerItem) -> Bool = { _ in true }
+        /// A submenu instead of an action (e.g. the files in a folder).
+        var children: ((PickerItem) -> [Action])? = nil
+        var closesPicker = true
+        var run: (PickerItem) -> Void = { _ in }
     }
 
     /// Monospaced preview text; colors diff lines when `diff` is true.
@@ -54,6 +71,8 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
     private let previewScroll = NSScrollView()
     private let previewText = NSTextView()
     private var previewTask: Task<Void, Never>?
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let buttonRow = NSStackView()
     private var items: [PickerItem] = []
     private var scope = 0
     private var closing = false
@@ -108,7 +127,7 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
         previewScroll.layer?.cornerRadius = 8
         previewScroll.isHidden = config.preview == nil
 
-        let titleLabel = NSTextField(labelWithString: config.title)
+        titleLabel.stringValue = config.title
         titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         titleLabel.textColor = .secondaryLabelColor
 
@@ -148,7 +167,26 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
         countLabel.textColor = .tertiaryLabelColor
         countLabel.alignment = .right
 
-        for v in [titleLabel, search, scopeControl, scroll, previewScroll, hintLabel, countLabel] as [NSView] {
+        // Right-click a row for its actions; buttons for the main ones.
+        let menu = NSMenu()
+        menu.delegate = self
+        table.menu = menu
+        for (i, a) in config.actions.enumerated() where a.button {
+            let b = NSButton(title: a.title, target: self, action: #selector(actionButton(_:)))
+            b.image = NSImage(systemSymbolName: a.symbol, accessibilityDescription: nil)
+            b.imagePosition = .imageLeading
+            b.controlSize = .small
+            b.bezelStyle = .rounded
+            b.font = .systemFont(ofSize: 11)
+            b.tag = i
+            b.toolTip = a.title + " (or right-click an item for more)"
+            buttonRow.addArrangedSubview(b)
+        }
+        buttonRow.spacing = 6
+        buttonRow.isHidden = buttonRow.arrangedSubviews.isEmpty
+        if !config.actions.isEmpty { hintLabel.stringValue = config.hint + "   ·   right-click for more" }
+
+        for v in [titleLabel, search, scopeControl, scroll, previewScroll, hintLabel, countLabel, buttonRow] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             fx.addSubview(v)
         }
@@ -174,8 +212,13 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
             hintLabel.bottomAnchor.constraint(equalTo: fx.bottomAnchor, constant: -8),
             countLabel.trailingAnchor.constraint(equalTo: fx.trailingAnchor, constant: -16),
             countLabel.centerYAnchor.constraint(equalTo: hintLabel.centerYAnchor),
+            buttonRow.centerYAnchor.constraint(equalTo: hintLabel.centerYAnchor),
+            buttonRow.trailingAnchor.constraint(equalTo: countLabel.leadingAnchor, constant: -12),
+            buttonRow.leadingAnchor.constraint(greaterThanOrEqualTo: hintLabel.trailingAnchor, constant: 8),
             countLabel.leadingAnchor.constraint(greaterThanOrEqualTo: hintLabel.trailingAnchor, constant: 8),
         ])
+        hintLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        hintLabel.lineBreakMode = .byTruncatingTail
     }
 
     func present(over parent: NSWindow) {
@@ -224,6 +267,12 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
     /// Re-runs the search (e.g. when more results arrived in the background).
     func refresh() { reload() }
 
+    /// A short status after the title ("fetching…"); nil shows the title alone.
+    func setStatus(_ status: String?) {
+        titleLabel.stringValue = config.title + (status.map { "  ·  " + $0 } ?? "")
+    }
+    var titleText: String { titleLabel.stringValue }
+
     /// For tests: type a query as the user would.
     func setQuery(_ q: String) {
         search.stringValue = q
@@ -231,6 +280,24 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     var itemTitles: [String] { items.map(\.title) }
+
+    /// For tests: pick a scope tab as the user would.
+    /// Selects (and scrolls to) an item, e.g. the line you came to blame.
+    func selectRow(_ i: Int) {
+        guard items.indices.contains(i) else { return }
+        table.selectRowIndexes([i], byExtendingSelection: false)
+        table.scrollRowToVisible(min(items.count - 1, i + 6))
+        table.scrollRowToVisible(max(0, i - 6))
+        table.scrollRowToVisible(i)
+    }
+    var selectedRowIndex: Int { table.selectedRow }
+    /// Tests: press ⏎ on the selected item.
+    func acceptSelectedForTest() { accept([]) }
+
+    func selectScope(_ i: Int) {
+        scopeControl.selectedSegment = i
+        scopeChanged()
+    }
 
     @objc private func scopeChanged() {
         scope = scopeControl.selectedSegment
@@ -252,6 +319,52 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     @objc private func doubleClicked() { accept([]) }
+
+    // MARK: Actions (right-click menu and buttons)
+
+    @objc private func actionButton(_ b: NSButton) {
+        guard config.actions.indices.contains(b.tag), let item = selectedItem else { NSSound.beep(); return }
+        perform(config.actions[b.tag], on: item)
+    }
+
+    private func perform(_ a: Action, on item: PickerItem) {
+        guard a.applies(item) else { NSSound.beep(); return }
+        if a.closesPicker { close() }
+        a.run(item)
+    }
+
+    /// The menu for the right-clicked row (it becomes the selection, so the preview follows).
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
+        guard items.indices.contains(row) else { return }
+        table.selectRowIndexes([row], byExtendingSelection: false)
+        for item in menuItems(for: items[row], config.actions) { menu.addItem(item) }
+    }
+
+    private func menuItems(for item: PickerItem, _ actions: [Action]) -> [NSMenuItem] {
+        actions.filter { $0.applies(item) }.map { a in
+            let mi: NSMenuItem
+            if let children = a.children {
+                mi = NSMenuItem(title: a.title, action: nil, keyEquivalent: "")
+                let sub = NSMenu()
+                let kids = menuItems(for: item, children(item))
+                if kids.isEmpty { sub.addItem(NSMenuItem(title: "Nothing here", action: nil, keyEquivalent: "")) } else { kids.forEach(sub.addItem) }
+                mi.submenu = sub
+            } else {
+                mi = ClosureMenuItem(title: a.title) { [weak self] in self?.perform(a, on: item) }
+            }
+            mi.image = NSImage(systemSymbolName: a.symbol, accessibilityDescription: nil)
+            return mi
+        }
+    }
+
+    /// For tests: the right-click menu's titles for an item.
+    func actionTitles(forRow row: Int) -> [String] {
+        guard items.indices.contains(row) else { return [] }
+        return menuItems(for: items[row], config.actions).map(\.title)
+    }
+    var buttonTitles: [String] { buttonRow.arrangedSubviews.compactMap { ($0 as? NSButton)?.title } }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
         let flags = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
@@ -323,15 +436,32 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
     private func updatePreview() {
         guard let preview = config.preview else { return }
         previewTask?.cancel()
-        guard let item = selectedItem else { previewText.string = ""; return }
+        guard let item = selectedItem else { showPreviewNote("Nothing selected"); return }
         previewTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 70_000_000)
             if Task.isCancelled { return }
+            // Say it's loading if the preview takes more than a moment (git on a big repo).
+            let loading = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                if !Task.isCancelled { self?.showPreviewNote("Loading…") }
+            }
             let text = await preview(item)
+            loading.cancel()
             guard !Task.isCancelled, let self else { return }
-            self.previewText.textStorage?.setAttributedString(text ?? NSAttributedString(string: ""))
+            if let text, !text.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.previewText.textStorage?.setAttributedString(text)
+            } else {
+                self.showPreviewNote("Nothing to preview")
+            }
             self.previewText.scrollToBeginningOfDocument(nil)
         }
+    }
+
+    /// A dim one-line message in the preview pane (loading, empty).
+    private func showPreviewNote(_ note: String) {
+        let t = GhosttyRuntime.shared.theme
+        previewText.textStorage?.setAttributedString(NSAttributedString(string: note, attributes: [
+            .font: NSFont.systemFont(ofSize: 12), .foregroundColor: t.foreground.withAlphaComponent(0.45)]))
     }
 
     var previewString: String { previewText.string }
@@ -340,6 +470,10 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
         let cell = (tableView.makeView(withIdentifier: .init("p"), owner: nil) as? PickerRow) ?? PickerRow()
         cell.identifier = .init("p")
         cell.configure(items[row])
+        let it = items[row]
+        cell.setAccessibilityElement(true)
+        cell.setAccessibilityRole(.cell)
+        cell.setAccessibilityLabel([it.title, it.subtitle, it.accessory].compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: ", "))
         return cell
     }
 }
@@ -380,8 +514,8 @@ private final class PickerRow: NSTableCellView {
     required init?(coder: NSCoder) { fatalError() }
 
     func configure(_ item: PickerItem) {
-        let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        let bold = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
+        let font = item.proportional ? NSFont.systemFont(ofSize: 13, weight: .medium) : NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        let bold = item.proportional ? NSFont.systemFont(ofSize: 13, weight: .bold) : NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
         // Shorten long titles in the middle so the end (e.g. a folder's name) stays visible.
         let para = NSMutableParagraphStyle()
         para.lineBreakMode = .byTruncatingMiddle
