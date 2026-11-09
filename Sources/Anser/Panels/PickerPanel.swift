@@ -29,6 +29,8 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
         /// What you can do with an item: shown when you right-click it, and the
         /// ones marked `button` also as buttons at the bottom (for the selected item).
         var actions: [Action] = []
+        var selectionHint: ((PickerItem) -> String)? = nil
+        var showsActionMenu = false
     }
 
     struct Action {
@@ -75,6 +77,10 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
     private let buttonRow = NSStackView()
     private var items: [PickerItem] = []
     private var scope = 0
+    /// The selected scope, its titles and the picker's title (tests).
+    var scopeIndex: Int { scope }
+    var scopeTitles: [String] { config.scopes }
+    var pickerTitle: String { config.title }
     private var closing = false
     var onClose: (() -> Void)?
 
@@ -182,9 +188,16 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
             b.toolTip = a.title + " (or right-click an item for more)"
             buttonRow.addArrangedSubview(b)
         }
+        if config.showsActionMenu {
+            let button = NSButton(title: "Actions…", target: self, action: #selector(showSelectedActions))
+            button.controlSize = .small
+            button.bezelStyle = .rounded
+            button.toolTip = "Actions for the selection (⌃Return)"
+            buttonRow.addArrangedSubview(button)
+        }
         buttonRow.spacing = 6
         buttonRow.isHidden = buttonRow.arrangedSubviews.isEmpty
-        if !config.actions.isEmpty { hintLabel.stringValue = config.hint + "   ·   right-click for more" }
+        if !config.actions.isEmpty && !config.showsActionMenu { hintLabel.stringValue = config.hint + "   ·   right-click for more" }
 
         for v in [titleLabel, search, scopeControl, scroll, previewScroll, hintLabel, countLabel, buttonRow] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -261,7 +274,7 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
             table.scrollRowToVisible(0)
         }
         countLabel.stringValue = items.isEmpty ? "No matches" : "\(items.count)\(items.count >= 200 ? "+" : "")"
-        updatePreview()
+        updateSelection()
     }
 
     /// Re-runs the search (e.g. when more results arrived in the background).
@@ -280,6 +293,7 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     var itemTitles: [String] { items.map(\.title) }
+    var footerHint: String { hintLabel.stringValue }
 
     /// For tests: pick a scope tab as the user would.
     /// Selects (and scrolls to) an item, e.g. the line you came to blame.
@@ -312,6 +326,10 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
     }
 
     private func accept(_ mods: NSEvent.ModifierFlags) {
+        if mods == .control && config.showsActionMenu {
+            showSelectedActions()
+            return
+        }
         guard let item = selectedItem else { NSSound.beep(); return }
         let keep = config.onAccept
         close()
@@ -340,6 +358,22 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
         guard items.indices.contains(row) else { return }
         table.selectRowIndexes([row], byExtendingSelection: false)
         for item in menuItems(for: items[row], config.actions) { menu.addItem(item) }
+    }
+
+    func selectedActionsMenu() -> NSMenu {
+        let menu = NSMenu()
+        if let item = selectedItem {
+            for action in menuItems(for: item, config.actions) { menu.addItem(action) }
+        }
+        return menu
+    }
+
+    @objc private func showSelectedActions() {
+        let menu = selectedActionsMenu()
+        guard !menu.items.isEmpty else { NSSound.beep(); return }
+        table.scrollRowToVisible(table.selectedRow)
+        let row = table.rect(ofRow: table.selectedRow)
+        menu.popUp(positioning: nil, at: NSPoint(x: row.minX + 16, y: row.maxY), in: table)
     }
 
     private func menuItems(for item: PickerItem, _ actions: [Action]) -> [NSMenuItem] {
@@ -411,7 +445,8 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
             close()
             return true
         }
-        if flags.contains(.command), Int(event.keyCode) == kVK_Return || Int(event.keyCode) == kVK_ANSI_KeypadEnter {
+        if flags.contains(.command) || (flags == .control && config.showsActionMenu),
+           Int(event.keyCode) == kVK_Return || Int(event.keyCode) == kVK_ANSI_KeypadEnter {
             accept(flags)
             return true
         }
@@ -429,7 +464,14 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
 
     func numberOfRows(in tableView: NSTableView) -> Int { items.count }
 
-    func tableViewSelectionDidChange(_ notification: Notification) { updatePreview() }
+    func tableViewSelectionDidChange(_ notification: Notification) { updateSelection() }
+
+    private func updateSelection() {
+        if let selectionHint = config.selectionHint {
+            hintLabel.stringValue = selectedItem.map(selectionHint) ?? config.hint
+        }
+        updatePreview()
+    }
 
     /// Loads the preview for the selected row (slightly delayed so fast
     /// arrowing through the list doesn't run a command per row).

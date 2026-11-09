@@ -2,7 +2,7 @@ import AppKit
 import AnserCore
 
 /// Anser's side of `anser-session`, the helper that keeps shells running
-/// while Anser quits, restarts or updates (Settings → Behavior). Each pane's
+/// while Anser quits, restarts or updates (Settings → Sessions & Windows). Each pane's
 /// terminal runs `anser-session attach`; this talks to the helper for
 /// everything else: which shells are alive, ending one when its pane closes,
 /// and cleaning up shells nobody will come back to.
@@ -111,8 +111,13 @@ final class SessionHost {
 
     // MARK: Saved state
 
+    /// What was last written per shell, so unchanged state isn't rewritten every autosave.
+    private var lastSaved: [String: Data] = [:]
+
     func save(_ session: ShellSession) {
         guard session.persistent, let data = try? JSONEncoder().encode(session.savedState()) else { return }
+        guard lastSaved[session.id] != data else { return }
+        lastSaved[session.id] = data
         let url = stateURL(session.id)
         try? data.write(to: url, options: .atomic)
         chmod(url.path, 0o600)

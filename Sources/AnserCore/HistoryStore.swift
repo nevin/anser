@@ -21,6 +21,10 @@ public struct HistoryCommand: Sendable, Hashable {
     public var lastExit: Int?
     public var cwds: Set<String>
 
+    public init(command: String, count: Int, lastUsed: Date, lastCwd: String?, lastExit: Int?, cwds: Set<String>) {
+        self.command = command; self.count = count; self.lastUsed = lastUsed; self.lastCwd = lastCwd; self.lastExit = lastExit; self.cwds = cwds
+    }
+
     /// Frequency weighted by recency (a "frecency" score).
     public func frecency(now: Date = Date(), cwd: String? = nil) -> Double {
         let ageHours = max(0, now.timeIntervalSince(lastUsed) / 3600)
@@ -84,6 +88,12 @@ public final class HistoryStore: @unchecked Sendable {
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         // Saved command output (the end of it, secrets removed), for searching.
         exec("CREATE TABLE IF NOT EXISTS output(history_id INTEGER PRIMARY KEY, text TEXT NOT NULL)")
+        // Commands deleted in the History Editor, kept 7 days so they can be restored.
+        exec("""
+        CREATE TABLE IF NOT EXISTS trash(
+            id INTEGER PRIMARY KEY, command TEXT NOT NULL, cwd TEXT, session TEXT, started REAL NOT NULL,
+            duration REAL, exit_code INTEGER, branch TEXT, source TEXT, deleted_at REAL NOT NULL)
+        """)
         loadIndex()
     }
 
@@ -416,6 +426,18 @@ public final class HistoryStore: @unchecked Sendable {
         return out.sorted { $0.3 > $1.3 }.prefix(limit).map { ($0.0, $0.1, $0.2) }
     }
 
+    /// One command's stats, if it was ever run.
+    public func stats(for command: String) -> HistoryCommand? {
+        lock.lock(); defer { lock.unlock() }
+        return commands[command] ?? commands[command.trimmingCharacters(in: .whitespaces)]
+    }
+
+    /// Every distinct command with its count (a copy).
+    public func allCommands() -> [HistoryCommand] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(commands.values)
+    }
+
     public var commandCount: Int { lock.lock(); defer { lock.unlock() }; return commands.count }
 
     /// How often each program (first word) was run. Kept up to date incrementally.
@@ -495,6 +517,72 @@ public final class HistoryStore: @unchecked Sendable {
             if !trimmed.isEmpty { out.append((trimmed, pendingDate)) }
         }
         return out
+    }
+
+    /// The run of `command` before `beforeID` that has saved output (for "Compare with Previous Run").
+    public func previousRun(of command: String, beforeID: Int64) -> (entry: HistoryEntry, output: String)? {
+        lock.lock(); defer { lock.unlock() }
+        let sql = """
+        SELECT h.id, h.command, h.cwd, h.session, h.started, h.duration, h.exit_code, h.branch, o.text
+        FROM history h JOIN output o ON o.history_id = h.id
+        WHERE h.command = ? AND (? <= 0 OR h.id < ?) ORDER BY h.id DESC LIMIT 1
+        """
+        var st: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(st) }
+        bindText(st, 1, command.trimmingCharacters(in: .whitespacesAndNewlines))
+        sqlite3_bind_int64(st, 2, beforeID)
+        sqlite3_bind_int64(st, 3, beforeID)
+        guard sqlite3_step(st) == SQLITE_ROW else { return nil }
+        let e = readEntry(st)
+        let text = sqlite3_column_text(st, 8).map { String(cString: $0) } ?? ""
+        return (e, text)
+    }
+
+    // MARK: Sync between Macs
+
+    /// Commands run on this Mac after `afterID`, finished (or started over 6 hours ago), oldest first.
+    public func localEntriesForSync(afterID: Int64, limit: Int = 5000) -> [HistoryEntry] {
+        lock.lock(); defer { lock.unlock() }
+        let sql = "SELECT id, command, cwd, session, started, duration, exit_code, branch FROM history WHERE id > ? AND source = 'anser' ORDER BY id ASC LIMIT ?"
+        var st: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(st) }
+        sqlite3_bind_int64(st, 1, afterID)
+        sqlite3_bind_int(st, 2, Int32(limit))
+        var out: [HistoryEntry] = []
+        let cutoff = Date().addingTimeInterval(-6 * 3600)
+        while sqlite3_step(st) == SQLITE_ROW {
+            let e = readEntry(st)
+            // Stop at a command still running, so it's sent once it has finished.
+            if e.exitCode == nil, e.started > cutoff { break }
+            out.append(e)
+        }
+        return out
+    }
+
+    /// Adds commands run on another Mac (marked with its name, so they're never sent back).
+    public func importSynced(_ entries: [HistoryEntry], machine: String) {
+        guard !entries.isEmpty else { return }
+        lock.lock()
+        exec("BEGIN")
+        for e in entries {
+            insert(command: e.command, cwd: e.cwd, session: nil, started: e.started, duration: e.duration, exit: e.exitCode, branch: e.branch, source: "sync:" + machine)
+            bump(e.command, date: e.started, cwd: e.cwd, exit: e.exitCode)
+        }
+        exec("COMMIT")
+        orderDirty = true
+        lock.unlock()
+    }
+
+    public func syncValue(_ key: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return metaValue("sync." + key)
+    }
+
+    public func setSyncValue(_ key: String, _ value: String) {
+        lock.lock(); defer { lock.unlock() }
+        setMeta("sync." + key, value)
     }
 
     // MARK: Internals
@@ -603,5 +691,265 @@ public final class HistoryStore: @unchecked Sendable {
         bindText(st, 1, key)
         bindText(st, 2, value)
         sqlite3_step(st)
+    }
+}
+
+// MARK: Cleaning up (History Editor)
+
+extension HistoryStore {
+    public struct CompactOptions: Sendable, Equatable {
+        /// Keep only the newest N runs of each command (counts for suggestions shrink to N).
+        public var keepRunsPerCommand: Int?
+        /// Forget commands not used for this many days.
+        public var unusedForDays: Int?
+        /// Drop saved output of runs older than this many days.
+        public var outputOlderThanDays: Int?
+        /// Also delete these commands (e.g. the mistakes found).
+        public var removeCommands: [String] = []
+        public init(keepRunsPerCommand: Int? = nil, unusedForDays: Int? = nil, outputOlderThanDays: Int? = nil, removeCommands: [String] = []) {
+            self.keepRunsPerCommand = keepRunsPerCommand; self.unusedForDays = unusedForDays
+            self.outputOlderThanDays = outputOlderThanDays; self.removeCommands = removeCommands
+        }
+    }
+
+    public struct CompactResult: Sendable, Equatable {
+        public var runsRemoved = 0
+        public var commandsRemoved = 0
+        public var outputsRemoved = 0
+        public var bytesBefore: Int64 = 0
+        public var bytesAfter: Int64 = 0
+    }
+
+    /// The database's size on disk, with its write-ahead log.
+    public var sizeOnDisk: Int64 {
+        let fm = FileManager.default
+        return [path, path + "-wal", path + "-shm"].reduce(Int64(0)) { sum, p in
+            sum + ((try? fm.attributesOfItem(atPath: p)[.size] as? Int64) ?? 0)
+        }
+    }
+
+    /// Total runs stored (every time a command ran).
+    public var runCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM history", -1, &st, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(st) }
+        return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int64(st, 0)) : 0
+    }
+
+    /// Deletes many commands at once (every run of each, and their output).
+    /// Unless `permanently`, the runs go to Recently Deleted for 7 days.
+    public func delete(commands list: [String], permanently: Bool = true, now: Date = Date()) {
+        guard !list.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        exec("BEGIN")
+        for c in list {
+            if !permanently { moveToTrash(command: c, now: now) }
+            delete(command: c)
+        }
+        exec("COMMIT")
+    }
+
+    private func moveToTrash(command: String, now: Date) {
+        var st: OpaquePointer?
+        let sql = "INSERT OR REPLACE INTO trash SELECT id, command, cwd, session, started, duration, exit_code, branch, source, ? FROM history WHERE command=?"
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(st) }
+        sqlite3_bind_double(st, 1, now.timeIntervalSince1970)
+        bindText(st, 2, command)
+        sqlite3_step(st)
+    }
+
+    public struct Trashed: Sendable, Equatable {
+        public var command: String
+        public var runs: Int
+        public var deleted: Date
+        public var lastUsed: Date
+    }
+
+    /// Recently deleted commands, newest deletion first.
+    public func trashed() -> [Trashed] {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT command, COUNT(*), MAX(deleted_at), MAX(started) FROM trash GROUP BY command ORDER BY MAX(deleted_at) DESC", -1, &st, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(st) }
+        var out: [Trashed] = []
+        while sqlite3_step(st) == SQLITE_ROW {
+            guard let c = sqlite3_column_text(st, 0) else { continue }
+            out.append(Trashed(command: String(cString: c), runs: Int(sqlite3_column_int(st, 1)),
+                               deleted: Date(timeIntervalSince1970: sqlite3_column_double(st, 2)), lastUsed: Date(timeIntervalSince1970: sqlite3_column_double(st, 3))))
+        }
+        return out
+    }
+
+    /// Puts deleted commands back (their saved output is gone).
+    public func restore(commands list: [String]) {
+        guard !list.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        exec("BEGIN")
+        for c in list {
+            var st: OpaquePointer?
+            if sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO history(id, command, cwd, session, started, duration, exit_code, branch, source) SELECT id, command, cwd, session, started, duration, exit_code, branch, source FROM trash WHERE command=?", -1, &st, nil) == SQLITE_OK {
+                bindText(st, 1, c); sqlite3_step(st)
+            }
+            sqlite3_finalize(st)
+            if sqlite3_prepare_v2(db, "DELETE FROM trash WHERE command=?", -1, &st, nil) == SQLITE_OK { bindText(st, 1, c); sqlite3_step(st) }
+            sqlite3_finalize(st)
+        }
+        exec("COMMIT")
+        loadIndex()
+    }
+
+    /// Removes from Recently Deleted for good: these commands, or everything deleted before `olderThan`.
+    @discardableResult
+    public func purgeTrash(commands list: [String]? = nil, olderThan: Date? = nil) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        var n = 0
+        if let list {
+            for c in list {
+                if sqlite3_prepare_v2(db, "DELETE FROM trash WHERE command=?", -1, &st, nil) == SQLITE_OK { bindText(st, 1, c); sqlite3_step(st); n += Int(sqlite3_changes(db)) }
+                sqlite3_finalize(st)
+            }
+        }
+        if let olderThan {
+            if sqlite3_prepare_v2(db, "DELETE FROM trash WHERE deleted_at < ?", -1, &st, nil) == SQLITE_OK {
+                sqlite3_bind_double(st, 1, olderThan.timeIntervalSince1970); sqlite3_step(st); n += Int(sqlite3_changes(db))
+            }
+            sqlite3_finalize(st)
+        }
+        return n
+    }
+
+    /// What you ran to fix it the last time this exact command failed: the commands
+    /// between that failure and its next successful run in the same tab.
+    public func fixAfterFailure(of command: String, excludingID: Int64 = 0) -> [String]? {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        let failSQL = "SELECT id, session FROM history WHERE command=? AND exit_code IS NOT NULL AND exit_code != 0 AND id != ? AND session IS NOT NULL ORDER BY id DESC LIMIT 5"
+        guard sqlite3_prepare_v2(db, failSQL, -1, &st, nil) == SQLITE_OK else { return nil }
+        bindText(st, 1, command)
+        sqlite3_bind_int64(st, 2, excludingID)
+        var failures: [(Int64, String)] = []
+        while sqlite3_step(st) == SQLITE_ROW {
+            if let sess = sqlite3_column_text(st, 1) { failures.append((sqlite3_column_int64(st, 0), String(cString: sess))) }
+        }
+        sqlite3_finalize(st)
+        let noise: Set<String> = ["ls", "ll", "la", "pwd", "clear", "history", "git status", "git diff", "cat", "less"]
+        for (fid, sess) in failures {
+            var q: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT command, exit_code FROM history WHERE session=? AND id > ? AND id != ? ORDER BY id LIMIT 15", -1, &q, nil) == SQLITE_OK else { continue }
+            bindText(q, 1, sess)
+            sqlite3_bind_int64(q, 2, fid)
+            sqlite3_bind_int64(q, 3, excludingID)
+            var steps: [String] = []
+            var fixed = false
+            while sqlite3_step(q) == SQLITE_ROW {
+                guard let c = sqlite3_column_text(q, 0) else { continue }
+                let cmd = String(cString: c)
+                let ok = sqlite3_column_type(q, 1) != SQLITE_NULL && sqlite3_column_int(q, 1) == 0
+                if cmd == command { fixed = ok; break }
+                // Only commands that worked count as part of the fix.
+                if ok, !noise.contains(cmd), !(HistoryStore.programName(cmd).map { ["cat", "less", "ls", "man", "echo"].contains($0) } ?? false),
+                   !steps.contains(cmd) { steps.append(cmd) }
+            }
+            sqlite3_finalize(q)
+            if fixed, !steps.isEmpty { return Array(steps.suffix(3)) }
+        }
+        return nil
+    }
+
+    /// Shrinks history: removes old runs, unused commands and old output, then reclaims the space.
+    @discardableResult
+    public func compact(_ o: CompactOptions, now: Date = Date()) -> CompactResult {
+        lock.lock(); defer { lock.unlock() }
+        var r = CompactResult()
+        r.bytesBefore = sizeOnDisk
+        let commandsBefore = commands.count
+        func run(_ sql: String, _ bind: ((OpaquePointer?) -> Void)? = nil) -> Int {
+            var st: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return 0 }
+            defer { sqlite3_finalize(st) }
+            bind?(st)
+            sqlite3_step(st)
+            return Int(sqlite3_changes(db))
+        }
+        exec("BEGIN")
+        for c in o.removeCommands {
+            moveToTrash(command: c, now: now)
+            r.runsRemoved += run("DELETE FROM history WHERE command=?") { self.bindText($0, 1, c) }
+        }
+        if let days = o.unusedForDays, days > 0 {
+            let cutoff = now.addingTimeInterval(-Double(days) * 86400).timeIntervalSince1970
+            r.runsRemoved += run("DELETE FROM history WHERE command IN (SELECT command FROM history GROUP BY command HAVING MAX(started) < ?)") {
+                sqlite3_bind_double($0, 1, cutoff)
+            }
+        }
+        if let keep = o.keepRunsPerCommand, keep > 0 {
+            r.runsRemoved += run("""
+                DELETE FROM history WHERE id IN (
+                  SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY command ORDER BY started DESC, id DESC) AS rn FROM history) WHERE rn > ?)
+                """) { sqlite3_bind_int($0, 1, Int32(keep)) }
+        }
+        if let days = o.outputOlderThanDays, days >= 0 {
+            let cutoff = now.addingTimeInterval(-Double(days) * 86400).timeIntervalSince1970
+            r.outputsRemoved += run("DELETE FROM output WHERE history_id IN (SELECT id FROM history WHERE started < ?)") { sqlite3_bind_double($0, 1, cutoff) }
+        }
+        r.outputsRemoved += run("DELETE FROM output WHERE history_id NOT IN (SELECT id FROM history)")
+        exec("COMMIT")
+        exec("PRAGMA wal_checkpoint(TRUNCATE)")
+        exec("VACUUM")
+        loadIndex()
+        r.commandsRemoved = max(0, commandsBefore - commands.count)
+        r.bytesAfter = sizeOnDisk
+        return r
+    }
+}
+
+extension HistoryStore {
+    /// Every run of one command, newest first (for the History Editor's details).
+    public func runs(of command: String, limit: Int = 50) -> [HistoryEntry] {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        let sql = "SELECT id, command, cwd, session, started, duration, exit_code, branch FROM history WHERE command=? ORDER BY started DESC, id DESC LIMIT ?"
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(st) }
+        bindText(st, 1, command)
+        sqlite3_bind_int(st, 2, Int32(limit))
+        var out: [HistoryEntry] = []
+        while sqlite3_step(st) == SQLITE_ROW { out.append(readEntry(st)) }
+        return out
+    }
+
+    /// Changes a command's text in every run (fixing a typo, removing a secret). Merges into `to` when that already exists.
+    public func rename(command: String, to new: String) {
+        let n = new.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !n.isEmpty, n != command else { return }
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(db, "UPDATE history SET command=? WHERE command=?", -1, &st, nil) == SQLITE_OK {
+            bindText(st, 1, n)
+            bindText(st, 2, command)
+            sqlite3_step(st)
+        }
+        sqlite3_finalize(st)
+        loadIndex()
+    }
+}
+
+extension HistoryStore {
+    /// When runs started since `since` (one command, or all of them), for activity charts.
+    public func runDates(command: String? = nil, since: Date) -> [Date] {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        let sql = command == nil ? "SELECT started FROM history WHERE started >= ?"
+                                 : "SELECT started FROM history WHERE started >= ? AND command=?"
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(st) }
+        sqlite3_bind_double(st, 1, since.timeIntervalSince1970)
+        if let command { bindText(st, 2, command) }
+        var out: [Date] = []
+        while sqlite3_step(st) == SQLITE_ROW { out.append(Date(timeIntervalSince1970: sqlite3_column_double(st, 0))) }
+        return out
     }
 }

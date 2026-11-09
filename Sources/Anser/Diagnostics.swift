@@ -160,6 +160,7 @@ final class Diagnostics: NSObject, MXMetricManagerSubscriber {
         let mem = MemoryUse.footprint()
         let kept = AppDelegate.shared.allPanes.reduce(0) { $0 + $1.session.outputBytes }
         r.append("- Memory: \(MemoryUse.megabytes(mem.current)) now, \(MemoryUse.megabytes(mem.peak)) peak · command output kept: \(MemoryUse.megabytes(UInt64(kept))) · memory warnings: \(MemoryManager.shared.pressureEvents)")
+        if !Startup.summary.isEmpty { r.append("- Startup: \(Startup.summary)") }
         r.append("")
         let crashes = ((try? FileManager.default.contentsOfDirectory(at: Self.directory, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
             .filter { $0.lastPathComponent.hasPrefix("crash-") }

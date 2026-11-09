@@ -43,7 +43,7 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.4.0</string>
+	<string>6.0.0</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -62,9 +62,17 @@
 				<string>x-man-page</string>
 			</array>
 		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Anser Link</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>anser</string>
+			</array>
+		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>4</string>
+	<string>10</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<key>LSMinimumSystemVersion</key>
@@ -75,6 +83,25 @@
 	<string>Terminal engine: Ghostty (MIT)</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>New Anser Tab Here</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>newTabHere</string>
+			<key>NSRequiredContext</key>
+			<dict/>
+			<key>NSSendFileTypes</key>
+			<array>
+				<string>public.folder</string>
+				<string>public.item</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 </dict>

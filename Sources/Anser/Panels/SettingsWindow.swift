@@ -8,7 +8,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     static let shared = SettingsWindowController()
 
     private struct Toggle {
-        enum Section { case editor, behavior }
+        enum Section { case editor, notifications, helpers, privacy, sessions }
         let section: Section
         let path: [String]
         let title: String
@@ -16,24 +16,36 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     }
 
     private let toggles: [Toggle] = [
-        Toggle(section: .editor, path: ["editorFollowsOutput"], title: "Keep the editor right under the output (until the screen fills)", defaultValue: true),
+        Toggle(section: .editor, path: ["editorFollowsOutput"], title: "Move the input bar up to follow short output", defaultValue: false),
         Toggle(section: .editor, path: ["editor", "autoPopup"], title: "Show completions while typing", defaultValue: true),
         Toggle(section: .editor, path: ["editor", "ghostText"], title: "Suggest from history as gray text", defaultValue: true),
+        Toggle(section: .editor, path: ["aiCompletions"], title: "When history has nothing, ask a local AI model (Ollama) for the gray text", defaultValue: false),
         Toggle(section: .editor, path: ["editor", "syntaxHighlighting"], title: "Color the command line", defaultValue: true),
         Toggle(section: .editor, path: ["editor", "lint"], title: "Underline mistakes and warn about risky commands", defaultValue: true),
         Toggle(section: .editor, path: ["editor", "vimMode"], title: "Vim keys (Esc for normal mode, i to type)", defaultValue: false),
-        Toggle(section: .behavior, path: ["commandBlocks"], title: "Show command blocks (✓/✗ marks, colored bars, hover actions)", defaultValue: true),
-        Toggle(section: .behavior, path: ["editor", "confirmMultilinePaste"], title: "Ask before multi-line pastes into running programs", defaultValue: true),
-        Toggle(section: .behavior, path: ["copyOnSelect"], title: "Copy terminal text as soon as it's selected", defaultValue: false),
-        Toggle(section: .behavior, path: ["restoreSession"], title: "Reopen windows, tabs and splits on launch", defaultValue: true),
-        Toggle(section: .behavior, path: ["previewFilesOnHover"], title: "Preview a file when the mouse rests on its path in the output", defaultValue: true),
-        Toggle(section: .behavior, path: ["keepShellsRunning"], title: "Keep shells running when Anser quits or updates (⌥ Quit ends them)", defaultValue: true),
-        Toggle(section: .behavior, path: ["showLoginMessage"], title: "Show macOS's \u{201C}Last login\u{201D} line in new tabs", defaultValue: false),
-        Toggle(section: .behavior, path: ["saveOutput"], title: "Remember command output so History → Output can search it (on this Mac, secrets removed)", defaultValue: true),
-        Toggle(section: .behavior, path: ["showPullRequests"], title: "Show the branch's pull request and checks (uses the GitHub CLI, gh)", defaultValue: true),
-        Toggle(section: .behavior, path: ["usageStats"], title: "Count which features I use, only on this Mac (Help → Your Feature Usage)", defaultValue: false),
+        Toggle(section: .helpers, path: ["commandBlocks"], title: "Show command blocks (✓/✗ marks, colored bars, hover actions)", defaultValue: true),
+        Toggle(section: .sessions, path: ["editor", "confirmMultilinePaste"], title: "Ask before multi-line pastes into running programs", defaultValue: true),
+        Toggle(section: .sessions, path: ["copyOnSelect"], title: "Copy terminal text as soon as it's selected", defaultValue: false),
+        Toggle(section: .sessions, path: ["restoreSession"], title: "Reopen windows, tabs and splits on launch", defaultValue: true),
+        Toggle(section: .sessions, path: ["restoreDrafts"], title: "Remember unfinished local commands when reopening windows", defaultValue: true),
+        Toggle(section: .helpers, path: ["previewFilesOnHover"], title: "Preview a file when the mouse rests on its path in the output", defaultValue: true),
+        Toggle(section: .sessions, path: ["keepShellsRunning"], title: "Keep shells running when Anser quits or updates (⌥ Quit ends them)", defaultValue: true),
+        Toggle(section: .sessions, path: ["showLoginMessage"], title: "Show macOS's \u{201C}Last login\u{201D} line in new tabs", defaultValue: false),
+        Toggle(section: .privacy, path: ["saveOutput"], title: "Remember command output so History → Output can search it (on this Mac, secrets removed)", defaultValue: true),
+        Toggle(section: .helpers, path: ["showPullRequests"], title: "Show the branch's pull request and checks (uses the GitHub CLI, gh)", defaultValue: true),
+        Toggle(section: .notifications, path: ["waitAlerts"], title: "Mark the tab and notify when a program waits for an answer (y/n, password, an AI agent)", defaultValue: true),
+        Toggle(section: .helpers, path: ["serverChips"], title: "Show servers a tab started (open, copy link, stop)", defaultValue: true),
+        Toggle(section: .helpers, path: ["sshAutoReconnect"], title: "Reconnect dropped ssh sessions by myself", defaultValue: true),
+        Toggle(section: .helpers, path: ["offerProjectEnvironment"], title: "Offer to load a project's .env, virtualenv and Node version when I cd into it", defaultValue: true),
+        Toggle(section: .privacy, path: ["autoCleanHistory"], title: "Once a week, move typos in my history to Recently Deleted", defaultValue: false),
+        Toggle(section: .helpers, path: ["suggestAliases"], title: "Suggest an alias for long commands I keep typing", defaultValue: true),
+        Toggle(section: .helpers, path: ["testFailureList"], title: "List failed tests after a test run (open one, re-run just that test)", defaultValue: true),
+        Toggle(section: .privacy, path: ["syncHistory"], title: "Share command history between my Macs (iCloud Drive or the notebook's folder)", defaultValue: false),
+        Toggle(section: .privacy, path: ["usageStats"], title: "Count which features I use, only on this Mac (Help → Your Feature Usage)", defaultValue: false),
     ]
     private let tabView = NSTabView()
+    private let searchField = NSSearchField()
+    private let pluginsList = NSStackView()
     private let preview = ThemePreviewView()
     private let notifyToggle = NSButton(checkboxWithTitle: "Notify when a command in a background tab takes longer than", target: nil, action: nil)
     private let tipsPopup = NSPopUpButton()
@@ -77,6 +89,13 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let updatesToggle = NSButton(checkboxWithTitle: "Check for updates automatically", target: nil, action: nil)
     private let notebookPopup = NSPopUpButton()
     private let scrollbackPopup = NSPopUpButton()
+    // Options that used to live only in config.json.
+    private let cloudPopup = NSPopUpButton()
+    static let cloudModes = [("auto", "When I type kubectl, aws, terraform…"), ("always", "Always"), ("off", "Never")]
+    private let openWithBox = NSComboBox()
+    static let openWithChoices = ["", "cursor", "code", "zed", "subl", "nvim", "vim"]
+    private let quickHeight = NSSlider(value: 0.45, minValue: 0.2, maxValue: 0.9, target: nil, action: nil)
+    private let quickHeightLabel = NSTextField(labelWithString: "45%")
     static let scrollbackChoices = [(2, "2 MB (lightest)"), (10, "10 MB (default)"), (50, "50 MB"), (100, "100 MB")]
     private var abbreviationsTable: EditableTable!
     private var keybindingsTable: EditableTable!
@@ -106,6 +125,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
     func show() {
         load()
+        rebuildPlugins()
         window?.center()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
@@ -318,17 +338,44 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         scrollbackPopup.target = self
         scrollbackPopup.action = #selector(scrollbackChanged)
         scrollbackPopup.toolTip = "How much past output each tab keeps. Less uses less memory with many tabs; applies to new tabs."
-        let behaviorViews: [NSView] = toggles.indices.filter { toggles[$0].section == .behavior }.map { checkboxes[$0] }
-            + [NSStackView(views: [notifyToggle, notifyField, NSTextField(labelWithString: "seconds")]),
-               NSStackView(views: [quickToggle, quickField]), quickStatus,
-               NSStackView(views: [NSTextField(labelWithString: "Keep the Command Notebook in:"), notebookPopup]),
-               NSStackView(views: [NSTextField(labelWithString: "Scrollback per tab:"), scrollbackPopup]),
-               updatesToggle]
-        let behaviorStack = NSStackView(views: behaviorViews)
-        behaviorStack.orientation = .vertical
-        behaviorStack.alignment = .leading
-        behaviorStack.spacing = 8
-        let behaviorPage = page([behaviorStack])
+        for (_, t) in Self.cloudModes { cloudPopup.addItem(withTitle: t) }
+        cloudPopup.target = self
+        cloudPopup.action = #selector(cloudChanged)
+        openWithBox.addItems(withObjectValues: Self.openWithChoices.map { $0.isEmpty ? "Automatic (first editor found)" : $0 })
+        openWithBox.completes = true
+        openWithBox.widthAnchor.constraint(equalToConstant: 230).isActive = true
+        openWithBox.target = self
+        openWithBox.action = #selector(openWithChanged)
+        openWithBox.delegate = self
+        openWithBox.toolTip = "The editor ⌘-clicked file paths open in: cursor, code, zed, subl, nvim… (openFilesWith)"
+        quickHeight.target = self
+        quickHeight.action = #selector(quickHeightChanged)
+        quickHeight.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        func column(_ views: [NSView]) -> NSStackView {
+            let st = NSStackView(views: views)
+            st.orientation = .vertical
+            st.alignment = .leading
+            st.spacing = 8
+            return st
+        }
+        func checks(_ section: Toggle.Section) -> [NSView] { toggles.indices.filter { toggles[$0].section == section }.map { checkboxes[$0] } }
+        let notificationsPage = page([column(
+            [NSStackView(views: [notifyToggle, notifyField, NSTextField(labelWithString: "seconds")])] + checks(.notifications)
+            + [note("Watched commands (Shell → Run and Watch) notify when their output changes; stop one from the sidebar's Watching section. macOS can silence Anser in System Settings → Notifications.")])])
+        let helpersPage = page([column(checks(.helpers) + [
+            NSStackView(views: [NSTextField(labelWithString: "Show the cloud context chip:"), cloudPopup]),
+            NSStackView(views: [NSTextField(labelWithString: "Open ⌘-clicked files with:"), openWithBox]),
+        ])])
+        let privacyPage = page([column(checks(.privacy) + [
+            NSStackView(views: [NSTextField(labelWithString: "Keep the Command Notebook in:"), notebookPopup]),
+            note("History and output stay on this Mac unless you turn on sharing. Commands that look like secrets are never saved."),
+        ])])
+        let sessionsPage = page([column(checks(.sessions) + [
+            NSStackView(views: [NSTextField(labelWithString: "Scrollback per tab:"), scrollbackPopup]),
+            NSStackView(views: [quickToggle, quickField]), quickStatus,
+            NSStackView(views: [NSTextField(labelWithString: "Quick terminal height:"), quickHeight, quickHeightLabel]),
+            updatesToggle,
+        ])])
 
         // AI help.
         for (_, title) in Self.aiChoices { aiPopup.addItem(withTitle: title) }
@@ -377,7 +424,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         let open = NSButton(title: "Open Config File", target: self, action: #selector(openConfig))
         let specs = NSButton(title: "Open Completions Folder", target: self, action: #selector(openCompletions))
         let importButton = NSButton(title: "Import from iTerm2 or Warp…", target: self, action: #selector(importOther))
-        let advanced = page([note("Everything else lives in the config file: history filters, completion helpers, quick terminal height, profile environment variables and any Ghostty option. Changes there apply as soon as you save."),
+        let advanced = page([note("Everything else lives in the config file: history filters, completion helpers, profile environment variables and any Ghostty option. Changes there apply as soon as you save."),
                              NSStackView(views: [open, specs]),
                              note("Bring over themes, font and workflows from another terminal:"),
                              importButton])
@@ -409,27 +456,222 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             self?.set(["profiles"], rows.compactMap(Self.profileJSON))
         }
         let profilesPage = page([
-            note("A profile applies where its pattern matches: an ssh host (prod-*, *.example.com) or a folder starting with ~ or / (~/work/payments). It colors the tab, shows a badge, and can ask before running commands there."),
+            note("A profile applies where its pattern matches: an ssh host (prod-*, *.example.com), a folder starting with ~ or / (~/work/payments), a Kubernetes context (kube:prod-*) or an AWS profile (aws:prod*). It colors the tab, shows a badge, and can ask before running commands there."),
             profilesTable.view(height: 230),
             note("Tab colors: red, orange, yellow, green, blue, purple, teal. Ask before running: * for every command, or patterns like *rm -rf*, *drop table*, separated by commas. Extra environment variables (\"env\") can be added in the config file."),
         ])
 
-        for (title, view) in [("Appearance", appearance), ("Editor", editorPage), ("Behavior", behaviorPage), ("AI", aiPage),
-                              ("Shortcuts", shortcutsPage), ("Profiles", profilesPage), ("Advanced", advanced)] {
+        // Plugins: found in ~/.config/anser/plugins, each off until turned on here.
+        pluginsList.orientation = .vertical
+        pluginsList.alignment = .leading
+        pluginsList.spacing = 10
+        let pluginButtons = NSStackView(views: [
+            ClosureButton(title: "Open Plugins Folder") { PluginHost.openFolder() },
+            ClosureButton(title: "New Example Plugin") { [weak self] in
+                if let dir = PluginHost.createExample() { PluginHost.shared.reload(); self?.rebuildPlugins(); NSWorkspace.shared.open(URL(fileURLWithPath: dir)) }
+            },
+            ClosureButton(title: "Reload") { [weak self] in PluginHost.shared.reload(); self?.rebuildPlugins() },
+        ])
+        let starter = NSPopUpButton(frame: .zero, pullsDown: true)
+        starter.addItem(withTitle: "Add Starter Plugin")
+        for item in PluginGallery.items {
+            let mi = ClosureMenuItem(title: item.name) { [weak self] in
+                if PluginHost.shared.installStarter(item) { self?.rebuildPlugins() }
+            }
+            mi.toolTip = item.description
+            starter.menu?.addItem(mi)
+        }
+        pluginButtons.insertArrangedSubview(starter, at: 0)
+        let pluginsPage = page([
+            note("Plugins add status-row chips, command palette actions, sidebar sections and scripts that run after commands. Each is a folder with a plugin.json in ~/.config/anser/plugins (see docs/PLUGINS.md)."),
+            note("Plugins run scripts on your Mac with your permissions. Turn on only plugins you wrote or trust. A repo can also ship plugins in .anser/plugins: they show as a chip and run only after you review and trust them."),
+            pluginsList,
+            pluginButtons,
+        ])
+
+        // Each section: a title and one line on what's in it, above its settings.
+        func titled(_ title: String, _ page: NSView) -> NSView {
+            let t = NSTextField(labelWithString: title)
+            t.font = .systemFont(ofSize: 18, weight: .semibold)
+            let d = NSTextField(wrappingLabelWithString: Self.sectionDescriptions[title] ?? "")
+            d.font = .systemFont(ofSize: 12)
+            d.textColor = .secondaryLabelColor
+            d.preferredMaxLayoutWidth = 560
+            let head = NSStackView(views: [t, d])
+            head.orientation = .vertical
+            head.alignment = .leading
+            head.spacing = 3
+            head.edgeInsets = NSEdgeInsets(top: 16, left: 22, bottom: 0, right: 22)
+            let container = NSView()
+            for v in [head, page] { v.translatesAutoresizingMaskIntoConstraints = false; container.addSubview(v) }
+            NSLayoutConstraint.activate([
+                head.topAnchor.constraint(equalTo: container.topAnchor),
+                head.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                head.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
+                page.topAnchor.constraint(equalTo: head.bottomAnchor, constant: -6),
+                page.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                page.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                page.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            ])
+            return container
+        }
+        for (title, view) in [("Appearance", appearance), ("Editor", editorPage), ("Notifications", notificationsPage),
+                              ("Suggestions & Helpers", helpersPage), ("Privacy & History", privacyPage), ("Sessions & Windows", sessionsPage), ("AI", aiPage),
+                              ("Shortcuts", shortcutsPage), ("Profiles", profilesPage), ("Plugins", pluginsPage), ("Advanced", advanced)] {
             let item = NSTabViewItem(identifier: title)
             item.label = title
-            item.view = view
+            item.view = titled(title, view)
             tabView.addTabViewItem(item)
         }
-        tabView.frame = NSRect(x: 0, y: 0, width: 680, height: 560)
-        let root = NSView(frame: tabView.frame)
+        // A sidebar instead of tabs.
+        let sideW: CGFloat = 180, pageW: CGFloat = 680, h: CGFloat = 640
+        tabView.tabViewType = .noTabsNoBorder
+        tabView.delegate = sidebar
+        tabView.frame = NSRect(x: sideW, y: 0, width: pageW, height: h)
         tabView.autoresizingMask = [.width, .height]
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: sideW + pageW, height: h))
+        let side = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: sideW, height: h))
+        side.material = .sidebar
+        side.blendingMode = .behindWindow
+        side.autoresizingMask = [.height]
+        sidebar.titles = tabView.tabViewItems.map(\.label)
+        sidebar.onSelect = { [weak self] i in self?.tabView.selectTabViewItem(at: i) }
+        sidebar.table.frame = NSRect(x: 0, y: 0, width: sideW, height: h - 52)
+        let sideScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: sideW, height: h - 52))
+        sideScroll.documentView = sidebar.table
+        sideScroll.drawsBackground = false
+        sideScroll.autoresizingMask = [.height]
+        side.addSubview(sideScroll)
+        // Search every section: Enter jumps to the matching setting.
+        searchField.placeholderString = "Search settings"
+        searchField.sendsWholeSearchString = true
+        searchField.target = self
+        searchField.action = #selector(searchSettings)
+        searchField.frame = NSRect(x: 10, y: h - 40, width: sideW - 20, height: 24)
+        searchField.autoresizingMask = [.minYMargin]
+        side.addSubview(searchField)
+        root.addSubview(side)
         root.addSubview(tabView)
         window?.contentView = root
-        window?.setContentSize(NSSize(width: 680, height: 560))
+        window?.setContentSize(NSSize(width: sideW + pageW, height: h))
+        sidebar.table.reloadData()
+        sidebar.table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
     }
 
-    /// Shows one section (0 Appearance … 6 Advanced).
+    private let sidebar = SettingsSidebar()
+
+    static let sectionDescriptions: [String: String] = [
+        "Appearance": "The terminal's theme, font and colors.",
+        "Editor": "How the command editor completes, suggests and highlights as you type.",
+        "Notifications": "When Anser gets your attention: long commands finishing and programs waiting for an answer.",
+        "Suggestions & Helpers": "Chips and helpers that appear while you work: servers, pull requests, project environments, alias tips, failed tests.",
+        "Privacy & History": "What Anser keeps, where, and whether it's shared between your Macs. Nothing is ever sent anywhere else.",
+        "Sessions & Windows": "What happens when you quit, reopen or paste, how much each tab keeps, and the quick terminal.",
+        "AI": "Which AI helps (Claude, GitHub Copilot or a model on this Mac). Off until you turn it on; nothing is sent until you ask.",
+        "Shortcuts": "Change any keyboard shortcut. Every action is also in the command palette (⇧⌘P).",
+        "Profiles": "Settings for certain folders or servers: a tab color, a badge, and asking before risky commands.",
+        "Plugins": "Add status-row chips, palette actions and sidebar sections with small scripts.",
+        "Advanced": "The config file, Ghostty options and other settings most people never need.",
+    ]
+
+    // MARK: Plugins
+
+    func rebuildPlugins() {
+        pluginsList.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let host = PluginHost.shared
+        if host.plugins.isEmpty {
+            let l = NSTextField(wrappingLabelWithString: "No plugins yet. “New Example Plugin” makes one to start from.")
+            l.textColor = .secondaryLabelColor
+            pluginsList.addArrangedSubview(l)
+        }
+        let on = Set(host.enabledIDs)
+        for p in host.plugins {
+            let box = NSButton(checkboxWithTitle: p.manifest.name, target: nil, action: nil)
+            box.state = on.contains(p.id) ? .on : .off
+            box.font = .systemFont(ofSize: 13, weight: .medium)
+            let id = p.id
+            box.target = self
+            box.action = #selector(pluginToggled(_:))
+            box.identifier = NSUserInterfaceItemIdentifier(id)
+            let detail = NSTextField(wrappingLabelWithString: (p.manifest.description.map { $0 + "\n" } ?? "") + p.manifest.summary + " · folder \(id)")
+            detail.font = .systemFont(ofSize: 11)
+            detail.textColor = .secondaryLabelColor
+            detail.preferredMaxLayoutWidth = 580
+            var views: [NSView] = [box, detail]
+            if !(p.manifest.settings ?? []).isEmpty {
+                let b = ClosureButton(title: "Settings…") { [weak self] in PluginHost.shared.editSettings(p, over: self?.window) }
+                b.controlSize = .small
+                views.append(b)
+            }
+            let v = NSStackView(views: views)
+            v.orientation = .vertical
+            v.alignment = .leading
+            v.spacing = 2
+            pluginsList.addArrangedSubview(v)
+        }
+        for e in host.errors {
+            let l = NSTextField(wrappingLabelWithString: "⚠︎ " + e)
+            l.textColor = .systemOrange
+            l.font = .systemFont(ofSize: 11)
+            pluginsList.addArrangedSubview(l)
+        }
+    }
+
+    @objc private func pluginToggled(_ b: NSButton) {
+        guard let id = b.identifier?.rawValue else { return }
+        var list = PluginHost.shared.enabledIDs.filter { $0 != id }
+        if b.state == .on { list.append(id) }
+        set(["enabledPlugins"], list.isEmpty ? nil : list)
+        Services.shared.record("plugin.toggle")
+    }
+
+    // MARK: Search
+
+    struct SearchHit { let section: String; let text: String; weak var view: NSView? }
+
+    /// Settings whose label or title contains every word of `query`.
+    func searchHits(_ query: String) -> [SearchHit] {
+        let words = query.lowercased().split(separator: " ").map(String.init)
+        guard !words.isEmpty else { return [] }
+        var hits: [SearchHit] = []
+        func walk(_ v: NSView, _ section: String) {
+            var text: String?
+            if let b = v as? NSButton, !b.title.isEmpty, b.title.count > 2 { text = b.title }
+            else if let f = v as? NSTextField, !f.isEditable, !f.stringValue.isEmpty { text = f.stringValue }
+            if let t = text {
+                let l = t.lowercased()
+                if words.allSatisfy(l.contains), !hits.contains(where: { $0.text == t }) { hits.append(SearchHit(section: section, text: t, view: v)) }
+            }
+            v.subviews.forEach { walk($0, section) }
+        }
+        for item in tabView.tabViewItems { if let v = item.view { walk(v, item.label) } }
+        return hits
+    }
+
+    @objc private func searchSettings() {
+        let hits = searchHits(searchField.stringValue)
+        guard !hits.isEmpty else { if !searchField.stringValue.isEmpty { NSSound.beep() }; return }
+        if hits.count == 1 { reveal(hits[0]); return }
+        let m = NSMenu()
+        for h in hits.prefix(14) {
+            let short = h.text.count > 70 ? String(h.text.prefix(68)) + "…" : h.text
+            m.addItem(ClosureMenuItem(title: "\(h.section) › \(short)") { [weak self] in self?.reveal(h) })
+        }
+        m.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: searchField)
+    }
+
+    func reveal(_ h: SearchHit) {
+        tabView.selectTabViewItem(withIdentifier: h.section)
+        guard let v = h.view else { return }
+        v.scrollToVisible(v.bounds)
+        v.wantsLayer = true
+        v.layer?.cornerRadius = 4
+        v.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.28).cgColor
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { v.layer?.backgroundColor = nil }
+        if let b = v as? NSButton { window?.makeFirstResponder(b) }
+    }
+
+    /// Shows one section (0 Appearance … 11 Advanced).
     func selectSection(_ i: Int) { tabView.selectTabViewItem(at: i) }
 
     /// Opens Settings at a section by name ("Profiles").
@@ -446,8 +688,11 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         var out = (r["_raw"] as? [String: Any]) ?? [:]
         let match = (r["match"] as? String ?? "").trimmingCharacters(in: .whitespaces)
         guard !match.isEmpty else { return nil }
-        out["host"] = nil; out["folder"] = nil
-        if match.hasPrefix("~") || match.hasPrefix("/") { out["folder"] = match } else { out["host"] = match }
+        out["host"] = nil; out["folder"] = nil; out["kubeContext"] = nil; out["awsProfile"] = nil
+        let lower = match.lowercased()
+        if lower.hasPrefix("kube:") { out["kubeContext"] = String(match.dropFirst(5)).trimmingCharacters(in: .whitespaces) }
+        else if lower.hasPrefix("aws:") { out["awsProfile"] = String(match.dropFirst(4)).trimmingCharacters(in: .whitespaces) }
+        else if match.hasPrefix("~") || match.hasPrefix("/") { out["folder"] = match } else { out["host"] = match }
         for k in ["badge", "tabColor"] {
             let v = (r[k] as? String ?? "").trimmingCharacters(in: .whitespaces)
             out[k] = v.isEmpty ? nil : v
@@ -458,7 +703,8 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     }
 
     static func profileRow(_ j: [String: Any]) -> [String: Any] {
-        ["match": (j["host"] as? String) ?? (j["folder"] as? String) ?? "", "badge": j["badge"] as? String ?? "",
+        ["match": (j["host"] as? String) ?? (j["folder"] as? String) ?? (j["kubeContext"] as? String).map { "kube:" + $0 }
+            ?? (j["awsProfile"] as? String).map { "aws:" + $0 } ?? "", "badge": j["badge"] as? String ?? "",
          "tabColor": j["tabColor"] as? String ?? "", "confirm": (j["confirm"] as? [String] ?? []).joined(separator: ", "), "_raw": j]
     }
 
@@ -547,6 +793,13 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         notifyToggle.state = notify > 0 ? .on : .off
         notifyField.doubleValue = notify > 0 ? notify : 10
         notifyField.isEnabled = notify > 0
+        let cloud = (value(json, ["showCloudContext"]) as? String) ?? "auto"
+        cloudPopup.selectItem(at: Self.cloudModes.firstIndex { $0.0 == cloud } ?? 0)
+        let openWith = (value(json, ["openFilesWith"]) as? String) ?? ""
+        openWithBox.stringValue = openWith.isEmpty ? "Automatic (first editor found)" : openWith
+        let qh = (value(json, ["quickTerminalHeight"]) as? Double) ?? 0.45
+        quickHeight.doubleValue = qh
+        quickHeightLabel.stringValue = "\(Int((qh * 100).rounded()))%"
         let tips = (value(json, ["keyTips"]) as? String) ?? "auto"
         tipsPopup.selectItem(at: Self.tipModes.firstIndex { $0.0 == tips } ?? 0)
         updatePreview()
@@ -635,6 +888,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         guard let box = notification.object as? NSComboBox else { return }
         DispatchQueue.main.async { [self] in
             if let v = box.objectValueOfSelectedItem as? String { box.stringValue = v }
+            if box === openWithBox { openWithChanged(); return }
             themeChanged(box)
         }
     }
@@ -839,6 +1093,16 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         notifyField.isEnabled = notifyToggle.state == .on
         set(["notifyAfterSeconds"], notifyToggle.state == .on ? max(1, notifyField.doubleValue) : 0)
     }
+    @objc private func cloudChanged() { set(["showCloudContext"], Self.cloudModes[max(0, cloudPopup.indexOfSelectedItem)].0) }
+    @objc private func openWithChanged() {
+        let v = openWithBox.stringValue.trimmingCharacters(in: .whitespaces)
+        set(["openFilesWith"], v.isEmpty || v.hasPrefix("Automatic") ? nil : v)
+    }
+    @objc private func quickHeightChanged() {
+        let v = (quickHeight.doubleValue * 20).rounded() / 20
+        quickHeightLabel.stringValue = "\(Int((v * 100).rounded()))%"
+        set(["quickTerminalHeight"], v)
+    }
     @objc private func tipsChanged() { set(["keyTips"], Self.tipModes[max(0, tipsPopup.indexOfSelectedItem)].0) }
 
     /// Redraws the sample terminal with the chosen theme, font and size.
@@ -931,5 +1195,50 @@ final class ThemePreviewView: NSView {
             y -= lh
             if y < 4 { break }
         }
+    }
+}
+
+/// The list of sections down the left of Settings.
+final class SettingsSidebar: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTabViewDelegate {
+    let table = NSTableView()
+    var titles: [String] = []
+    var onSelect: ((Int) -> Void)?
+    static let symbols: [String: String] = ["Appearance": "paintbrush", "Editor": "character.cursor.ibeam", "Notifications": "bell", "Suggestions & Helpers": "lightbulb",
+                                            "Privacy & History": "hand.raised", "Sessions & Windows": "macwindow.on.rectangle",
+                                            "AI": "sparkles", "Shortcuts": "keyboard", "Profiles": "person.crop.rectangle.stack",
+                                            "Plugins": "puzzlepiece.extension", "Advanced": "wrench.and.screwdriver"]
+
+    override init() {
+        super.init()
+        let c = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("s"))
+        table.addTableColumn(c)
+        table.headerView = nil
+        table.style = .sourceList
+        table.rowHeight = 28
+        table.backgroundColor = .clear
+        table.dataSource = self
+        table.delegate = self
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { titles.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let icon = NSImageView(image: NSImage(systemSymbolName: Self.symbols[titles[row]] ?? "circle", accessibilityDescription: nil) ?? NSImage())
+        icon.contentTintColor = .controlAccentColor
+        let l = NSTextField(labelWithString: titles[row])
+        let v = NSStackView(views: [icon, l])
+        v.spacing = 7
+        v.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 6)
+        return v
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        if table.selectedRow >= 0 { onSelect?(table.selectedRow) }
+    }
+
+    // Keeps the list in step when a section is chosen another way (search, show(section:)).
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        guard let item = tabViewItem, let i = titles.firstIndex(of: item.label), table.selectedRow != i else { return }
+        table.selectRowIndexes(IndexSet(integer: i), byExtendingSelection: false)
     }
 }

@@ -41,6 +41,8 @@ extension AppDelegate {
         case "x-man-page":
             guard let cmd = OpenRequests.manCommand(url) else { refuseLink(url); return }
             openTab(cwd: nil, run: cmd)
+        case "anser":
+            handleAnserLink(url)
         default:
             NSSound.beep()
         }
@@ -87,7 +89,7 @@ extension AppDelegate {
         if a.runModal() == .alertFirstButtonReturn { run() }
     }
 
-    private func refuseLink(_ url: URL) {
+    func refuseLink(_ url: URL) {
         let a = NSAlert()
         a.messageText = "Anser didn't open this link"
         a.informativeText = "It doesn't look like a plain \(url.scheme ?? "") address, so it was ignored for safety:\n\n\(url.absoluteString.prefix(300))"

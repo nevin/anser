@@ -1,7 +1,7 @@
 import AppKit
 import AnserCore
 
-/// Git blame and Find in All Tabs.
+/// Git blame, and Search All Tabs (a scope of the one search).
 extension TerminalWindowController {
 
     // MARK: Git blame
@@ -112,77 +112,6 @@ extension TerminalWindowController {
 
     // MARK: Find in all tabs
 
-    private struct TabHit {
-        weak var pane: PaneView?
-        let tab: String
-        let command: String
-        let started: Date
-        let output: String
-        let lineIndex: Int?
-    }
-
-    /// Edit → Find in All Tabs (⇧⌘F): every command and its output, in every window.
-    func showSearchAllTabs(for pane: PaneView) {
-        Services.shared.record("search.allTabs")
-        // A snapshot of what's on screen everywhere, newest first.
-        var corpus: [(pane: PaneView, tab: String, blocks: [(String, Date, String)])] = []
-        for p in AppDelegate.shared.allPanes {
-            let tabTitle = p.windowController.flatMap { wc in wc.tab(for: p).map { wc.title(of: $0) } } ?? "Terminal"
-            var blocks: [(String, Date, String)] = []
-            for i in p.session.blocks.indices.reversed() {
-                blocks.append((p.session.blocks[i].command, p.session.blocks[i].started, p.output(ofBlock: i) ?? ""))
-            }
-            corpus.append((p, tabTitle, blocks))
-        }
-        showPicker(PickerPanel.Config(
-            title: "Find in all tabs",
-            placeholder: "Search commands and output in every tab…",
-            scopes: [],
-            hint: "⏎ go to it (and find it there)",
-            provider: { query, _ in
-                let q = query.trimmingCharacters(in: .whitespaces).lowercased()
-                guard q.count >= 2 else { return [] }
-                var items: [PickerItem] = []
-                outer: for c in corpus {
-                    for (command, started, output) in c.blocks {
-                        let sub = "\(c.tab) · $ \(command) · \(TerminalWindowController.relative(started))"
-                        if command.lowercased().contains(q) {
-                            items.append(PickerItem(title: command, subtitle: c.tab + " · command · " + TerminalWindowController.relative(started), accessory: c.tab,
-                                                    accessoryColor: .secondaryLabelColor, positions: [],
-                                                    payload: TabHit(pane: c.pane, tab: c.tab, command: command, started: started, output: output, lineIndex: nil)))
-                        }
-                        let lines = output.components(separatedBy: "\n")
-                        for (n, l) in lines.enumerated() where l.lowercased().contains(q) {
-                            items.append(PickerItem(title: l.trimmingCharacters(in: .whitespaces), subtitle: sub, accessory: c.tab,
-                                                    accessoryColor: .secondaryLabelColor, positions: [],
-                                                    payload: TabHit(pane: c.pane, tab: c.tab, command: command, started: started, output: output, lineIndex: n)))
-                            if items.count >= 300 { break outer }
-                        }
-                    }
-                }
-                return items
-            },
-            onAccept: { item, _ in
-                guard let hit = item.payload as? TabHit, let p = hit.pane else { NSSound.beep(); return }
-                AppDelegate.shared.reveal(sessionID: p.session.id)
-                let q = item.title.count < 80 ? item.title : hit.command
-                p.showFind(query: hit.lineIndex == nil ? hit.command : q)
-            },
-            onCopy: { $0.title },
-            onDelete: nil,
-            preview: { item in
-                guard let hit = item.payload as? TabHit else { return nil }
-                var lines = ["$ " + hit.command, ""]
-                let out = hit.output.components(separatedBy: "\n")
-                if let n = hit.lineIndex {
-                    let lo = max(0, n - 8), hi = min(out.count, n + 9)
-                    if lo > 0 { lines.append("…") }
-                    for i in lo..<hi { lines.append((i == n ? "▶ " : "  ") + out[i]) }
-                    if hi < out.count { lines.append("…") }
-                } else {
-                    lines += out.prefix(40)
-                }
-                return PickerPanel.previewText(lines.joined(separator: "\n"))
-            }), pane: pane)
-    }
+    /// Edit → Search All Tabs (⇧⌘F): the search window on "All tabs".
+    func showSearchAllTabs(for pane: PaneView) { showSearch(for: pane, scope: .allTabs) }
 }

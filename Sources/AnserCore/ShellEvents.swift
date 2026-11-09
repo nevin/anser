@@ -15,6 +15,10 @@ public enum ShellEvent: Equatable, Sendable {
     case functions(names: [String])
     /// The shell's own line editor has text in it (user typed in raw mode).
     case buffer(String)
+    /// Cloud context variables: AWS_PROFILE, KUBECONFIG, DOCKER_CONTEXT, CLOUDSDK_CORE_PROJECT.
+    case context(CloudContext.Vars)
+    /// Features this shell's hooks support ("load": ESC [9990~ loads a file Anser wrote).
+    case capabilities([String])
 
     public static func parse(_ line: String) -> ShellEvent? {
         let fields = line.split(separator: "\t", omittingEmptySubsequences: false).map { unescape(String($0)) }
@@ -27,6 +31,10 @@ public enum ShellEvent: Equatable, Sendable {
         case "aliases": return .aliases(file: f(1))
         case "functions": return .functions(names: f(1).split(separator: " ").map(String.init))
         case "buffer": return .buffer(f(1))
+        case "ctx":
+            func v(_ i: Int) -> String? { f(i).isEmpty ? nil : f(i) }
+            return .context(CloudContext.Vars(awsProfile: v(1), kubeconfig: v(2), dockerContext: v(3), gcloudProject: v(4), virtualEnv: v(5)))
+        case "caps": return .capabilities(fields.dropFirst().filter { !$0.isEmpty })
         default: return nil
         }
     }

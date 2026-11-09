@@ -16,7 +16,77 @@ enum SelfTest {
         guard let pane = AppDelegate.shared.currentPane, let wc = pane.windowController else {
             check("window opened", false); finish(); return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "history" {
+            Task { @MainActor in await historyShots(pane); finish() }
+            return
+        }
         Task { @MainActor in await run(pane, wc); finish() }
+    }
+
+    /// A real screenshot of a window (what people see, unlike cacheDisplay).
+    @MainActor
+    static func windowShot(_ w: NSWindow?, _ name: String) async {
+        guard let w else { return }
+        w.displayIfNeeded()
+        await sleep(0.4)
+        let path = shotDir + "/\(name).png"
+        for attempt in 0..<3 {
+            if attempt > 0 { await sleep(0.8) }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            p.arguments = ["-x", "-o", "-l\(w.windowNumber)", path]
+            try? p.run()
+            p.waitUntilExit()
+            if FileManager.default.fileExists(atPath: path) { return }
+        }
+    }
+
+    /// History window screenshots on a realistic throwaway history.
+    @MainActor
+    static func historyShots(_ pane: PaneView) async {
+        let dir = NSTemporaryDirectory() + "anser-st-history"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let hpath = dir + "/shots.sqlite"
+        for sfx in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: hpath + sfx) }
+        let hs = HistoryStore(path: hpath)
+        let home = NSHomeDirectory()
+        let folders = [home + "/dev-library/anser", home + "/dev-library/reqorb", home + "/dev-library/captode", home]
+        let cmds: [(String, Int, Int, Int)] = [  // command, runs, folder, failures
+            ("git status", 120, 0, 0), ("swift build", 45, 0, 6), ("bash scripts/build-app.sh debug", 30, 0, 2), ("swift test", 25, 0, 3),
+            ("npm run dev", 40, 1, 1), ("npm test", 22, 1, 4), ("git push", 18, 1, 1), ("git commit -m \"wip\"", 15, 1, 0),
+            ("ls -la", 60, 3, 0), ("pwd", 12, 3, 0), ("gti status", 2, 0, 2), ("sl", 1, 3, 1), ("npm run biuld", 1, 1, 1),
+            ("docker compose up -d", 9, 2, 1), ("ffmpeg -i in.mov -vf scale=1280:-2 out.mp4", 4, 2, 0), ("open .", 14, 2, 0),
+            ("git log --oneline --graph -20", 11, 0, 0), ("cd ~/dev-library", 30, 3, 0), ("brew upgrade", 3, 3, 1), ("kubectl get pods -A", 2, 3, 2),
+        ]
+        var day = 0.0
+        for (c, runs, f, fails) in cmds {
+            for i in 0..<runs {
+                let at = Date().addingTimeInterval(-Double(i) * 86400 * 0.7 - day)
+                let id = hs.recordStart(command: c, cwd: folders[f], session: "st", branch: f < 2 ? "main" : nil, at: at)
+                hs.recordFinish(id: id, exitCode: i < fails ? (["gti status", "sl"].contains(c) ? 127 : 1) : 0, duration: Double(c.count % 7) + 0.4)
+                if i == 0 { hs.saveOutput("line one of output\nline two\n" + (fails > 0 ? "error: something failed" : "done"), forHistoryID: id) }
+            }
+            day += 1800
+        }
+        let he = HistoryEditorWindowController.shared
+        he.storeOverride = hs
+        he.window?.setContentSize(NSSize(width: 900, height: 680))
+        he.show(for: pane)
+        _ = await wait(8) { he.all.count == cmds.count }
+        await sleep(0.5)
+        await windowShot(he.window, "history-none")
+        he.select(where: { $0.c.command == "swift build" }, add: false)
+        await windowShot(he.window, "history-one")
+        he.select(where: { $0.c.command == "npm test" }, add: false)
+        if let sv = he.insights.subviews.first as? NSScrollView, let doc = sv.documentView { doc.scroll(NSPoint(x: 0, y: 260)) }
+        await windowShot(he.window, "history-one-scrolled")
+        he.select(where: { $0.c.command.hasPrefix("npm") }, add: false)
+        await windowShot(he.window, "history-several")
+        he.setFilterForTests(.mistakes)
+        await windowShot(he.window, "history-mistakes")
+        check("history shots taken", FileManager.default.fileExists(atPath: shotDir + "/history-none.png"))
+        he.close()
+        he.storeOverride = nil
     }
 
     private static func check(_ name: String, _ ok: Bool, _ detail: String = "") {
@@ -62,6 +132,8 @@ enum SelfTest {
         pane.snapshotBar(to: shotDir + "/bar-\(name).png", includeTerminalArea: full)
     }
 
+    static func allSubviews(_ v: NSView) -> [NSView] { v.subviews + v.subviews.flatMap(allSubviews) }
+
     @MainActor
     static func snapView(_ v: NSView, _ name: String) {
         v.layoutSubtreeIfNeeded()
@@ -80,6 +152,886 @@ enum SelfTest {
         for ch in text { pane.editor.insertText(String(ch), replacementRange: pane.editor.selectedRange()) }
     }
 
+    // MARK: Newer feature checks (separate functions keep the compiler fast)
+
+    @MainActor
+    private static func workToolChecks(_ pane: PaneView, _ wc: TerminalWindowController, live: String, tmp: String) async {
+        let s = pane.session
+        var ok = false
+        // Work tools: failed tests, "when done", file watching, project env, runbooks, containers, AI tasks, project plugins.
+        FileTrust.testDefaults = UserDefaults(suiteName: "anser-selftest-trust-\(UUID().uuidString)")
+        ProjectEnvPrefs.file = URL(fileURLWithPath: live + "/project-env.json")
+        let wt = live + "/work"
+        let fm = FileManager.default
+        try? fm.removeItem(atPath: wt)
+        try? fm.createDirectory(atPath: wt + "/anser-selftest/tests", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: wt + "/.git", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: wt + "/tests", withIntermediateDirectories: true)
+        try? (Array(repeating: "x = 1", count: 10).joined(separator: "\n") + "\n").write(toFile: wt + "/tests/test_x.py", atomically: true, encoding: .utf8)
+        try? """
+        #!/bin/sh
+        if [ "$1" != "-q" ]; then echo "1 passed"; exit 0; fi
+        echo "=================== FAILURES ==================="
+        echo "___________________ test_add ___________________"
+        echo "tests/test_x.py:7: AssertionError"
+        echo "FAILED tests/test_x.py::test_add - assert 3 == 4"
+        exit 1
+        """.write(toFile: wt + "/anser-selftest/pytest", atomically: true, encoding: .utf8)
+        chmod(wt + "/anser-selftest/pytest", 0o755)
+        try? "ST_FOO=from-dotenv\nPATH=/nope\n".write(toFile: wt + "/.env", atomically: true, encoding: .utf8)
+        pane.run("cd \(ShellLexer.escape(wt)) # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.cwd.hasSuffix("/work") }
+        await sleep(0.4)
+
+        // Project environment: offered on cd, loaded silently, unloaded on leaving.
+        check("the shell can load project environments", s.capabilities.contains("load"), s.capabilities.joined(separator: ","))
+        ok = await wait(3) { pane.envOffer?.dotenvFiles == [".env"] }
+        pane.refreshBar()
+        check("a project's .env is offered on cd", ok && pane.envChip.text.contains(".env"), pane.envChip.text)
+        if let offer = pane.envOffer { pane.loadProjectEnv(offer) }
+        _ = await wait(3) { pane.envLoaded != nil }
+        await sleep(0.4)
+        pane.run("printf '%s|%s' \"$ST_FOO\" \"$PATH\" > env.out # anser-selftest")
+        ok = await wait(6) { ((try? String(contentsOfFile: wt + "/env.out", encoding: .utf8)) ?? "").hasPrefix("from-dotenv|") }
+        let envOut = (try? String(contentsOfFile: wt + "/env.out", encoding: .utf8)) ?? ""
+        check("loading a .env sets its values without typing a command", ok && !s.blocks.contains { $0.command.contains("ST_FOO=") }, envOut)
+        check("a .env can't change PATH", !envOut.contains("/nope"))
+        pane.run("cd .. # anser-selftest")
+        _ = await wait(5) { s.atPrompt && !s.cwd.hasSuffix("/work") }
+        ok = await wait(3) { pane.envLoaded == nil }
+        await sleep(0.4)
+        pane.run("printf '[%s]' \"$ST_FOO\" > \(ShellLexer.escape(wt))/env2.out # anser-selftest")
+        _ = await wait(6) { fm.fileExists(atPath: wt + "/env2.out") }
+        check("leaving the project unloads its values", ok && ((try? String(contentsOfFile: wt + "/env2.out", encoding: .utf8)) ?? "") == "[]",
+              (try? String(contentsOfFile: wt + "/env2.out", encoding: .utf8)) ?? "none")
+        ProjectEnvPrefs.set(wt, "never")
+        pane.run("cd \(ShellLexer.escape(wt)) # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.cwd.hasSuffix("/work") }
+        await sleep(0.3)
+        check("“don't offer here” is remembered", pane.envOffer == nil && pane.envLoaded == nil)
+
+        // Failed tests: listed after a failing run, opened at the line, re-run until they pass.
+        pane.run("./anser-selftest/pytest -q")
+        ok = await wait(8) { pane.testReport?.report.failures.count == 1 }
+        pane.refreshBar()
+        check("failed tests are listed after a test run", ok && pane.testsChip.text == "1 test failed", pane.testsChip.text)
+        if let (r, cmd, cwd) = pane.testReport, let f = r.failures.first {
+            let re = TestFailures.rerunCommand(f, runner: r.runner, original: cmd) ?? ""
+            check("a failed test can be re-run on its own", re == "./anser-selftest/pytest tests/test_x.py::test_add", re)
+            pane.openTestLocation(f, cwd: cwd)
+            check("a failed test opens at its line", pane.lastOpenedLink?.path.hasSuffix("tests/test_x.py") == true && pane.lastOpenedLink?.line == 7,
+                  "\(String(describing: pane.lastOpenedLink))")
+            check("the failed tests menu lists them", pane.failedTestsMenu()?.items.contains { $0.title == "test_add" } == true)
+            pane.rerunTests([f], command: re, cwd: cwd)
+            ok = await wait(8) { pane.testReport == nil }
+            check("re-running a fixed test clears the list", ok)
+        } else {
+            check("a failed test can be re-run on its own", false, "no report")
+        }
+
+        // When this finishes: run next, but only if it worked.
+        pane.run("sleep 1 # anser-selftest")
+        _ = await wait(3) { s.running != nil }
+        pane.afterSteps = [.run("echo after-ran # anser-selftest", onlyIfSucceeded: true)]
+        pane.refreshBar()
+        check("the next command shows while one runs", pane.afterChip.text.contains("after-ran"), pane.afterChip.text)
+        ok = await wait(8) { s.atPrompt && s.blocks.last?.command.contains("after-ran") == true }
+        check("a command can run when the current one finishes", ok)
+        pane.run("sleep 0.5; false # anser-selftest")
+        _ = await wait(3) { s.running != nil }
+        pane.afterSteps = [.run("echo should-not-run # anser-selftest", onlyIfSucceeded: true)]
+        _ = await wait(6) { s.atPrompt && s.blocks.last?.command.contains("false") == true }
+        await sleep(0.6)
+        check("“if it succeeds” doesn't run after a failure", !s.blocks.contains { $0.command.contains("should-not-run") } && pane.afterSteps.isEmpty)
+
+        // Re-run when files change (not for build output or dependencies).
+        pane.run("echo watch-ran # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.blocks.last?.command.contains("watch-ran") == true }
+        pane.toggleWatch()
+        check("watching starts for the last command", pane.fileWatch?.command.contains("watch-ran") == true && pane.watchChip.text.contains("watching"))
+        await sleep(0.8)
+        let watchBefore = s.blocks.filter { $0.command.contains("watch-ran") }.count
+        try? "changed".write(toFile: wt + "/src-file.txt", atomically: true, encoding: .utf8)
+        ok = await wait(8) { s.atPrompt && s.blocks.filter { $0.command.contains("watch-ran") }.count == watchBefore + 1 }
+        check("a file change re-runs the watched command", ok && pane.fileWatch?.runs == 1, "runs=\(pane.fileWatch?.runs ?? -1)")
+        await sleep(1.2)
+        try? fm.createDirectory(atPath: wt + "/node_modules", withIntermediateDirectories: true)
+        try? "x".write(toFile: wt + "/node_modules/dep.js", atomically: true, encoding: .utf8)
+        await sleep(1.5)
+        check("changes in node_modules don't trigger a run", pane.fileWatch?.runs == 1)
+        pane.stopWatching()
+        check("watching stops", pane.fileWatch == nil && pane.watchChip.text.isEmpty)
+
+        // Runbooks: steps run one by one and are ticked off; untrusted project runbooks ask first.
+        try? fm.createDirectory(atPath: wt + "/.anser/runbooks", withIntermediateDirectories: true)
+        try? """
+        # St runbook
+
+        ## One
+        ```sh
+        echo rb-one # anser-selftest
+        ```
+
+        ## Two
+        ```sh
+        echo rb-{{word:two}} # anser-selftest
+        ```
+
+        ## Three
+        ```sh
+        false # anser-selftest
+        ```
+        """.write(toFile: wt + "/.anser/runbooks/st.md", atomically: true, encoding: .utf8)
+        let rbs = Runbook.load(cwd: wt)
+        check("project runbooks are found", rbs.first?.title == "St runbook" && rbs.first?.steps.count == 3 && rbs.first?.source == .project)
+        if let rb = rbs.first {
+            check("a project runbook starts untrusted", !FileTrust.runbooks.isTrusted(rb))
+            FileTrust.runbooks.trust(rb)
+            let rw = RunbookWindowController.show(rb, pane: pane)
+            rw?.run(step: 0)
+            ok = await wait(8) { if case .ok = rw?.states[0] { return true } else { return false } }
+            check("a runbook step runs and is ticked off", ok, "\(String(describing: rw?.states))")
+            rw?.run(step: 2)
+            ok = await wait(8) { if case .failed = rw?.states[2] { return true } else { return false } }
+            check("a failing runbook step is marked failed", ok, "\(String(describing: rw?.states))")
+            check("the next step is the first one not done", rw?.nextStep == 1)
+            rw?.close()
+            try? "# changed\n```sh\nrm -rf / # anser-selftest\n```\n".write(toFile: wt + "/.anser/runbooks/st.md", atomically: true, encoding: .utf8)
+            check("changing a project runbook asks for trust again", Runbook.load(cwd: wt).first.map { !FileTrust.runbooks.isTrusted($0) } == true)
+        }
+        let panelWasOpen = wc.notebookPanelVisible
+        if !panelWasOpen { wc.toggleNotebookPanel() }
+        wc.notebookPanel.reload()
+        let runbooksInPanel: Int = wc.notebookPanel.runbookCount
+        check("runbooks show in the Saved panel", runbooksInPanel >= 1, "\(runbooksInPanel)")
+        if !panelWasOpen { wc.toggleNotebookPanel() }
+
+        // Containers in the sidebar (test data instead of Docker).
+        ContainerMonitor.shared.testContainers = [Containers.Container(id: "1", name: "st-db", image: "postgres", status: "Up 1 minute", state: "running", ports: "0.0.0.0:5432->5432/tcp")]
+        wc.sidebar.refresh(for: pane)
+        ok = await wait(4) { wc.sidebar.sectionTitles.contains("CONTAINERS · 1") }
+        check("running containers show in the sidebar", ok, wc.sidebar.sectionTitles.joined(separator: ", "))
+        ContainerMonitor.shared.testContainers = nil
+
+        // A tunnel to a host that doesn't exist fails and says so (and is retried a few times first).
+        let badTunnel = SSHTunnel(name: "st", host: "anser-selftest.invalid", localPort: 47999, remotePort: 22)
+        TunnelManager.shared.start(badTunnel)
+        ok = await wait(8) {
+            switch TunnelManager.shared.state(badTunnel) { case .retrying, .failed: return true; default: return false }
+        }
+        check("a broken tunnel reports why", ok, "\(TunnelManager.shared.state(badTunnel))")
+        TunnelManager.shared.stop(badTunnel)
+        check("uploads are only offered in ssh tabs", !pane.offerUpload([wt + "/env.out"]))
+
+        // AI task: a proposed command waits for you, runs, and its result goes back for the next step.
+        let doneJSON = #"{"content":[{"type":"text","text":"DONE: Printed the greeting."}],"stop_reason":"end_turn","model":"test"}"#
+        Services.shared.aiOverride = AIHelp(apiKey: { "test" }, transport: { _ in (200, Data(doneJSON.utf8)) })
+        AgentPanel.show(for: pane)
+        if let ap = AgentPanel.forTests(pane) {
+            ap.setGoalForTests("print a greeting")
+            ap.received(.run(command: "rm -rf build # anser-selftest", why: "clean"))
+            check("a risky AI step is flagged", ap.riskText?.contains("deletes") == true)
+            ap.received(.run(command: "echo agent-step # anser-selftest", why: "Say hello."))
+            check("the AI's command waits for approval", ap.proposedCommand.contains("agent-step") && !s.blocks.contains { $0.command.contains("agent-step") })
+            ap.runTapped()
+            ok = await wait(10) { ap.transcriptText.contains("Done: Printed the greeting.") }
+            check("after a step runs, the AI gets its result and finishes", ok && s.blocks.last?.command.contains("agent-step") == true, ap.transcriptText)
+            ap.close()
+        } else {
+            check("the AI task panel opens", false)
+        }
+        Services.shared.aiOverride = nil
+
+        // Project plugins (trusted first), plugin settings, starter plugins.
+        let teamDir = wt + "/.anser/plugins/team"
+        try? fm.createDirectory(atPath: teamDir, withIntermediateDirectories: true)
+        try? """
+        {"name": "Team", "chips": [{"id": "greet", "script": "echo \\"team-$ANSER_SETTING_GREETING\\""}],
+         "settings": [{"key": "greeting", "title": "Greeting", "default": "default"}]}
+        """.write(toFile: teamDir + "/plugin.json", atomically: true, encoding: .utf8)
+        PluginHost.shared.reload()
+        pane.refreshBar()
+        check("a repo's plugins wait for trust", PluginHost.shared.untrusted(for: pane).count == 1 && pane.pluginChipViews.contains { $0.text == "1 project plugin" },
+              pane.pluginChipViews.map(\.text).joined(separator: ","))
+        if let tp = PluginHost.shared.untrusted(for: pane).first { FileTrust.plugins.trust(tp) }
+        PluginHost.shared.settingsOverride = ["project:" + teamDir: ["greeting": "from-settings"]]
+        PluginHost.shared.reload()
+        ok = await wait(6) { PluginHost.shared.chips(for: pane).contains { $0.chip.text == "team-from-settings" } }
+        check("a trusted project plugin runs, with its settings", ok, PluginHost.shared.chips(for: pane).map(\.chip.text).joined(separator: ","))
+        PluginHost.shared.settingsOverride = nil
+        let starterDir = live + "/starter-plugins"
+        try? fm.removeItem(atPath: starterDir)
+        PluginHost.directory = starterDir
+        PluginHost.shared.enabledOverride = []
+        if let node = PluginGallery.items.first(where: { $0.id == "node-version" }) { PluginHost.shared.installStarter(node) }
+        check("a starter plugin installs and turns on", PluginHost.shared.plugins.map(\.id) == ["node-version"] && PluginHost.shared.enabledIDs == ["node-version"])
+        PluginHost.shared.enabledOverride = nil
+        PluginHost.directory = PluginRegistry.defaultDirectory
+        PluginHost.shared.reload()
+        FileTrust.testDefaults = nil
+        pane.run("cd \(ShellLexer.escape(tmp)) # anser-selftest")
+        _ = await wait(5) { s.atPrompt }
+
+        _ = ok
+    }
+
+    @MainActor
+    private static func habitChecks(_ pane: PaneView, _ wc: TerminalWindowController, live: String, tmp: String) async {
+        let s = pane.session
+        var ok = false
+        // Aliases: added in Anser, live in an open tab, removed again; habit tips; log viewer; recording a tab.
+        let hab = live + "/habits"
+        try? FileManager.default.removeItem(atPath: hab)
+        try? FileManager.default.createDirectory(atPath: hab, withIntermediateDirectories: true)
+        AliasManager.fileURL = URL(fileURLWithPath: hab + "/aliases.json")
+        RecordingStore.directory = URL(fileURLWithPath: hab + "/recordings")
+        pane.run("cd \(ShellLexer.escape(hab)) # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.cwd.hasSuffix("/habits") }
+        var book = AliasBook()
+        book.set(AnserAlias(name: "anserst", command: "echo alias-works-anser-selftest"))
+        check("an alias saves", AliasManager.save(book) && FileManager.default.fileExists(atPath: hab + "/aliases.sh"))
+        await sleep(0.4)
+        pane.run("anserst > alias.out # anser-selftest")
+        ok = await wait(6) { ((try? String(contentsOfFile: hab + "/alias.out", encoding: .utf8)) ?? "").contains("alias-works") }
+        check("a new alias works in an open tab right away", ok)
+        AliasesWindowController.shared.show(for: pane)
+        check("the alias manager lists it", AliasesWindowController.shared.rows.contains { if case let .mine(a) = $0 { return a.name == "anserst" } else { return false } })
+        AliasesWindowController.shared.close()
+        pane.run("echo alias-works-anser-selftest")
+        ok = await wait(6) { pane.aliasTip?.existing == true }
+        pane.refreshBar()
+        check("typing an alias's full command shows a tip", ok && pane.aliasChip.text.contains("anserst"), pane.aliasChip.text)
+        book.remove("anserst")
+        AliasManager.save(book)
+        await sleep(0.4)
+        pane.run("type anserst >/dev/null 2>&1 || echo gone > alias2.out # anser-selftest")
+        ok = await wait(6) { FileManager.default.fileExists(atPath: hab + "/alias2.out") }
+        check("a deleted alias is gone from open tabs", ok)
+        check("alias names are checked", AliasStore.problem(name: "rm -rf", command: "x") != nil)
+
+        // Log viewer: levels, filters, errors.
+        pane.run("printf '%s\\n' 'INFO server start' '{\"level\":\"error\",\"msg\":\"db down\",\"code\":5}' 'WARN slow query' '    at frame one' # anser-selftest")
+        _ = await wait(6) { s.atPrompt && s.blocks.last?.command.contains("server start") == true }
+        await sleep(0.6)
+        pane.openLogViewer()
+        if let lv = LogViewerWindowController.forTests(pane) {
+            lv.poll()
+            check("the log viewer reads levels", lv.lines.count == 4 && lv.errorCount == 1, "\(lv.lines.map { "\($0.level.label):\($0.message)" })")
+            lv.setFilterForTests(level: 3, search: "")
+            check("the log viewer can show only errors (with the lines that follow them)", lv.shownText.contains("db down") && !lv.shownText.contains("server start"), lv.shownText)
+            lv.setFilterForTests(level: 0, search: "slow")
+            check("the log viewer searches", lv.shownText.contains("slow query") && !lv.shownText.contains("db down"))
+            lv.close()
+        } else {
+            check("the log viewer opens", false)
+        }
+        pane.run("tail -f /dev/null # anser-selftest")
+        _ = await wait(4) { s.running != nil }
+        pane.refreshBar()
+        check("following a log offers the log view", pane.logChip.text == "Log view", pane.logChip.text)
+        pane.sendControl("c")
+        _ = await wait(5) { s.atPrompt }
+
+        // Recording a tab and replaying it.
+        pane.startRecording()
+        pane.refreshBar()
+        check("recording shows in the status row", pane.recChip.text.hasPrefix("REC"))
+        pane.run("echo rec-demo-$((40+2)) # anser-selftest")
+        _ = await wait(6) { s.atPrompt && s.blocks.last?.command.contains("rec-demo") == true }
+        await sleep(0.6)
+        let recURL = pane.stopRecording()
+        let rec = recURL.flatMap { try? TabRecording.decode(Data(contentsOf: $0)) }
+        check("a recording is saved with its frames and commands", (rec?.frames.count ?? 0) > 1 && rec?.marks.contains { $0.label.contains("rec-demo") } == true,
+              "frames=\(rec?.frames.count ?? -1) marks=\(rec?.marks.map(\.label) ?? [])")
+        if let rw = ReplayWindowController.forTests() {
+            rw.seek(to: rw.recording.duration)
+            check("the replay shows the recorded screen", rw.screenText.contains("rec-demo-42"))
+            rw.close()
+        } else {
+            check("the replay window opens", false)
+        }
+        check("a recording exports for asciinema", rec.map { $0.asciicast().contains("\"version\":2") } == true)
+        pane.run("cd \(ShellLexer.escape(tmp)) # anser-selftest")
+        _ = await wait(5) { s.atPrompt }
+
+        // History editor: on a throwaway history, never your real one.
+        let hpath = live + "/edit-history.sqlite"
+        for sfx in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: hpath + sfx) }
+        let hs = HistoryStore(path: hpath)
+        for i in 0..<12 { hs.recordStart(command: "git status --short", cwd: tmp, session: "st", at: Date().addingTimeInterval(Double(-i))) }
+        let typoID = hs.recordStart(command: "gti status", cwd: tmp, session: "st")
+        hs.recordFinish(id: typoID, exitCode: 127, duration: 0.01)
+        hs.recordStart(command: "sl -la", cwd: tmp, session: "st")
+        hs.recordStart(command: "pwd", cwd: tmp, session: "st")
+        let he = HistoryEditorWindowController.shared
+        he.storeOverride = hs
+        he.show(for: pane)
+        ok = await wait(8) { he.all.count == 4 }
+        check("the history editor lists every command", ok, "\(he.all.count)")
+        he.selectMistakesTapped()
+        let picked: Set<String> = Set(he.selectedCommands)
+        check("Select Mistakes picks the typos", picked == Set(["gti status", "sl -la"]), he.selectedCommands.joined(separator: ", "))
+        he.selectBasicTapped()
+        check("Select Basic picks commands like pwd", he.selectedCommands == ["pwd"], he.selectedCommands.joined(separator: ", "))
+        he.selectMistakesTapped()
+        he.delete(he.selectedCommands)
+        let typoGone: Bool = hs.stats(for: "gti status") == nil
+        let typo2Gone: Bool = hs.stats(for: "sl -la") == nil
+        let leftCount: Int = he.all.count
+        check("several commands delete at once", leftCount == 2 && typoGone && typo2Gone)
+        var compacted: HistoryStore.CompactResult?
+        he.compact(.init(keepRunsPerCommand: 3)) { compacted = $0 }
+        ok = await wait(8) { compacted != nil }
+        let keptRuns: Int = hs.stats(for: "git status --short")?.count ?? -1
+        let removedRuns: Int = compacted?.runsRemoved ?? -1
+        check("compacting trims old runs", ok && keptRuns == 3 && removedRuns == 9, "kept=\(keptRuns) removed=\(removedRuns)")
+        he.close()
+        he.storeOverride = nil
+
+        _ = ok
+    }
+
+    @MainActor
+    private static func moreToolChecks(_ pane: PaneView, _ wc: TerminalWindowController, live: String, tmp: String) async {
+        let s = pane.session
+        var ok = false
+        let fm = FileManager.default
+        let dir = live + "/more"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        pane.run("cd \(ShellLexer.escape(dir)) # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.cwd.hasSuffix("/more") }
+
+        // "Last time this failed, you ran…"
+        for c in ["test -f fixed.flag # anser-selftest", "touch fixed.flag # anser-selftest", "test -f fixed.flag # anser-selftest",
+                  "rm fixed.flag # anser-selftest", "test -f fixed.flag # anser-selftest"] {
+            pane.run(c)
+            let n = s.blocks.count
+            _ = await wait(5) { s.atPrompt && s.blocks.count > n - 1 && s.blocks.last?.command == c }
+            await sleep(0.3)
+        }
+        ok = await wait(5) { pane.fixHint != nil }
+        pane.refreshBar()
+        let hintSteps: [String] = pane.fixHint?.steps ?? []
+        check("a repeated failure shows what fixed it last time", ok && hintSteps == ["touch fixed.flag # anser-selftest"] && pane.hintChip.text.hasPrefix("Last time"),
+              hintSteps.joined(separator: " | "))
+
+        // Watching a command's output in the background.
+        OutputWatchManager.shared.notify = false
+        try? "one".write(toFile: dir + "/counter.txt", atomically: true, encoding: .utf8)
+        let ow = OutputWatchManager.shared.add(command: "cat counter.txt", cwd: dir, env: s.env, minutes: 60)
+        ok = await wait(6) { OutputWatchManager.shared.watches.first { $0.id == ow.id }?.runs == 1 }
+        try? "two".write(toFile: dir + "/counter.txt", atomically: true, encoding: .utf8)
+        var event: OutputWatch.Event?
+        OutputWatchManager.shared.run(ow.id) { event = $0 }
+        _ = await wait(6) { event != nil }
+        check("a watched command notices changed output", ok && event == .changed, "\(String(describing: event))")
+        wc.sidebar.refresh(for: pane)
+        ok = await wait(4) { wc.sidebar.sectionTitles.contains { $0.hasPrefix("WATCHING") } }
+        check("watched commands show in the sidebar", ok)
+        OutputWatchManager.shared.remove(ow.id)
+
+        // Running on several hosts (a local stand-in for ssh).
+        let mh = MultiHostWindowController.shared
+        mh.argvOverride = { host, _ in ["/bin/sh", "-c", host == "st-bad" ? "echo broken; exit 2" : "echo hello-\(host)"] }
+        mh.show()
+        mh.setChecked(["st-a", "st-bad"])
+        var mhDone = false
+        mh.run("uptime", on: ["st-a", "st-bad"]) { mhDone = true }
+        _ = await wait(8) { mhDone }
+        let mhSummary = MultiHost.summary(Array(mh.results.values))
+        check("one command runs on several hosts, failures first", mhDone && mhSummary == "1 ok · 1 failed" && mh.order.first == "st-bad", mhSummary)
+        mh.argvOverride = nil
+        mh.close()
+
+        // AI ghost text from a local model (answered by the test).
+        CommandEditor.aiTransportForTests = { _ in (200, Data(#"{"response":"echo anser-ai-ghost-ok"}"#.utf8)) }
+        SettingsWindowController.setValue(["aiCompletions"], true)
+        SettingsWindowController.setValue(["aiProvider"], "ollama")
+        _ = await wait(5) { Services.shared.config.aiCompletions && Services.shared.config.aiProvider == "ollama" }
+        pane.editor.setTextForTests("echo anser-ai-gh")
+        ok = await wait(5) { pane.editor.ghostSuffix == "ost-ok" }
+        check("a local AI model fills the gray text when history has none", ok, pane.editor.ghostSuffix)
+        pane.editor.setTextForTests("")
+        SettingsWindowController.setValue(["aiCompletions"], nil)
+        SettingsWindowController.setValue(["aiProvider"], nil)
+        CommandEditor.aiTransportForTests = nil
+
+        // History: Recently Deleted, restore, weekly clean-up.
+        let hpath = dir + "/h.sqlite"
+        let hs = HistoryStore(path: hpath)
+        hs.recordStart(command: "git status --short", cwd: tmp, session: "st")
+        let typo = hs.recordStart(command: "gti status", cwd: tmp, session: "st")
+        hs.recordFinish(id: typo, exitCode: 127, duration: 0)
+        let he = HistoryEditorWindowController.shared
+        he.storeOverride = hs
+        he.show(for: pane)
+        _ = await wait(6) { he.all.count == 2 }
+        he.delete(["gti status"])
+        he.setFilterForTests(.trash)
+        let trashShown: Int = he.shown.count
+        check("deleted commands wait in Recently Deleted", trashShown == 1 && hs.stats(for: "gti status") == nil)
+        he.restore(["gti status"])
+        ok = await wait(6) { hs.stats(for: "gti status") != nil }
+        check("a deleted command can be restored", ok)
+        he.setFilterForTests(.all)
+        // Details, fixing a command in place, saving to the notebook.
+        he.select(where: { $0.c.command == "git status --short" }, add: false)
+        he.updateDetails()
+        let detailText: String = he.detailsText
+        check("the history editor shows a command's runs", detailText.contains("git status --short") && detailText.contains("1 run"), String(detailText.prefix(120)))
+        let savedN: Int = NotebookSaver.add([(command: "git status --short", title: "St short status")], group: "St from history")
+        let nb = (try? Notebook.load(from: NotebookWindow.fileURL)) ?? Notebook()
+        let savedTitle: String? = nb.groups.first { $0.name == "St from history" }?.entries.first?.displayTitle
+        check("a history command saves to the notebook", savedN == 1 && savedTitle == "St short status", "\(savedN) \(savedTitle ?? "none")")
+        check("saving it again is skipped", NotebookSaver.add([(command: "git status --short", title: "")], group: "General") == 0)
+        he.rename("git status --short", to: "git status -sb")
+        ok = await wait(6) { he.all.contains { $0.c.command == "git status -sb" } }
+        check("a command can be edited in history", ok && hs.stats(for: "git status --short") == nil)
+        he.setFilterForTests(.folder)
+        let folderRows: Int = he.shown.count
+        check("the folder filter shows commands used here", folderRows == 0, "pane is in \(PathDisplay.short(s.cwd)), history in \(PathDisplay.short(tmp)): \(folderRows)")
+        he.setFilterForTests(.all)
+        let moved = HistoryAutoClean.runIfDue(store: hs, force: true)
+        check("the weekly clean-up moves typos to Recently Deleted", moved == 1 && hs.trashed().map(\.command) == ["gti status"], "\(moved)")
+        he.close()
+        he.storeOverride = nil
+
+        // Aliases: import from the shell, with groups.
+        let imported = AliasesWindowController.shared.importFromShell(["anserimp": "echo imported-anser-selftest"])
+        let importedGroup: String? = AliasManager.load()["anserimp"]?.group
+        check("shell aliases import into a group", imported == 1 && importedGroup == "Imported")
+        var book = AliasManager.load()
+        book.remove("anserimp")
+        AliasManager.save(book)
+
+        // Log viewer: highlights, saved filters, export.
+        LogViewerPrefs.fileURL = URL(fileURLWithPath: dir + "/log-viewer.json")
+        pane.run("printf '%s\\n' 'INFO req-42 start' 'ERROR req-42 failed' 'INFO other' # anser-selftest")
+        _ = await wait(6) { s.atPrompt && s.blocks.last?.command.contains("req-42") == true }
+        await sleep(0.6)
+        pane.openLogViewer()
+        if let lv = LogViewerWindowController.forTests(pane) {
+            lv.poll()
+            lv.setHighlightForTests("req-42")
+            check("the log viewer highlights words", lv.highlightCount == 2, "\(lv.highlightCount)")
+            lv.setFilterForTests(level: 3, search: "")
+            lv.saveFilter(named: "St errors")
+            check("a log filter can be saved", LogViewerPrefs.load().filters.map(\.name) == ["St errors"])
+            check("the shown log lines export", lv.exportText.contains("ERROR req-42 failed") && !lv.exportText.contains("INFO other"))
+            lv.close()
+        } else {
+            check("the log viewer opens", false)
+        }
+
+        // Watching only some files.
+        pane.run("echo pat-ran # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.blocks.last?.command.contains("pat-ran") == true }
+        pane.startWatching(command: "echo pat-ran # anser-selftest", cwd: s.cwd, patterns: ["*.py"])
+        await sleep(0.8)
+        try? "x".write(toFile: dir + "/README.md", atomically: true, encoding: .utf8)
+        await sleep(1.5)
+        let runsAfterMD: Int = pane.fileWatch?.runs ?? -1
+        try? "x".write(toFile: dir + "/app.py", atomically: true, encoding: .utf8)
+        ok = await wait(8) { pane.fileWatch?.runs == 1 }
+        check("watch patterns: only matching files re-run", runsAfterMD == 0 && ok, "md=\(runsAfterMD) py=\(pane.fileWatch?.runs ?? -1)")
+        pane.stopWatching()
+        _ = await wait(5) { s.atPrompt }
+
+        // Editing a runbook in its window.
+        try? fm.createDirectory(atPath: dir + "/.git", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: dir + "/.anser/runbooks", withIntermediateDirectories: true)
+        try? "# Ed\n\n```sh\necho one # anser-selftest\n```\n".write(toFile: dir + "/.anser/runbooks/ed.md", atomically: true, encoding: .utf8)
+        FileTrust.testDefaults = UserDefaults(suiteName: "anser-selftest-trust2-\(UUID().uuidString)")
+        if let rb = Runbook.load(cwd: dir).first {
+            FileTrust.runbooks.trust(rb)
+            let rw = RunbookWindowController.show(rb, pane: pane)
+            rw?.save("# Ed\n\n```sh\necho one # anser-selftest\n```\n\n```sh\necho two # anser-selftest\n```\n")
+            let stepCount: Int = rw?.runbook.steps.count ?? 0
+            let stillTrusted: Bool = rw.map { FileTrust.runbooks.isTrusted($0.runbook) } ?? false
+            check("a runbook can be edited in its window", stepCount == 2 && stillTrusted)
+            rw?.close()
+        }
+        FileTrust.testDefaults = nil
+
+        // Trimming a recording.
+        pane.startRecording()
+        pane.run("echo trim-a # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.blocks.last?.command.contains("trim-a") == true }
+        await sleep(1.2)
+        pane.run("echo trim-b # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.blocks.last?.command.contains("trim-b") == true }
+        await sleep(0.5)
+        _ = pane.stopRecording()
+        if let rw = ReplayWindowController.forTests() {
+            let full = rw.original.duration
+            rw.setTrimForTests(start: 0, end: full / 2)
+            let trimmed: Double = rw.recording.duration
+            check("a recording can be trimmed", trimmed <= full / 2 + 0.01 && trimmed > 0, "full=\(full) trimmed=\(trimmed)")
+            rw.close()
+        }
+
+        // Port forwarding helpers (a real forward needs an ssh server).
+        check("forwarding finds a free local port", PaneView.freeLocalPort(near: 47100).map { $0 >= 47100 } == true)
+        pane.run("cd \(ShellLexer.escape(tmp)) # anser-selftest")
+        _ = await wait(5) { s.atPrompt }
+        _ = ok
+    }
+
+    @MainActor
+    private static func savedAndInsightsChecks(_ pane: PaneView, _ wc: TerminalWindowController, tmp: String) async {
+        // Saved things live in one place: the right panel. The sidebar only links to it.
+        let panelWasOpen = wc.notebookPanelVisible
+        if panelWasOpen { wc.toggleNotebookPanel() }
+        wc.sidebar.refresh(for: pane)
+        var ok = await wait(4) { wc.sidebar.savedRowText != nil }
+        let titles = wc.sidebar.sectionTitles
+        let dupes = titles.filter { $0.hasPrefix("NOTEBOOK") || $0.hasPrefix("WORKFLOWS") || $0.hasPrefix("RUNBOOKS") }
+        check("the sidebar doesn't repeat the Saved panel", ok && dupes.isEmpty, (wc.sidebar.savedRowText ?? "no link") + " · " + titles.joined(separator: ", "))
+        wc.toggleNotebookPanel()
+        ok = await wait(4) { wc.sidebar.savedRowText == nil }
+        check("the sidebar's Saved link goes away while the panel is open", ok)
+        if !panelWasOpen { wc.toggleNotebookPanel() }
+
+        // History Editor side panel.
+        let dir = NSTemporaryDirectory() + "anser-selftest-insights-\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let hs = HistoryStore(path: dir + "/h.sqlite")
+        for i in 0..<5 {
+            let id = hs.recordStart(command: "make build", cwd: tmp, session: "st", branch: "main", at: Date().addingTimeInterval(Double(-i * 3600)))
+            hs.recordFinish(id: id, exitCode: i == 0 ? 2 : 0, duration: 3)
+        }
+        let typo = hs.recordStart(command: "gti status", cwd: tmp, session: "st")
+        hs.recordFinish(id: typo, exitCode: 127, duration: 0)
+        hs.recordStart(command: "pwd", cwd: tmp, session: "st")
+        let he = HistoryEditorWindowController.shared
+        he.storeOverride = hs
+        he.show(for: pane)
+        ok = await wait(8) { he.all.count == 3 }
+        he.updateDetails()
+        let overview: String = he.insights.textForTests
+        check("with nothing selected the side panel gives an overview",
+              ok && overview.contains("Most used") && overview.contains("make build 5") && overview.contains("7 runs") && overview.contains("Tidy up"),
+              overview.replacingOccurrences(of: "\n", with: " | ").prefix(220).description)
+        he.insights.press("Show Mistakes")
+        ok = await wait(3) { he.shown.map(\.c.command) == ["gti status"] }
+        check("Tidy up's Show buttons filter the list", ok, he.shown.map(\.c.command).joined(separator: ", "))
+        he.focus(command: "make build")
+        let one: String = he.insights.textForTests
+        check("one command shows its track record", one.contains("runs 5") && one.contains("worked 80%") && one.contains("main 5") && he.insights.buttonTitles.contains("Run"),
+              one.replacingOccurrences(of: "\n", with: " | ").prefix(220).description)
+        he.focus(command: "gti status")
+        check("a typo offers its fix", he.insights.textForTests.contains("Probably meant “git status”"))
+        he.insights.press("Fix Typo")
+        ok = await wait(6) { he.all.contains { $0.c.command == "git status" } }
+        check("Fix Typo corrects the command in history", ok && hs.stats(for: "gti status") == nil)
+        he.select(where: { _ in true }, add: false)
+        he.updateDetails()
+        let many: String = he.insights.textForTests
+        check("several selected shows a breakdown", many.contains("3 selected") && many.contains("Breakdown") && he.insights.buttonTitles.contains("Delete 3…"),
+              many.replacingOccurrences(of: "\n", with: " | ").prefix(200).description)
+        he.focus(command: "make build")
+        await sleep(0.6)
+        let splits: [NSSplitView] = he.window?.contentView.map { allSubviews($0).compactMap { $0 as? NSSplitView } } ?? []
+        let gaps: [String] = splits.compactMap { sp in
+            let used = sp.arrangedSubviews.reduce(CGFloat(0)) { $0 + (sp.isVertical ? $1.frame.width : $1.frame.height) } + sp.dividerThickness
+            let size = sp.isVertical ? sp.bounds.width : sp.bounds.height
+            return used < size - 4 ? "\(Int(used)) of \(Int(size))" : nil
+        }
+        let listFrame = he.window?.contentView.flatMap { allSubviews($0).first { $0 is HistoryTable }?.enclosingScrollView?.frame }
+        check("the History Editor fills its window, the list at full height beside the inspector",
+              splits.count == 1 && gaps.isEmpty && splits.first?.isVertical == true && (listFrame?.height ?? 0) > 400,
+              "\(splits.count) splits; list \(listFrame.map { "\(Int($0.width))×\(Int($0.height))" } ?? "none"); gaps: " + gaps.joined(separator: ", "))
+        let oneCmd: String = he.insights.textForTests
+        check("the inspector puts actions first and lists recent runs",
+              he.insights.buttonTitles.contains("Put in Editor") && oneCmd.contains("Last output") == false && oneCmd.contains("failed ") && oneCmd.contains("5 runs"),
+              oneCmd.replacingOccurrences(of: "\n", with: " | ").prefix(220).description)
+        check("filter menu shows counts", he.filterTitlesForTests.contains("Mistakes and typos (0)") && he.filterTitlesForTests.contains("Basic commands (ls, pwd…) (1)"),
+              he.filterTitlesForTests.joined(separator: ", ") + " · mistakes: " + he.all.filter { $0.issue?.isMistake == true }.map { "\($0.c.command)=\($0.issue!.label) exit \($0.c.lastExit.map(String.init) ?? "nil")" }.joined(separator: ", "))
+        if let content = he.window?.contentView { content.display(); snapView(content, "history-editor") }
+        if let n = he.window?.windowNumber {
+            let shot = Process()
+            shot.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            shot.arguments = ["-x", "-o", "-l\(n)", shotDir + "/history-editor-window.png"]
+            try? shot.run()
+            shot.waitUntilExit()
+        }
+        he.close()
+        he.storeOverride = nil
+        try? FileManager.default.removeItem(atPath: dir)
+    }
+
+    /// A command that opens a pager gets the window; Stop ends pagers and, on a second click, programs that ignore ⌃C.
+    @MainActor
+    private static func stopChecks(_ pane: PaneView) async {
+        let s = pane.session
+        _ = await wait(5) { s.atPrompt }
+        pane.run("seq 1 500 | less # anser-selftest")
+        var ok = await wait(6) { pane.fullscreenProgram && pane.fullscreenDetected }
+        check("a pager opened by a command gets the whole window", ok, "full=\(pane.fullscreenProgram) job=\(pane.foregroundJob?.names.joined(separator: ",") ?? "none")")
+        pane.stopRunning()
+        ok = await wait(5) { s.atPrompt && !pane.fullscreenProgram }
+        check("Stop ends a pager", ok)
+        pane.run("sh -c 'trap \"\" INT; sleep 40' # anser-selftest")
+        _ = await wait(5) { !s.atPrompt && pane.foregroundJob != nil }
+        pane.stopRunning()
+        await sleep(2.0)
+        let stillRunning = !s.atPrompt
+        check("a program ignoring ⌃C offers Force Stop", stillRunning && pane.stopButton.title.contains("Force Stop"), pane.stopButton.title)
+        pane.stopRunning()
+        ok = await wait(5) { s.atPrompt }
+        check("Force Stop ends it", ok && pane.stopButton.title == " Stop", pane.stopButton.title)
+    }
+
+    /// The product UX review: one search, Notebook + workflows, Library tabs, menus, settings pages.
+    @MainActor
+    private static func uxReviewChecks(_ pane: PaneView, _ wc: TerminalWindowController, tmp: String) async {
+        func openPicker() -> PickerPanel? { NSApp.windows.compactMap { $0 as? PickerPanel }.first { $0.isVisible } }
+        func closePickers() { NSApp.windows.compactMap { $0 as? PickerPanel }.forEach { $0.close() } }
+        let s = pane.session
+
+        // One search: every scope in one window; ⌘B and ⇧⌘F open it on their scope.
+        wc.showHistorySearch(for: pane)
+        var ok = await wait(3) { openPicker() != nil }
+        check("one search window has every scope", ok && openPicker()?.scopeTitles == SearchScope.allCases.map(\.title), openPicker()?.scopeTitles.joined(separator: ", ") ?? "none")
+        closePickers()
+        wc.showBlocks(for: pane)
+        ok = await wait(3) { openPicker()?.scopeIndex == SearchScope.tab.rawValue }
+        check("⌘B opens Search on This tab", ok)
+        closePickers()
+        wc.showSearchAllTabs(for: pane)
+        ok = await wait(3) { openPicker()?.scopeIndex == SearchScope.allTabs.rawValue }
+        check("⇧⌘F opens Search on All tabs", ok)
+        closePickers()
+
+        // Saved scope and Run from Notebook: notebook entries and workflows together.
+        let savedURL = NotebookWindow.fileURL
+        let nbFile = NSTemporaryDirectory() + "anser-selftest-nb-\(UUID().uuidString).json"
+        var nb = Notebook(groups: [.init(name: "General")])
+        _ = nb.add(.init(title: "Deploy the docs", command: "echo docs-anser-selftest"))
+        try? nb.save(to: URL(fileURLWithPath: nbFile))
+        NotebookWindow.fileURL = URL(fileURLWithPath: nbFile)
+        wc.showSearch(for: pane, scope: .saved)
+        ok = await wait(3) { openPicker()?.itemTitles.contains("Deploy the docs") == true }
+        check("Search → Saved finds notebook entries", ok, openPicker()?.itemTitles.prefix(4).joined(separator: " | ") ?? "none")
+        closePickers()
+        wc.showWorkflows(for: pane)
+        ok = await wait(3) { openPicker()?.itemTitles.contains("Deploy the docs") == true }
+        check("Run from Notebook lists notebook entries with workflows", ok && openPicker()?.pickerTitle == "Run from Notebook", openPicker()?.itemTitles.prefix(4).joined(separator: " | ") ?? "none")
+        closePickers()
+        LibraryWindowController.shared.show(for: pane, section: .notebook)
+        ok = await wait(3) { LibraryWindowController.shared.items.contains { $0.title == "Deploy the docs" } }
+        let libraryHasNoWorkflowSection = !LibraryWindowController.Section.allCases.map(\.title).contains("Workflows")
+        check("the Library's Notebook holds workflows too (no separate section)", ok && libraryHasNoWorkflowSection)
+
+        // Managing opens as Library tabs, not separate windows.
+        AliasesWindowController.shared.show(for: pane)
+        ok = await wait(3) { LibraryTabs.isHosted(AliasesWindowController.shared.window) }
+        check("Aliases opens as a tab of the Library", ok)
+        SecretsWindowController.shared.show()
+        ok = await wait(3) { LibraryTabs.isHosted(SecretsWindowController.shared.window) }
+        check("Secrets opens as a tab of the Library", ok)
+        SecretsWindowController.shared.close()
+        AliasesWindowController.shared.close()
+        LibraryWindowController.shared.close()
+        NotebookWindow.fileURL = savedURL
+        try? FileManager.default.removeItem(atPath: nbFile)
+
+        // Menus: old shortcut kept working, Welcome Tips folded into the tour.
+        let output = NSApp.mainMenu?.items.first { $0.submenu?.title == "Output" }?.submenu
+        let legacy = output?.items.first { $0.isHidden && $0.keyEquivalent == "l" && $0.keyEquivalentModifierMask == [.command, .option] }
+        check("Filter Output keeps its old ⌥⌘L shortcut, hidden", legacy?.allowsKeyEquivalentWhenHidden == true)
+        let help = NSApp.mainMenu?.items.first { $0.submenu?.title == "Help" }?.submenu?.items.map(\.title) ?? []
+        check("Help has the tour and no separate Welcome Tips", help.contains("Take the Tour") && !help.contains("Show Welcome Tips"))
+        let goItems = NSApp.mainMenu?.items.first { $0.submenu?.title == "Go" }?.submenu?.items ?? []
+        let doubled = zip(goItems, goItems.dropFirst()).contains { $0.isSeparatorItem && $1.isSeparatorItem }
+        check("the Go menu has no doubled separators", !doubled && !goItems.isEmpty)
+
+        // Settings: Behavior split by purpose; config-only options have controls.
+        SettingsWindowController.shared.show(section: "Sessions & Windows")
+        let sessionsHit = SettingsWindowController.shared.searchHits("quick terminal height")
+        let helpersHit = SettingsWindowController.shared.searchHits("open ⌘-clicked files")
+        check("Settings has pages by purpose with the config-only options",
+              SettingsWindowController.shared.selectedSectionName == "Sessions & Windows" && sessionsHit.first?.section == "Sessions & Windows"
+                && helpersHit.first?.section == "Suggestions & Helpers",
+              (sessionsHit + helpersHit).map(\.section).joined(separator: ", "))
+        SettingsWindowController.shared.close()
+
+        // Hover strip: four actions and "…" with the rest.
+        pane.run("echo strip-anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.blocks.last?.command.contains("strip-anser") == true }
+        pane.blocksOverlay.refresh()
+        if let good = pane.blocksOverlay.blocks.last(where: { !$0.running && $0.info?.exitCode == 0 }) {
+            pane.blocksOverlay.hover(at: NSPoint(x: 40, y: good.top + 4))
+            let more = pane.blocksOverlay.moreMenuTitles
+            pane.blocksOverlay.hover(at: nil)
+            check("the hover strip's … holds the other actions", more.contains("Open Output in a Window") && more.contains("Compare with Previous Run"), more.prefix(5).joined(separator: " | "))
+        }
+
+        // History Editor: a filtered list offers Select All; the chart has a spoken summary.
+        let dir = NSTemporaryDirectory() + "anser-selftest-ux-\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let hs = HistoryStore(path: dir + "/h.sqlite")
+        for c in ["gti status", "dokcer ps"] { let id = hs.recordStart(command: c, cwd: tmp, session: "st"); hs.recordFinish(id: id, exitCode: 127, duration: 0) }
+        let okRun = hs.recordStart(command: "make", cwd: tmp, session: "st")
+        hs.recordFinish(id: okRun, exitCode: 0, duration: 1)
+        let he = HistoryEditorWindowController.shared
+        he.storeOverride = hs
+        he.show(for: pane)
+        ok = await wait(8) { he.all.count == 3 }
+        check("History opens as a tab of the Library", LibraryTabs.isHosted(he.window))
+        he.showFilter(.all)
+        he.select(where: { _ in false }, add: false)
+        he.updateDetails()
+        check("the activity chart has a spoken summary", he.insights.chartAccessibilityLabels.first?.contains("runs") == true,
+              he.insights.chartAccessibilityLabels.first ?? String(he.insights.textForTests.replacingOccurrences(of: "\n", with: " | ").prefix(160)))
+        he.showFilter(.mistakes)
+        _ = await wait(3) { he.shown.count == 2 }
+        he.insights.press("Select All")
+        ok = await wait(3) { he.selectedCommands.count == 2 }
+        check("a filtered list offers Select All", ok, he.selectedCommands.joined(separator: ", "))
+        he.close()
+        he.storeOverride = nil
+        LibraryWindowController.shared.close()
+        try? FileManager.default.removeItem(atPath: dir)
+    }
+
+    @MainActor
+    private static func uiChecks(_ pane: PaneView, _ wc: TerminalWindowController, live: String, tmp: String) async {
+        let s = pane.session
+        var ok = false
+        pane.run("echo ui-menu-anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.blocks.last?.command.contains("ui-menu") == true }
+        await sleep(0.5)
+
+        // Right-click a command: every action in one menu.
+        if let last = s.blocks.last {
+            let titles = BlocksOverlayView.commandMenuItems(for: last, blockIndex: s.blocks.count - 1, markIndex: 1, pane: pane).map(\.title)
+            let wanted = ["Run Again", "Copy Output", "Save to Notebook…", "Make an Alias…", "Watch Its Output…", "Show in History Editor", "Share…"]
+            let missing = wanted.filter { !titles.contains($0) }
+            check("right-clicking a command lists every action", missing.isEmpty, "missing: " + missing.joined(separator: ", "))
+        }
+        pane.blocksOverlay.refresh()
+        if let b = pane.blocksOverlay.blocks.first(where: { !$0.running && $0.info != nil }) {
+            let menuTitles = pane.surfaceView.contextMenu(at: NSPoint(x: 20, y: (b.top + b.bottom) / 2)).items.map(\.title)
+            check("the terminal's right-click menu starts with the command's actions", menuTitles.contains("Save to Notebook…") && menuTitles.contains("Split"),
+                  menuTitles.prefix(6).joined(separator: " | "))
+        } else {
+            check("the terminal's right-click menu starts with the command's actions", false, "no command blocks")
+        }
+
+        // A calmer status row: meaning-based colors, at most a few chips, suggestions fade.
+        PaneView.fadeAfter = 0.6
+        pane.aliasTip = ("echo something long enough", "esl", false)
+        pane.fixHint = ("make", ["npm install"])
+        pane.afterSteps = [.notify]
+        pane.testReport = (TestFailures.Report(runner: .pytest, failures: [.init(name: "test_x")]), "pytest", s.cwd)
+        pane.envOffer = ProjectEnv.Found(root: s.cwd, dotenvFiles: [".env"])
+        pane.refreshBar()
+        pane.layoutSubtreeIfNeeded()
+        let extras = [pane.aliasChip, pane.hintChip, pane.afterChip, pane.testsChip, pane.envChip, pane.statusChip, pane.fixChip, pane.explainChip].filter { !$0.isHidden }.count
+        check("suggestion chips share one color", pane.aliasChip.role == .suggestion && pane.hintChip.textColorForTests == ChipRole.suggestion.color(pane.theme))
+        check("the status row shows a few chips and a +N for the rest", extras <= PaneView.maxExtraChips && pane.moreChip.text.hasPrefix("+") && !pane.moreChip.isHidden,
+              "extras=\(extras) more=\(pane.moreChip.text)")
+        check("the +N chip opens the rest", (pane.overflowStatusMenu()?.items.count ?? 0) >= 1)
+        await sleep(1.0)
+        pane.layoutSubtreeIfNeeded()
+        let fadedNow = pane.suggestionChips.filter { !$0.isHidden }.contains { $0.faded }
+        check("suggestions fade after a while", fadedNow)
+        PaneView.fadeAfter = 20
+        pane.aliasTip = nil; pane.fixHint = nil; pane.afterSteps = []; pane.testReport = nil; pane.envOffer = nil
+        pane.refreshBar()
+
+        // The Library: everything saved, in one place.
+        let lib = LibraryWindowController.shared
+        lib.show(for: pane, section: .notebook)
+        // The Notebook section also holds workflows (notebook entries with several steps).
+        let nbCount = ((try? Notebook.load(from: NotebookWindow.fileURL)) ?? Notebook()).entryCount + WorkflowStore.load(cwd: pane.session.cwd).count
+        check("the Library lists the notebook", lib.items.count == nbCount && nbCount > 0, "\(lib.items.count) of \(nbCount)")
+        lib.select(.everything)
+        lib.setSearchForTests("from-notebook")
+        check("the Library searches everything at once", lib.items.contains { $0.section == .notebook }, lib.items.map(\.title).joined(separator: ", "))
+        for sec in LibraryWindowController.Section.allCases { lib.select(sec) }
+        check("every Library section opens", lib.section == .watches)
+        lib.setSearchForTests("")
+        lib.close()
+
+        // A sidebar you can arrange.
+        SidebarPrefs.defaults = UserDefaults(suiteName: "anser-selftest-sidebar-\(UUID().uuidString)")!
+        wc.sidebar.refresh(for: pane)
+        ok = await wait(4) { wc.sidebar.orderedSections.count >= 2 }
+        // Let the background refresh finish, then work from a fresh build.
+        await sleep(1.0)
+        wc.sidebar.rebuildNow()
+        if ok, wc.sidebar.orderedSections.count >= 2 {
+            let before = wc.sidebar.orderedSections
+            let second = before[1]
+            wc.sidebar.move(second, to: 0)
+            await sleep(1.0)
+            check("a sidebar section can move to the top", wc.sidebar.orderedSections.first == second,
+                  "before: " + before.joined(separator: ", ") + " · after: " + wc.sidebar.orderedSections.joined(separator: ", "))
+            SidebarPrefs.setHidden(second, true)
+            wc.sidebar.rebuildNow()
+            check("a sidebar section can be hidden", !wc.sidebar.orderedSections.contains(second))
+        } else {
+            check("a sidebar section can move to the top", false, "no sections")
+        }
+        SidebarPrefs.defaults = .standard
+        wc.sidebar.refresh(for: pane)
+
+        // Polish: grouped menus with shortcuts, forms that check as you type, Settings sidebar, tour, empty states.
+        let shellItems = NSApp.mainMenu?.items.first { $0.submenu?.title == "Shell" }?.submenu?.items ?? []
+        let outputMenu = NSApp.mainMenu?.items.first { $0.submenu?.title == "Output" }?.submenu?.items.map(\.title) ?? []
+        let toolItems = NSApp.mainMenu?.items.first { $0.submenu?.title == "Tools" }?.submenu?.items ?? []
+        let manageItems = toolItems.first { $0.title == "Manage" }?.submenu?.items ?? []
+        let aliasKey = manageItems.first { $0.title == "Aliases…" }?.keyEquivalent ?? ""
+        check("menus are grouped, and new features have shortcuts", outputMenu.contains("Log Viewer") && aliasKey == "a" && shellItems.count < 25,
+              "output=\(outputMenu.count) shell=\(shellItems.count) alias=\(aliasKey)")
+        let af = AliasManager.form(nil, pane: pane)
+        af.set("name", "1bad")
+        af.set("command", "echo hi")
+        let badBlocked: Bool = !af.canSave && !af.errorText.isEmpty
+        af.set("name", "anserform")
+        let goodOK: Bool = af.canSave && af.previewText.contains("anserform")
+        af.set("name", "ls")
+        let warned: Bool = af.canSave && af.warningText.contains("already a command")
+        check("the alias form checks as you type and previews", badBlocked && goodOK && warned, "\(badBlocked) \(goodOK) \(warned) \(af.warningText)")
+        let tf = TunnelManager.shared.form(nil)
+        tf.set("host", "bastion"); tf.set("local", "99999"); tf.set("remotePort", "5432")
+        let tunnelBlocked: Bool = !tf.canSave
+        tf.set("local", "47321")
+        check("the tunnel form checks ports and previews the command", tunnelBlocked && tf.canSave && tf.previewText.contains("localhost:47321"), tf.previewText)
+        SettingsWindowController.shared.show(section: "Plugins")
+        let settingsSection: String = SettingsWindowController.shared.selectedSectionName ?? ""
+        check("Settings opens at a section from its sidebar", settingsSection == "Plugins")
+        SettingsWindowController.shared.close()
+        TourWindowController.shared.show()
+        for _ in 0..<4 { TourWindowController.shared.nextTapped() }
+        check("the tour walks through five pages", TourWindowController.shared.currentTitle == "Keep things one click away")
+        TourWindowController.shared.close()
+        let emptyStore = HistoryStore(path: live + "/empty-\(UUID().uuidString.prefix(6)).sqlite")
+        let he2 = HistoryEditorWindowController.shared
+        he2.storeOverride = emptyStore
+        he2.show(for: pane)
+        _ = await wait(4) { he2.all.isEmpty }
+        he2.setFilterForTests(.trash)
+        check("empty lists say what they're for", he2.shown.isEmpty && he2.emptyText.contains("Nothing deleted"), he2.emptyText)
+        he2.setFilterForTests(.all)
+        he2.close()
+        he2.storeOverride = nil
+
+        // The palette finds features by what they do.
+        wc.showCommandPalette(for: pane)
+        if let p = NSApp.windows.compactMap({ $0 as? PickerPanel }).first(where: { $0.isVisible }) {
+            p.setQuery("typo")
+            check("the palette finds features by what they're for", p.itemTitles.contains(AnserAction.editHistory.title), p.itemTitles.prefix(4).joined(separator: " | "))
+            p.close()
+        } else {
+            check("the palette finds features by what they're for", false, "no palette")
+        }
+        _ = ok
+    }
+
     @MainActor
     private static func run(_ pane: PaneView, _ wc: TerminalWindowController) async {
         let s = pane.session
@@ -96,6 +1048,9 @@ enum SelfTest {
         ok = await wait(10) { s.atPrompt && s.blocks.count >= 1 }
         check("command ran, exit code recorded", ok && s.blocks.last?.exitCode == 0)
         check("cwd followed cd", s.cwd.hasSuffix("anser-selftest"), s.cwd)
+        // Everything below runs git and writes files in the current folder. Never do that anywhere else
+        // (a stray keystroke once garbled the cd, and the test made a repo in the home folder).
+        guard s.cwd.hasSuffix("anser-selftest") else { check("stopped: the test tab isn't in its temp folder", false, s.cwd); return }
         check("saved to history db", Services.shared.history.entries(session: s.id, limit: 3).first?.command.contains("anser-ok") == true)
         await sleep(0.3)
         let output = pane.lastOutput() ?? "<nil>"
@@ -108,7 +1063,14 @@ enum SelfTest {
         let lastLine = vp.split(separator: "\n", omittingEmptySubsequences: false).last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
         check("no duplicate prompt waiting in the terminal", lastLine.contains("line3"), String(lastLine))
         pane.layoutSubtreeIfNeeded()
-        check("editor sits right under the output", pane.followTop != nil, "followTop=\(pane.followTop.map { "\(Int($0))" } ?? "bottom")")
+        check("input bar stays at the bottom by default",
+              pane.followTop == nil && pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5)
+        Services.shared.setEditorFollowsOutputForTest(true)
+        pane.needsLayout = true
+        pane.layoutSubtreeIfNeeded()
+        check("editor sits right under the output when enabled", pane.followTop != nil, "followTop=\(pane.followTop.map { "\(Int($0))" } ?? "bottom")")
+        Services.shared.setEditorFollowsOutputForTest(false)
+        pane.needsLayout = true
         snap(pane, "follow", full: true)
         check("no \u{201C}Last login\u{201D} line", !(pane.surfaceView.viewportText() ?? "").contains("Last login"))
 
@@ -232,7 +1194,7 @@ enum SelfTest {
         pane.editor.clear()
 
         // Git: a throwaway repo with a branch and a changed file.
-        pane.run("git init -q -b main 2>/dev/null; git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init; git branch -f feature/demo; touch \"new file.txt\" # anser-selftest")
+        pane.run("cd \(ShellLexer.escape(tmp)) && git init -q -b main 2>/dev/null; git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init; git branch -f feature/demo; git branch -qD pushed-later 2>/dev/null; touch \"new file.txt\" # anser-selftest")
         ok = await wait(10) { s.atPrompt && s.blocks.last?.command.hasPrefix("git init") == true }
         ok = await wait(5) { s.gitChangeCount >= 1 }
         pane.layoutSubtreeIfNeeded()
@@ -249,6 +1211,7 @@ enum SelfTest {
         let remoteDir = NSTemporaryDirectory() + "anser-selftest-remote-\(UUID().uuidString.prefix(8))"
         _ = await ScriptRunner.shared.run("""
             set -e; mkdir -p \(remoteDir); git init -q --bare -b main \(remoteDir)/origin.git
+            git remote remove origin 2>/dev/null || true
             git remote add origin \(remoteDir)/origin.git; git push -q origin main feature/demo
             git clone -q \(remoteDir)/origin.git \(remoteDir)/other; cd \(remoteDir)/other
             git switch -q -c pushed-later; git -c user.email=t@t -c user.name=t commit -q --allow-empty -m later; git push -q origin pushed-later
@@ -271,7 +1234,25 @@ enum SelfTest {
             p.setQuery("")
             p.selectScope(0)
             if let v = p.contentView { snapView(v, "picker-branches") }
-            p.close()
+            // Picking a branch switches to it, and the branch chip follows.
+            p.setQuery("feature/demo")
+            if let i = p.itemTitles.firstIndex(of: "feature/demo") { p.selectRow(i); p.acceptSelectedForTest() }
+            ok = await wait(10) { s.atPrompt && s.gitBranch == "feature/demo" }
+            check("picking a branch switches to it", ok, "on \(s.gitBranch ?? "-"), last: \(s.blocks.last?.command ?? "-")")
+            closePickers()
+            // A remote-only branch switches by its short name (git sets up tracking).
+            wc.showBranchSwitcher(for: pane)
+            _ = await wait(3) { openPicker() != nil }
+            if let p = openPicker() {
+                _ = await wait(15) { p.itemTitles.contains("origin/pushed-later") }
+                p.setQuery("origin/pushed-later")
+                if let i = p.itemTitles.firstIndex(of: "origin/pushed-later") { p.selectRow(i); p.acceptSelectedForTest() }
+            }
+            ok = await wait(10) { s.atPrompt && s.gitBranch == "pushed-later" }
+            check("picking a remote branch makes a local one", ok, "on \(s.gitBranch ?? "-"), last: \(s.blocks.last?.command ?? "-")")
+            closePickers()
+            pane.run("git switch -q main && git branch -qD pushed-later # anser-selftest")
+            _ = await wait(10) { s.atPrompt && s.gitBranch == "main" }
         }
         try? FileManager.default.createDirectory(atPath: tmp + "/folders/alpha/beta/gamma-target", withIntermediateDirectories: true)
         TerminalWindowController.resetFolderScanCache()
@@ -398,7 +1379,25 @@ enum SelfTest {
         let newWC = movedPane?.windowController
         check("move tab to a new window", order() == "BA" && newWC !== wc && newWC?.tabs.count == 1 && movedPane?.session.integrated == true,
               "order=\(order()) newWindow=\(newWC !== wc) tabs=\(newWC?.tabs.count ?? -1) integrated=\(movedPane?.session.integrated == true)")
+        if let newWC, let source = wc.focusedPane {
+            newWC.renameTab(0, to: "Cross Window Fixture")
+            wc.window?.makeKeyAndOrderFront(nil)
+            wc.showTabSwitcher(for: source)
+            if let switcher = openPicker() {
+                switcher.setQuery("cross window fixture")
+                check("tab switcher starts in this window", switcher.itemTitles.isEmpty)
+                switcher.selectScope(1)
+                check("tab switcher finds tabs in other windows", switcher.itemTitles == ["Cross Window Fixture"])
+                switcher.acceptSelectedForTest()
+                ok = await wait(3) { NSApp.keyWindow === newWC.window }
+                check("cross-window tab switch brings the target window forward", ok, NSApp.keyWindow?.title ?? "no key window")
+            } else {
+                check("tab switcher opens for cross-window search", false)
+            }
+        }
+        closePickers()
         newWC?.forceClose()
+        wc.window?.makeKeyAndOrderFront(nil)
         // Keep only the tab holding the main test pane.
         while wc.tabs.count > 1, let i = wc.tabs.firstIndex(where: { $0 !== wc.tab(for: pane) }) { wc.closeTab(i) }
         wc.selectTab(0)
@@ -432,7 +1431,7 @@ enum SelfTest {
             let onGood = pane.blocksOverlay.visibleStripActions
             pane.blocksOverlay.hover(at: nil)
             check("hover strip offers Explain on failed commands only",
-                  onFailed.contains { $0.hasPrefix("Explain") } && !onGood.contains { $0.hasPrefix("Explain") } && onGood.contains { $0.contains("own window") },
+                  onFailed.contains { $0.hasPrefix("Explain") } && !onGood.contains { $0.hasPrefix("Explain") } && onGood.contains { $0.hasPrefix("More") } && onGood.count <= 5,
                   "\(onFailed.count) vs \(onGood.count)")
             wc.showOutputViewer(for: pane, block: good.blockIndex!)
             let viewer = OutputViewer.openViewers.last
@@ -477,10 +1476,24 @@ enum SelfTest {
         wc.window!.setFrame(NSRect(x: savedFrame.minX, y: savedFrame.minY, width: 420, height: savedFrame.height), display: true)
         wc.window!.contentView?.layoutSubtreeIfNeeded()
         pane.layoutSubtreeIfNeeded()
-        let actionTitles = pane.actionsMenu().items.filter { !$0.isSeparatorItem }.map(\.title)
-        check("actions sit in one menu, with the sidebar toggle", pane.actionsMenuButtonVisible && actionTitles.count == 10 && actionTitles.contains("Save Command to Notebook") && actionTitles.contains("Deep Clean…")
+        let actionTitles = pane.actionsMenu().items.filter { !$0.isSeparatorItem && !$0.hasSubmenu }.map(\.title)
+        check("actions sit in one menu, with the sidebar toggle", pane.actionsMenuButtonVisible && actionTitles.count == 11 && actionTitles.contains("Re-run Last Command When Files Change") && actionTitles.contains("Save Command to Notebook") && actionTitles.contains("Deep Clean…")
                 && actionTitles.last == "Show Sidebar", actionTitles.joined(separator: ", "))
         snap(pane, "narrow")
+
+        let narrowFrame = pane.frame
+        pane.setFrameSize(NSSize(width: 95, height: narrowFrame.height))
+        // Run the pane layout directly before the window constraints restore its width.
+        pane.layout()
+        let statusItems = pane.actionsMenu().items.first { $0.title == "Pane Status" }?.submenu?.items ?? []
+        check("overflow preserves the folder action and its context menu",
+              pane.cwdChip.isHidden && statusItems.contains { $0.title == pane.cwdChip.text && $0.action != nil }
+                  && statusItems.contains { $0.title == "Folder Options" && $0.hasSubmenu },
+              "width \(pane.bounds.width), folder hidden \(pane.cwdChip.isHidden), menu \(statusItems.map(\.title))")
+        pane.frame = narrowFrame
+        pane.layout()
+        check("widening the pane restores the folder chip", !pane.cwdChip.isHidden)
+
         wc.window!.setFrame(savedFrame, display: true)
         pane.layoutSubtreeIfNeeded()
         check("actions menu shows shortcuts", pane.actionsMenu().items.first?.keyEquivalent == "r")
@@ -523,8 +1536,51 @@ enum SelfTest {
         // Many tabs: overflow menu.
         for _ in 0..<11 { wc.addTab(cwd: s.cwd) }
         wc.tabBar.layoutSubtreeIfNeeded()
-        check("many tabs get an overflow menu", wc.tabBar.isCrowded, "\(wc.tabs.count) tabs")
+        let visibleTabs = wc.tabBar.itemViews.filter { !$0.isHidden }
+        check("crowded tab strip keeps the selected tab visible at a readable width",
+              wc.tabBar.isCrowded && visibleTabs.count < wc.tabs.count && visibleTabs.allSatisfy { $0.frame.width >= 120 }
+                  && !wc.tabBar.itemViews[wc.selectedIndex].isHidden,
+              "\(visibleTabs.count) of \(wc.tabs.count) tabs visible")
         snapView(wc.tabBar, "tabbar-crowded")
+
+        let allTabs = wc.tabBar.allTabsMenu()
+        let tabItems = Array(allTabs.items.dropFirst(2))
+        check("All Tabs distinguishes duplicate names and marks the active tab",
+              tabItems.count == wc.tabs.count && Set(tabItems.map(\.title)).count == wc.tabs.count
+                  && tabItems.first?.title.contains(pane.tabLocation) == true
+                  && tabItems[wc.selectedIndex].state == .on)
+        allTabs.performActionForItem(at: 2)
+        wc.tabBar.layoutSubtreeIfNeeded()
+        check("selecting a hidden tab brings it into view",
+              wc.selectedIndex == 0 && !wc.tabBar.itemViews[0].isHidden)
+
+        let lastIndex = wc.tabs.count - 1
+        let switcherFixture = "Deploy Console"
+        wc.renameTab(lastIndex, to: switcherFixture)
+        wc.tabBar.allTabsMenu().performActionForItem(at: 0)
+        if let switcher = openPicker() {
+            switcher.setQuery("$TMPDIR/")
+            check("tab switcher matches folder context", switcher.itemTitles.contains(switcherFixture))
+            switcher.setQuery("deploy console")
+            check("tab switcher finds a hidden tab by name", switcher.itemTitles == [switcherFixture])
+            switcher.acceptSelectedForTest()
+            wc.tabBar.layoutSubtreeIfNeeded()
+            check("tab switcher selects and reveals the matching tab",
+                  wc.selectedIndex == lastIndex && !wc.tabBar.itemViews[lastIndex].isHidden)
+        } else {
+            check("All Tabs opens the tab switcher", false)
+        }
+
+        wc.showCommandPalette(for: wc.focusedPane ?? pane)
+        if let palette = openPicker() {
+            palette.setQuery("switch to tab")
+            check("command palette offers Switch to Tab", palette.itemTitles.first == "Switch to Tab")
+            palette.acceptSelectedForTest()
+            check("command palette opens the tab switcher", openPickerTitles().contains(switcherFixture))
+        } else {
+            check("command palette opens for tab switching", false)
+        }
+        closePickers()
         while wc.tabs.count > 1, let i = wc.tabs.firstIndex(where: { $0 !== wc.tab(for: pane) }) { wc.closeTab(i) }
         wc.selectTab(0)
 
@@ -544,7 +1600,7 @@ enum SelfTest {
         // Sidebar, opened with the tab-bar button.
         wc.tabBar.layoutSubtreeIfNeeded()
         let sbFrame = wc.tabBar.sidebarButtonFrame
-        let firstTab = wc.tabBar.frameForTab(0, count: wc.tabs.count)
+        let firstTab = wc.tabBar.itemViews[0].frame
         check("sidebar button sits before the tabs", sbFrame.width > 0 && sbFrame.maxX <= firstTab.minX, "\(sbFrame) vs \(firstTab)")
         wc.tabBar.clickSidebarButton()
         ok = await wait(5) { wc.sidebar.rowCount > 3 }
@@ -573,7 +1629,8 @@ enum SelfTest {
         wc.showWorkflows(for: pane)
         ok = await wait(3) { NSApp.windows.contains { ($0 as? PickerPanel)?.isVisible == true } }
         if let p = NSApp.windows.compactMap({ $0 as? PickerPanel }).first(where: { $0.isVisible }) {
-            _ = await wait(3) { !p.previewString.isEmpty }
+            p.setQuery("Greet and count")
+            _ = await wait(4) { p.previewString.contains("echo hello") }
             check("workflow picker shows steps", p.previewString.contains("1  echo hello"), String(p.previewString.prefix(60)).replacingOccurrences(of: "\n", with: " ⏎ "))
             check("parameters show as chips, trust is explained", p.previewString.contains(" who ") && p.previewString.lowercased().contains("trusted"))
             if let v = p.contentView { snapView(v, "picker-workflows") }
@@ -658,9 +1715,24 @@ enum SelfTest {
         check("paste a saved command into the terminal", ok, pane.editor.string)
         pane.editor.clear()
         nbw.close()
+
+        wc.showCommandPalette(for: pane)
+        if let palette = NSApp.windows.compactMap({ $0 as? PickerPanel }).first(where: { $0.isVisible }) {
+            palette.setQuery("search history")
+            check("palette names the selected action", palette.footerHint.hasPrefix("Return · Search"), palette.footerHint)
+            palette.setQuery("from-notebook")
+            check("palette tells users a saved command goes into the editor",
+                  palette.footerHint == "Return · Insert into editor", palette.footerHint)
+            palette.acceptSelectedForTest()
+            check("palette inserts the saved command into the editor", pane.editor.string == "echo from-notebook {{name}}", pane.editor.string)
+            pane.editor.clear()
+        } else {
+            check("command palette opens", false)
+        }
+
         // The right-hand panel, from the book button at the right end of the tab bar.
         wc.tabBar.layoutSubtreeIfNeeded()
-        let lastTab = wc.tabBar.frameForTab(wc.tabs.count - 1, count: wc.tabs.count)
+        let lastTab = wc.tabBar.itemViews[wc.tabs.count - 1].frame
         check("notebook button sits at the right of the tab bar",
               wc.tabBar.notebookButtonFrame.minX > lastTab.maxX && wc.tabBar.notebookButtonFrame.maxX <= wc.tabBar.bounds.width,
               "\(wc.tabBar.notebookButtonFrame) after \(lastTab)")
@@ -704,7 +1776,7 @@ enum SelfTest {
         check("stashes picker offers to stash changes", ok)
         let menuTitles = NSApp.mainMenu?.items.compactMap { $0.submenu?.title } ?? []
         let tools = NSApp.mainMenu?.items.first { $0.submenu?.title == "Tools" }?.submenu?.items.map(\.title) ?? []
-        check("Git and Tools menus", menuTitles.contains("Git") && tools.contains("Command Notebook") && tools.contains("Workflows…"),
+        check("Git, Output and Tools menus", menuTitles.contains("Git") && menuTitles.contains("Output") && tools.contains("Saved Panel") && tools.contains("Run from Notebook…") && tools.contains("Manage"),
               menuTitles.joined(separator: " "))
 
         // ---- AI help (fake Claude responses; no network, no key) ----
@@ -1188,7 +2260,7 @@ enum SelfTest {
         edt.setSelectedRange(NSRange(location: 3, length: 3))
         edt.selectNextOccurrence()
         edt.insertText("bar", replacementRange: NSRange(location: NSNotFound, length: 0))
-        check("⌥⌘D adds the next match", edt.string == "ls bar; cat bar", edt.string)
+        check("⌥⌘G adds the next match", edt.string == "ls bar; cat bar", edt.string)
         edt.setCommand("echo one\necho two")
         edt.setSelectedRange(NSRange(location: 0, length: 0))
         edt.toggleComment()
@@ -1295,7 +2367,7 @@ enum SelfTest {
         if let p = openPicker() {
             p.setQuery("alltabs-42")
             ok = await wait(3) { p.refresh(); return p.itemTitles.contains { $0.contains("anser-alltabs-42") } }
-            check("Find in All Tabs finds output from another tab", ok, p.itemTitles.prefix(3).joined(separator: " | "))
+            check("Search → All tabs finds output from another tab", ok, p.itemTitles.prefix(3).joined(separator: " | "))
             p.acceptSelectedForTest()
             ok = await wait(2) { wc.selectedIndex == homeTab }
             check("choosing a result goes to its tab", ok)
@@ -1337,6 +2409,254 @@ enum SelfTest {
             check("sharing stops", TabShare.share(for: pane) == nil)
         }
 
+        // ---- Live tools: waiting, servers, cloud context, filter, tasks, secrets, reconnect, compare, data ----
+        let live = NSTemporaryDirectory() + "anser-st-live"
+        try? FileManager.default.removeItem(atPath: live)
+        try? FileManager.default.createDirectory(atPath: live, withIntermediateDirectories: true)
+
+        // Waiting for an answer.
+        pane.run("read -q 'REPLY?Proceed? [y/N] ' ; echo answered # anser-selftest")
+        ok = await wait(8) { pane.waitState?.kind == .confirm }
+        check("a y/n prompt marks the pane as waiting", ok, pane.waitState?.line ?? "none")
+        check("the tab shows it's waiting", wc.tab(for: pane).map { wc.activity(of: $0) } == .waiting)
+        pane.layoutSubtreeIfNeeded()
+        check("the waiting chip shows", !pane.waitChip.isHidden && pane.waitChip.text.contains("y/n"), pane.waitChip.text)
+        snap(pane, "waiting")
+        pane.surfaceView.sendText("n")
+        ok = await wait(6) { s.atPrompt && pane.waitState == nil }
+        check("answering clears the waiting state", ok)
+
+        // Servers a tab started.
+        let port = 48000 + Int.random(in: 0..<900)
+        pane.run("python3 -m http.server \(port) --bind 127.0.0.1 # anser-selftest")
+        ok = await wait(15) {
+            ServerMonitor.shared.check()
+            return ServerMonitor.shared.servers(for: pane).contains { $0.port == port }
+        }
+        check("a server the tab started is found", ok, ServerMonitor.shared.servers(for: pane).map { "\($0.process):\($0.port)" }.joined(separator: ","))
+        pane.refreshBar()
+        pane.layoutSubtreeIfNeeded()
+        check("the server chip shows its port", pane.serverChip.text.contains(":\(port)"), pane.serverChip.text)
+        snap(pane, "server-chip")
+        if let srv = ServerMonitor.shared.servers(for: pane).first(where: { $0.port == port }) { ServerMonitor.stop(pid: srv.pid) }
+        ok = await wait(8) { s.atPrompt }
+        check("stopping the server ends the command", ok)
+        ok = await wait(8) { ServerMonitor.shared.check(); return ServerMonitor.shared.servers(for: pane).isEmpty }
+        check("the server chip goes away", ok)
+
+        // Cloud context chip from KUBECONFIG, and a profile for a prod cluster.
+        let kubeFile = live + "/kubeconfig"
+        try? "contexts:\n- context:\n    cluster: c\n    namespace: payments\n  name: st-prod-eu\n- context:\n    cluster: d\n  name: st-dev\ncurrent-context: st-prod-eu\n"
+            .write(toFile: kubeFile, atomically: true, encoding: .utf8)
+        pane.run("export KUBECONFIG=\(ShellLexer.escape(kubeFile)) # anser-selftest")
+        ok = await wait(6) { s.atPrompt && s.cloudVars.kubeconfig == kubeFile }
+        check("the shell reports KUBECONFIG", ok, s.cloudVars.kubeconfig ?? "nil")
+        var prodProfile = Profile(name: "prod cluster", tabColor: "red", badge: "PROD", confirm: ["*delete*"])
+        prodProfile.kubeContext = "st-prod*"
+        Services.shared.setProfilesForTest([prodProfile])
+        pane.cloudCache = nil
+        pane.editor.setCommand("kubectl get pods")
+        pane.editorContentChanged()
+        pane.refreshBar()
+        pane.layoutSubtreeIfNeeded()
+        check("the context chip shows the cluster and badge", pane.contextChip.text.contains("PROD") && pane.contextChip.text.contains("st-prod-eu/payments"), pane.contextChip.text)
+        snap(pane, "context-chip")
+        check("risky commands on that cluster ask first", pane.contextProfile(for: "kubectl delete pod web")?.needsConfirmation("kubectl delete pod web") == true
+              && pane.contextProfile(for: "ls") == nil)
+        Services.shared.setProfilesForTest([])
+        pane.editor.setCommand("")
+        pane.run("unset KUBECONFIG # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.cloudVars.kubeconfig == nil }
+        pane.cloudCache = nil
+        pane.refreshBar()
+
+        // Filter output.
+        pane.run("printf 'ok 1\\nerror: boom\\nok 2\\nwarning: hmm\\nDownloading 1/3\\nDownloading 2/3\\nDownloading 3/3\\n' # anser-selftest")
+        _ = await wait(6) { s.atPrompt && s.blocks.last?.command.contains("Downloading") == true }
+        await sleep(0.4)
+        pane.toggleFilterPanel()
+        if let fp = pane.filterPanel {
+            fp.setForTest(query: "", level: 2)
+            check("filter shows errors only", fp.shown.map(\.text) == ["error: boom"], fp.shown.map(\.text).joined(separator: " | "))
+            fp.setForTest(query: "", level: 0)
+            check("filter folds repeated lines", fp.shown.contains { $0.count == 3 && $0.text.hasPrefix("Downloading 3/3") }, fp.shown.map { "\($0.text)×\($0.count)" }.joined(separator: " | "))
+            fp.setForTest(query: "boom", level: 0)
+            pane.layoutSubtreeIfNeeded()
+            snap(pane, "filter")
+            pane.toggleFilterPanel()
+        }
+        check("filter panel opens and closes", pane.filterPanel == nil)
+
+        // Project tasks in the sidebar.
+        try? #"{"scripts":{"dev":"vite","test":"vitest"}}"#.write(toFile: live + "/package.json", atomically: true, encoding: .utf8)
+        try? "build: ## compile\n\techo built\n".write(toFile: live + "/Makefile", atomically: true, encoding: .utf8)
+        pane.run("cd \(ShellLexer.escape(live)) # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.cwd == live }
+        check("project tasks are found", ProjectTasks.find(from: s.cwd)?.tasks.map(\.name) == ["dev", "test", "build"],
+              ProjectTasks.find(from: s.cwd)?.tasks.map(\.name).joined(separator: ",") ?? "none")
+        wc.tabBar.clickSidebarButton()
+        ok = await wait(5) { wc.sidebar.sectionTitles.contains { $0.hasPrefix("TASKS") } }
+        check("the sidebar lists project tasks", ok, wc.sidebar.sectionTitles.joined(separator: ", "))
+        wc.window?.contentView?.layoutSubtreeIfNeeded()
+        snapView(wc.sidebar, "sidebar-tasks")
+        wc.tabBar.clickSidebarButton()
+
+        // Secrets: filled in as the command runs, never kept.
+        SecretBroker.testValues = ["st-token": "s3cr3t-v4lue"]
+        pane.run("echo got-{{secret:st-token}}-done # anser-selftest")
+        ok = await wait(8) { s.atPrompt && (pane.surfaceView.viewportText() ?? "").contains("got-s3cr3t-v4lue-done") }
+        check("a {{secret:…}} is filled in when the command runs", ok)
+        let kept = Services.shared.history.entries(session: s.id, limit: 3).first?.command ?? ""
+        check("history keeps {{secret:…}}, not the value", kept.contains("{{secret:st-token}}") && !kept.contains("s3cr3t"), kept)
+        check("the command block keeps it too", s.blocks.last?.command.contains("{{secret:st-token}}") == true)
+        SecretBroker.testValues = nil
+
+        // Compare with the previous run.
+        let cmpCmd = "[[ -f st-cmp ]] && echo second-run || echo first-run; touch st-cmp # anser-selftest"
+        pane.run(cmpCmd)
+        _ = await wait(6) { s.atPrompt && s.blocks.last?.command == cmpCmd }
+        await sleep(0.5)
+        pane.run(cmpCmd)
+        _ = await wait(6) { s.atPrompt && s.blocks.filter { $0.command == cmpCmd }.count == 2 }
+        await sleep(0.6)
+        if let i = s.blocks.indices.last { pane.captureOutput(forBlockAt: i) }
+        await sleep(0.3)
+        DiffViewer.openViewers.forEach { $0.close() }
+        if let i = s.blocks.indices.last { pane.compareWithPreviousRun(block: i) }
+        let dv = DiffViewer.openViewers.first
+        check("compare shows what changed since the last run", dv?.lastSummary.added == 1 && dv?.lastSummary.removed == 1,
+              "\(dv?.lastSummary.added ?? -1)+ \(dv?.lastSummary.removed ?? -1)-")
+        if let dv, let v = dv.contentView { snapView(v, "compare") }
+        DiffViewer.openViewers.forEach { $0.close() }
+
+        // Table viewer.
+        pane.run("printf 'NAME   READY   AGE\\nweb    1/1     5d\\napi    0/1     12m\\n' # anser-selftest")
+        _ = await wait(6) { s.atPrompt && s.blocks.last?.command.contains("READY") == true }
+        await sleep(0.6)
+        if let i = s.blocks.indices.last { pane.captureOutput(forBlockAt: i); await sleep(0.3); pane.viewOutputAsData(block: i) }
+        if let v = DataViewer.openViewers.first {
+            check("column output opens as a table", v.rowCountForTest == 2)
+            v.sortForTest(column: 0, ascending: true)
+            check("the table sorts by a column", v.firstRowForTest?.first == "api", v.firstRowForTest?.joined(separator: " ") ?? "")
+            v.filterForTest("web")
+            check("the table filters rows", v.rowCountForTest == 1)
+            if let c = v.contentView { snapView(c, "table") }
+        } else {
+            check("column output opens as a table", false, "no viewer")
+        }
+        DataViewer.openViewers.forEach { $0.close() }
+
+        // Reconnecting a dropped ssh session (a stand-in ssh that "drops" after 9 seconds).
+        pane.run("ssh() { sleep 9; return 255; } # anser-selftest")
+        _ = await wait(5) { s.atPrompt }
+        pane.run("ssh st-host # anser-selftest")
+        ok = await wait(16) { pane.reconnect != nil && s.atPrompt }
+        check("a dropped ssh session offers to reconnect", ok)
+        pane.refreshBar()
+        pane.layoutSubtreeIfNeeded()
+        check("the reconnect chip counts down", pane.reconnectChip.text.contains("reconnecting"), pane.reconnectChip.text)
+        snap(pane, "reconnect")
+        ok = await wait(6) { pane.reconnect?.attemptRunning == true && s.running != nil }
+        check("it reconnects by itself", ok, s.running?.command ?? "not running")
+        check("history keeps the command you typed", s.running?.command == "ssh st-host # anser-selftest", s.running?.command ?? "")
+        pane.reconnect?.timer?.invalidate()
+        pane.reconnect = nil
+        pane.sendControl("c")
+        _ = await wait(5) { s.atPrompt }
+        pane.reconnect?.timer?.invalidate()
+        pane.reconnect = nil
+        pane.run("unset -f ssh # anser-selftest")
+        _ = await wait(5) { s.atPrompt }
+        pane.refreshBar()
+
+        // Sharing with a code.
+        var coded: TabShare?
+        TabShare.start(for: pane, requireCode: true) { coded = $0 }
+        ok = await wait(3) { coded != nil }
+        if let coded, let code = coded.code {
+            func status(_ path: String) async -> Int {
+                let r = try? await URLSession.shared.data(from: URL(string: coded.localLink + path)!)
+                return (r?.1 as? HTTPURLResponse)?.statusCode ?? -1
+            }
+            let noCode = await status("/events")
+            let wrong = await status("/check?code=" + (code == "0000" ? "1111" : "0000"))
+            let right = await status("/check?code=" + code)
+            check("a shared tab can require a code", noCode == 403 && wrong == 403 && right == 200, "\(noCode) \(wrong) \(right)")
+            coded.stop()
+        } else {
+            check("a shared tab can require a code", false, "didn't start")
+        }
+
+        // Plugins: a chip, actions, a sidebar section and an after-command hook.
+        let pdir = live + "/plugins"
+        let pfolder = pdir + "/st-plugin"
+        try? FileManager.default.createDirectory(atPath: pfolder, withIntermediateDirectories: true)
+        try? """
+        {"name": "Self-test plugin", "description": "test",
+         "chips": [{"id": "hello", "script": "echo '{\\"text\\":\\"plugin-chip-ok\\",\\"color\\":\\"green\\",\\"run\\":\\"echo chip-clicked # anser-selftest\\"}'"},
+                   {"id": "never", "script": "echo hidden", "when": ["no-such-file.xyz"]}],
+         "actions": [{"title": "St plugin run", "run": "echo plugin-action-ran # anser-selftest"},
+                     {"title": "St plugin script", "script": "echo script-said-hi"}],
+         "sidebar": [{"title": "St rows", "script": "printf 'row one\\tdetail\\techo row-ran # anser-selftest\\nrow two\\n'"}],
+         "hooks": {"commandFinished": "./hook.sh"}}
+        """.write(toFile: pfolder + "/plugin.json", atomically: true, encoding: .utf8)
+        try? "#!/bin/sh\necho \"$ANSER_EXIT $ANSER_COMMAND\" >> \"$ANSER_PLUGIN_DIR/hook.log\"\n".write(toFile: pfolder + "/hook.sh", atomically: true, encoding: .utf8)
+        chmod(pfolder + "/hook.sh", 0o755)
+        try? FileManager.default.createDirectory(atPath: pdir + "/broken", withIntermediateDirectories: true)
+        try? "{ not json".write(toFile: pdir + "/broken/plugin.json", atomically: true, encoding: .utf8)
+        PluginHost.directory = pdir
+        PluginHost.shared.enabledOverride = []
+        PluginHost.shared.reload()
+        check("plugins are found, and broken ones reported", PluginHost.shared.plugins.map(\.id) == ["st-plugin"] && PluginHost.shared.errors.count == 1,
+              PluginHost.shared.errors.joined(separator: "; "))
+        pane.run("true # anser-selftest")
+        _ = await wait(4) { s.atPrompt }
+        await sleep(0.8)
+        check("a plugin does nothing until it's turned on", PluginHost.shared.chips(for: pane).isEmpty && !FileManager.default.fileExists(atPath: pfolder + "/hook.log"))
+        PluginHost.shared.enabledOverride = ["st-plugin"]
+        PluginHost.shared.reload()
+        ok = await wait(6) { PluginHost.shared.chips(for: pane).first?.chip.text == "plugin-chip-ok" }
+        pane.refreshBar()
+        pane.layoutSubtreeIfNeeded()
+        check("a plugin chip shows in the status row", ok && pane.pluginChipViews.contains { $0.text == "plugin-chip-ok" && !$0.isHidden },
+              PluginHost.shared.chips(for: pane).map(\.chip.text).joined(separator: ","))
+        check("a chip whose files are missing stays hidden", PluginHost.shared.chips(for: pane).count == 1)
+        snap(pane, "plugin-chip")
+        check("plugin actions are in the palette", PluginHost.shared.actions.map(\.action.title) == ["St plugin run", "St plugin script"])
+        if let a = PluginHost.shared.actions.first { PluginHost.shared.perform(a, in: pane) }
+        ok = await wait(6) { s.atPrompt && s.blocks.last?.command.contains("plugin-action-ran") == true }
+        check("a plugin action runs its command", ok)
+        ok = await wait(6) { ((try? String(contentsOfFile: pfolder + "/hook.log", encoding: .utf8)) ?? "").contains("0 echo plugin-action-ran") }
+        check("a plugin hook runs after commands", ok)
+        ok = await wait(6) { PluginHost.shared.sections(for: pane).first?.rows.count == 2 }
+        check("a plugin adds a sidebar section", ok && PluginHost.shared.sections(for: pane).first?.rows.first?.run?.contains("row-ran") == true)
+        PluginHost.shared.enabledOverride = nil
+        PluginHost.directory = PluginRegistry.defaultDirectory
+        PluginHost.shared.reload()
+        pane.refreshBar()
+
+
+        await workToolChecks(pane, wc, live: live, tmp: tmp)
+        await habitChecks(pane, wc, live: live, tmp: tmp)
+        await moreToolChecks(pane, wc, live: live, tmp: tmp)
+        await uiChecks(pane, wc, live: live, tmp: tmp)
+        await savedAndInsightsChecks(pane, wc, tmp: tmp)
+        await uxReviewChecks(pane, wc, tmp: tmp)
+        await stopChecks(pane)
+        // Sharing one command, and startup timing.
+        let shareMD = PaneView.shareMarkdown(command: "curl -H 'Authorization: Bearer abc.def.ghi' x", output: "token=ghp_abcdefghijklmnopqrstuvwxyz0123\nok",
+                                        exitCode: 0, duration: 1.2, cwd: NSHomeDirectory())
+        check("sharing a command removes secrets", shareMD.contains("[redacted]") && !shareMD.contains("ghp_abcdef") && shareMD.contains("ok"), shareMD)
+        check("startup time is measured", Startup.totalMilliseconds != nil, Startup.summary)
+
+        // What's New and links.
+        check("What's New lists the new features", WhatsNew.items.count >= 8 && WhatsNewWindowController.shared.window != nil)
+        check("anser:// links parse", AnserLink.parse(URL(string: "anser://run?dir=/tmp&cmd=ls")!)?.command == "ls")
+        check("every new action is in the palette", [AnserAction.filterOutput, .killPort, .compareLastRun, .viewOutputAsData, .manageSecrets, .whatsNew]
+              .allSatisfy { !$0.title.isEmpty })
+        pane.run("cd \(ShellLexer.escape(tmp)) # anser-selftest")
+        _ = await wait(5) { s.atPrompt }
+
         func unlabeled(_ v: NSView) -> [String] {
             var out: [String] = []
             for sub in v.subviews where !sub.isHidden {
@@ -1349,6 +2669,41 @@ enum SelfTest {
         }
         let missing = unlabeled(wc.window!.contentView!)
         check("every visible button has a label for VoiceOver", missing.isEmpty, missing.joined(separator: ", "))
+
+        // Shell clear with scrollback preserved. The live cursor moves to the top.
+        // (Following is off by default, and config reloads earlier in the test turn the override off.)
+        Services.shared.setEditorFollowsOutputForTest(true)
+        pane.run("echo anser-scrollback-$((6*7)) # anser-selftest")
+        _ = await wait(10) { s.atPrompt && s.blocks.last?.command.contains("anser-scrollback") == true }
+        pane.run("clear -x # anser-selftest")
+        ok = await wait(10) {
+            pane.layoutSubtreeIfNeeded()
+            return s.atPrompt && s.blocks.last?.command.hasPrefix("clear -x") == true
+                && pane.followTop != nil && !(pane.surfaceView.viewportText() ?? "").contains("anser-scrollback-42")
+        }
+        check("shell clear leaves the editor following the live prompt", ok,
+              "follow=\(Services.shared.config.editorFollowsOutput) top=\(String(describing: pane.followTop)) full=\(pane.fullscreenProgram) exp=\(pane.editorExpanded) ed=\(pane.editorEnabled) last=\(s.blocks.last?.command ?? "")")
+        // The terminal only reports scrolling while it draws: make sure its window is in front.
+        NSApp.activate(ignoringOtherApps: true)
+        wc.window?.makeKeyAndOrderFront(nil)
+        _ = await wait(3) { wc.window?.occlusionState.contains(.visible) == true }
+        pane.surfaceView.binding("scroll_page_up")
+        ok = await wait(3) {
+            pane.layoutSubtreeIfNeeded()
+            return (pane.surfaceView.viewportText() ?? "").contains("anser-scrollback-42")
+                && pane.followTop == nil && pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5
+        }
+        check("scrollback after shell clear stays above the input bar", ok,
+              "vis=\(pane.window?.occlusionState.contains(.visible) ?? false) key=\(pane.window?.isKeyWindow ?? false) wins=\(NSApp.windows.filter(\.isVisible).map { $0.title.isEmpty ? String(describing: Swift.type(of: $0)) : $0.title }.joined(separator: "|")) atBottom=\(pane.viewportAtBottom) seen=\((pane.surfaceView.viewportText() ?? "").contains("anser-scrollback-42")) top=\(String(describing: pane.followTop)) surf=\(pane.surfaceView.frame.minY) bar=\(pane.barTopForTest)")
+        pane.surfaceView.binding("scroll_to_bottom")
+        ok = await wait(3) {
+            pane.layoutSubtreeIfNeeded()
+            return pane.followTop != nil && !(pane.surfaceView.viewportText() ?? "").contains("anser-scrollback-42")
+        }
+        check("returning to live output restores editor following", ok)
+        // Back to the default: the input bar at the bottom for the rest of the run.
+        Services.shared.setEditorFollowsOutputForTest(false)
+        pane.needsLayout = true
 
         // ---- Clear and Deep Clean ----
         pane.run("echo anser-clear-$((5*5)) # anser-selftest")
@@ -1364,19 +2719,30 @@ enum SelfTest {
         }
         pane.confirmDeepClean()
         ok = await wait(2) { pane.lastConfirmation?.messageText == "Deep clean this tab?" }
-        check("Deep Clean asks first", ok)
+        check("Deep Clean history option opens a dialog", ok)
         if let w = pane.window, let sheet = w.attachedSheet { w.endSheet(sheet, returnCode: .alertSecondButtonReturn) }
         // Garble the terminal on purpose: DEC line drawing turns q into ─ (what cat-ing a binary file can do).
         pane.run(#"printf '\033(0' # anser-selftest"#)
         _ = await wait(10) { s.atPrompt && s.blocks.last?.command.contains("033(0") == true }
-        pane.deepClean(removeFromHistory: true)
-        await sleep(0.4)
-        check("Deep Clean forgets this tab's commands", s.blocks.isEmpty)
+        pane.focus()
+        let viewMenu = NSApp.mainMenu?.items.compactMap(\.submenu).first { $0.title == "View" }
+        let deepCleanItem = viewMenu?.items.first { $0.representedObject as? String == AnserAction.deepClean.rawValue }
+        let shortcutBound = deepCleanItem?.keyEquivalent == "k"
+            && deepCleanItem?.keyEquivalentModifierMask == [.command, .shift]
+        if let deepCleanItem, let action = deepCleanItem.action {
+            NSApp.sendAction(action, to: deepCleanItem.target, from: deepCleanItem)
+        }
+        ok = await wait(2) { s.blocks.isEmpty }
+        check("Deep Clean shortcut runs without a dialog", shortcutBound && ok && pane.window?.attachedSheet == nil)
+        check("Deep Clean shortcut keeps saved History",
+              Services.shared.history.search("anser-clear-", scope: .all).contains { $0.0.command.contains("anser-clear-$((5*5))") })
         pane.run("echo abcq-deep # anser-selftest")
         ok = await wait(10) { (pane.surfaceView.viewportText() ?? "").contains("abcq-deep") }
         check("Deep Clean resets the terminal (text reads normally again)", ok, (pane.surfaceView.viewportText() ?? "").suffix(80).description)
-        // (History search is fuzzy, so look for the exact command.)
-        ok = await wait(3) { !Services.shared.history.search("anser-clear-", scope: .all).contains { $0.0.command.contains("anser-clear-$((5*5))") } }
+        _ = await wait(5) { s.atPrompt && s.blocks.last?.command.contains("abcq-deep") == true }
+        pane.deepClean(removeFromHistory: true)
+        // History search is fuzzy, so look for the exact command.
+        ok = await wait(3) { !Services.shared.history.search("abcq-deep", scope: .all).contains { $0.0.command == "echo abcq-deep # anser-selftest" } }
         check("and can remove them from History", ok)
         snap(pane, "deep-clean", full: true)
 
@@ -1425,20 +2791,22 @@ enum SelfTest {
 
         // ---- New menus ----
         let allItems = (NSApp.mainMenu?.items ?? []).flatMap { $0.submenu?.items ?? [] }.map(\.title)
-        check("menus for the new features", ["Search Command Output…", "Type in All Panes of This Tab", "Resolve Conflicts…", "Open Pull Request",
+        check("menus for the new features", ["Search Output…", "Type in All Panes of This Tab", "Resolve Conflicts…", "Open Pull Request",
                                              "Check for Updates…", "Import from iTerm2 or Warp…", "Your Feature Usage…"].allSatisfy(allItems.contains),
               allItems.filter { $0.contains("…") }.count.description)
 
         // Settings window.
         SettingsWindowController.shared.show()
         await sleep(0.3)
-        for (i, name) in ["appearance", "editor", "behavior", "ai", "shortcuts", "profiles", "advanced"].enumerated() {
+        for (i, name) in ["appearance", "editor", "notifications", "helpers", "privacy", "sessions", "ai", "shortcuts", "profiles", "plugins", "advanced"].enumerated() {
             SettingsWindowController.shared.selectSection(i)
             await sleep(0.2)
             if let v = SettingsWindowController.shared.window?.contentView { snapView(v, "settings-\(name)") }
         }
         SettingsWindowController.shared.show(section: "Profiles")
         check("settings has Shortcuts and Profiles pages", SettingsWindowController.shared.selectedSectionName == "Profiles")
+        let hits = SettingsWindowController.shared.searchHits("reconnect ssh")
+        check("settings search finds a setting", hits.first?.section == "Suggestions & Helpers", hits.map { "\($0.section): \($0.text)" }.joined(separator: " | "))
         SettingsWindowController.shared.selectSection(0)
         SettingsWindowController.shared.close()
 
@@ -1453,6 +2821,75 @@ enum SelfTest {
         } else {
             check("layout snapshot for session restore", false)
         }
+        let previousText = pane.editor.string
+        let previousSelection = pane.editor.selectedRange()
+        let draftText = "echo anser-draft-fixture 😀\necho second line"
+        pane.editor.setCommand(draftText)
+        pane.editor.setSelectedRange(NSRange(location: 10, length: 0))
+        second.editor.setCommand("echo token=fixture-secret")
+        if let data = try? JSONEncoder().encode(wc.snapshotTabs()),
+           let restoredTabs = try? JSONDecoder().decode([TerminalWindowController.SavedTab].self, from: data),
+           case let .split(_, children, _)? = restoredTabs.first?.layout,
+           case let .pane(cwd, _, draft)? = children.first,
+           case let .pane(_, _, secretDraft)? = children.last {
+            check("draft snapshots omit recognized secrets", secretDraft == nil)
+            let restored = TerminalWindowController(
+                tabs: [.init(layout: .pane(cwd: cwd, draft: draft))],
+                selected: 0, frame: nil)
+            let editor = restored.allPanes.first?.editor
+            check("session restore returns the multiline draft and cursor",
+                  editor?.string == draftText && editor?.selectedRange().location == 10)
+            restored.forceClose()
+        } else {
+            check("session draft snapshots decode", false)
+        }
+
+        let oldLayout = Data(#"{"pane":{"cwd":"/tmp"}}"#.utf8)
+        let decodedLegacy = try? JSONDecoder().decode(TerminalWindowController.Layout.self, from: oldLayout)
+        if case .pane(cwd: "/tmp", session: nil, draft: nil)? = decodedLegacy {
+            check("session layouts written before drafts still open", true)
+        } else {
+            check("session layouts written before drafts still open", false)
+        }
+
+        let workspace = wc.workspaceSnapshot(named: "Workspace Fixture")
+        let workspaceURL = URL(fileURLWithPath: tmp).appendingPathComponent("workspace-selftest.json")
+        do {
+            try TerminalWindowController.Workspace.save([workspace], to: workspaceURL)
+            wc.showWorkspaces(for: pane, from: workspaceURL)
+            if let picker = openPicker() {
+                picker.setQuery("workspace fixture")
+                check("saved workspace can be found by name", picker.itemTitles == [workspace.name])
+                ok = await wait(2) { picker.previewString.contains("Side by side") && picker.previewString.contains("anser-selftest") }
+                check("workspace previews its split and folders", ok)
+                picker.selectedActionsMenu().performActionForItem(at: 0)
+                let pinned = try TerminalWindowController.Workspace.load(from: workspaceURL).first
+                check("workspace pin persists", pinned?.pinned == true)
+                picker.acceptSelectedForTest()
+                let opened = AppDelegate.shared.currentController
+                check("workspace opens its split and folders in a new window with fresh shells",
+                      opened !== wc && opened?.allPanes.count == 2
+                        && opened?.allPanes.allSatisfy { $0.session.cwd == tmp && $0.editor.string.isEmpty && $0.session.id != s.id } == true)
+                if let opened, opened !== wc {
+                    let count = AppDelegate.shared.tabWindows.count
+                    wc.window?.makeKeyAndOrderFront(nil)
+                    wc.openWorkspace(workspace.name, from: workspaceURL)
+                    ok = await wait(3) { NSApp.keyWindow === opened.window }
+                    check("opening a live workspace focuses it without creating a duplicate",
+                          ok && AppDelegate.shared.tabWindows.count == count)
+                    let recent = try TerminalWindowController.Workspace.load(from: workspaceURL).first
+                    check("opening a workspace records it as recent", recent?.lastOpened != nil)
+                    opened.forceClose()
+                }
+            } else {
+                check("workspace picker opens", false)
+            }
+        } catch {
+            check("workspace saves", false, error.localizedDescription)
+        }
+        wc.window?.makeKeyAndOrderFront(nil)
+        pane.editor.setCommand(previousText)
+        pane.editor.setSelectedRange(previousSelection)
         wc.close(second)
         check("closing a split leaves one pane", wc.allPanes.count == 1)
 
@@ -1460,7 +2897,18 @@ enum SelfTest {
         wc.showBlocks(for: pane)
         ok = await wait(3) { NSApp.windows.contains { $0 is PickerPanel && $0.isVisible } }
         check("command blocks panel opens", ok)
-        (NSApp.windows.first { $0 is PickerPanel } as? PickerPanel)?.close()
+        if let blocks = openPicker(), let command = blocks.itemTitles.first {
+            let actions = blocks.selectedActionsMenu()
+            check("selected command block offers keyboard-accessible actions",
+                  blocks.footerHint.contains("⌃⏎ Actions") && blocks.buttonTitles.contains("Actions…")
+                    && actions.items.map(\.title).starts(with: ["Copy Output", "Copy Command", "Edit & Retry", "Save to Notebook"]))
+            if let edit = actions.items.firstIndex(where: { $0.title == "Edit & Retry" }) {
+                actions.performActionForItem(at: edit)
+                check("Edit & Retry stages the selected command", pane.editor.string == command)
+                pane.editor.clear()
+            }
+        }
+        closePickers()
 
         // Completion sources.
         let r = await Services.shared.engine.complete(CompletionContext(line: "git chec", cursor: 8, cwd: s.cwd), env: s.env)

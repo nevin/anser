@@ -6,146 +6,13 @@ import AnserCore
 extension TerminalWindowController {
     // MARK: Pickers
 
+    /// ⌘R: the one search window (see SearchUI.swift), on a history scope.
     func showHistorySearch(for pane: PaneView, scope initialScope: HistoryScope = .all) {
-        let history = Services.shared.history
-        let sessionBlocks = pane.session.blocks
-        Services.shared.record(initialScope == .output ? "history.searchOutput" : "history.search")
-        let panel = presentPickerReturning(PickerPanel.Config(
-            title: "History",
-            placeholder: "Search every command you've run…",
-            scopes: HistoryScope.allCases.map(\.title),
-            hint: "⏎ edit   ⌘⏎ run   ⌘C copy   ⌥⏎ copy output   ⌘⌫ forget   ⇥ scope (Output searches what commands printed)",
-            provider: { query, scope in
-                let scopeValue = HistoryScope(rawValue: scope) ?? .all
-                if scopeValue == .output {
-                    // Search what commands printed (saved on this Mac, secrets removed).
-                    return history.searchOutput(query).map { hit in
-                        let failed = (hit.entry.exitCode ?? 0) != 0
-                        return PickerItem(
-                            title: hit.entry.command,
-                            subtitle: "\(Self.relative(hit.entry.started)) · \(hit.line.isEmpty ? "(no output)" : hit.line)",
-                            accessory: hit.entry.exitCode == nil ? nil : (failed ? "✗" : "✓"),
-                            accessoryColor: failed ? .systemRed : .systemGreen,
-                            positions: [],
-                            payload: ["command": hit.entry.command, "historyID": hit.entry.id, "query": query])
-                    }
-                }
-                if scopeValue == .session {
-                    // This tab: every run in order, with exit status and timing.
-                    let blocks = Array(sessionBlocks.enumerated().reversed())
-                    return blocks.compactMap { idx, b -> PickerItem? in
-                        guard let m = Fuzzy.match(query, b.command) else { return nil }
-                        let ok = (b.exitCode ?? 0) == 0
-                        let outputIndex = sessionBlocks.count - 1 - idx
-                        return PickerItem(
-                            title: b.command,
-                            subtitle: "\(Self.relative(b.started)) · \(Self.shortPath(b.cwd))\(b.duration.map { " · " + Services.formatDuration($0) } ?? "")",
-                            accessory: ok ? "✓" : "✗ \(b.exitCode ?? 0)",
-                            accessoryColor: ok ? .systemGreen : .systemRed,
-                            positions: m.positions,
-                            payload: ["command": b.command, "output": outputIndex])
-                    }
-                }
-                return history.search(query, scope: scopeValue, cwd: pane.session.cwd, session: pane.session.id).map { c, m in
-                    let failed = (c.lastExit ?? 0) != 0
-                    return PickerItem(
-                        title: c.command,
-                        subtitle: "\(c.count)× · \(Self.relative(c.lastUsed))\(c.lastCwd.map { " · " + Self.shortPath($0) } ?? "")",
-                        accessory: c.lastExit == nil ? nil : (failed ? "✗" : "✓"),
-                        accessoryColor: failed ? .systemRed : .systemGreen,
-                        positions: m.positions,
-                        payload: ["command": c.command])
-                }
-            },
-            onAccept: { [weak pane] item, mods in
-                guard let pane, let payload = item.payload as? [String: Any], let cmd = payload["command"] as? String else { return }
-                if mods.contains(.option), let idx = payload["output"] as? Int {
-                    if let out = pane.output(ofBlock: pane.session.blocks.count - 1 - idx) { Self.copy(out) } else { NSSound.beep() }
-                    return
-                }
-                if mods.contains(.option), let id = payload["historyID"] as? Int64 {
-                    if let out = history.output(forHistoryID: id) { Self.copy(out) } else { NSSound.beep() }
-                    return
-                }
-                if mods.contains(.command) { pane.insertIntoEditor(cmd, run: true) } else { pane.insertIntoEditor(cmd) }
-            },
-            onCopy: { item in (item.payload as? [String: Any])?["command"] as? String },
-            onDelete: { item in
-                if let cmd = (item.payload as? [String: Any])?["command"] as? String { history.delete(command: cmd) }
-            },
-            preview: { [weak pane] item in
-                guard let payload = item.payload as? [String: Any], let cmd = payload["command"] as? String else { return nil }
-                if let idx = payload["output"] as? Int, let pane, let out = pane.output(ofBlock: pane.session.blocks.count - 1 - idx) {
-                    return PickerPanel.previewText("$ " + cmd + "\n\n" + out)
-                }
-                if let id = payload["historyID"] as? Int64 {
-                    let out = history.output(forHistoryID: id) ?? ""
-                    // Start the preview at the first match so it's visible.
-                    let q = (payload["query"] as? String ?? "").lowercased()
-                    var lines = out.components(separatedBy: "\n")
-                    if !q.isEmpty, let i = lines.firstIndex(where: { $0.lowercased().contains(q) }), i > 3 {
-                        lines = ["… \(i - 3) lines above"] + Array(lines[(i - 3)...])
-                    }
-                    return PickerPanel.previewText("$ " + cmd + "\n\n" + lines.joined(separator: "\n"))
-                }
-                let c = history.search(cmd, scope: .all, limit: 50).first { $0.0.command == cmd }?.0
-                var lines = ["$ " + cmd, ""]
-                if let c {
-                    lines.append("Run \(c.count) time\(c.count == 1 ? "" : "s"), last \(Self.relative(c.lastUsed))")
-                    if let e = c.lastExit { lines.append(e == 0 ? "Last run succeeded" : "Last run failed with exit \(e)") }
-                    if let t = history.timing(for: cmd) {
-                        lines.append("Usually takes \(Services.formatDuration(t.typical)) (\(Services.formatDuration(t.fastest))–\(Services.formatDuration(t.slowest)) over \(t.runs) runs)")
-                    }
-                    if !c.cwds.isEmpty { lines += ["", "Folders:"] + c.cwds.sorted().prefix(12).map { "  " + Self.shortPath($0) } }
-                }
-                return PickerPanel.previewText(lines.joined(separator: "\n"))
-            }), pane: pane)
-        if initialScope != .all { panel?.selectScope(initialScope.rawValue) }
+        showSearch(for: pane, scope: SearchScope(initialScope))
     }
 
-    /// Every command run in this tab, newest first: jump to it, copy its output, or re-run it.
-    func showBlocks(for pane: PaneView) {
-        let blocks = pane.session.blocks
-        presentPicker(PickerPanel.Config(
-            title: "Commands in this tab",
-            placeholder: "Filter commands…",
-            scopes: ["All", "Failed", "Slow (>5s)"],
-            hint: "⏎ jump to it   ⌘C copy output   ⌥⏎ copy command   ⌘⏎ run again   ⇧⏎ export",
-            provider: { query, scope in
-                blocks.enumerated().reversed().compactMap { idx, b -> PickerItem? in
-                    if scope == 1, (b.exitCode ?? 0) == 0 { return nil }
-                    if scope == 2, (b.duration ?? 0) < 5 { return nil }
-                    guard let m = Fuzzy.match(query, b.command) else { return nil }
-                    let ok = (b.exitCode ?? 0) == 0
-                    return PickerItem(
-                        title: b.command,
-                        subtitle: "\(Self.relative(b.started)) · \(Self.shortPath(b.cwd))\(b.duration.map { " · " + Services.formatDuration($0) } ?? "")",
-                        accessory: ok ? "✓" : "✗ \(b.exitCode ?? 0)",
-                        accessoryColor: ok ? .systemGreen : .systemRed,
-                        positions: m.positions,
-                        payload: (b.command, blocks.count - 1 - idx))
-                }
-            },
-            onAccept: { [weak pane] item, mods in
-                guard let pane, let (cmd, index) = item.payload as? (String, Int) else { return }
-                if mods.contains(.shift) { pane.windowController?.exportOutput(for: pane, block: pane.session.blocks.count - 1 - index); return }
-                if mods.contains(.command) { pane.insertIntoEditor(cmd, run: true); return }
-                if mods.contains(.option) { Self.copy(cmd); return }
-                pane.surfaceView.binding("scroll_to_bottom")
-                pane.surfaceView.binding("jump_to_prompt:-\(index + 1)")
-            },
-            onCopy: { [weak pane] item in
-                guard let (_, index) = item.payload as? (String, Int) else { return nil }
-                guard let pane else { return nil }
-                return pane.output(ofBlock: pane.session.blocks.count - 1 - index)
-            },
-            onDelete: nil,
-            preview: { [weak pane] item in
-                guard let (cmd, index) = item.payload as? (String, Int) else { return nil }
-                let out = pane.flatMap { $0.output(ofBlock: $0.session.blocks.count - 1 - index) } ?? "(output not available)"
-                return PickerPanel.previewText("$ " + cmd + "\n\n" + out)
-            }), pane: pane)
-    }
+    /// ⌘B: the search window on "This tab".
+    func showBlocks(for pane: PaneView) { showSearch(for: pane, scope: .tab) }
 
     /// Folders found by the disk scan, kept for a minute so ⌘J reopens instantly.
     private static var folderScan: (date: Date, root: String, paths: [String])?
@@ -247,7 +114,7 @@ extension TerminalWindowController {
 
     /// Branches, most recent first. Enter switches; typing a new name offers to create it.
     func showBranchSwitcher(for pane: PaneView) {
-        guard pane.session.gitBranch != nil else { NSSound.beep(); return }
+        guard pane.session.gitBranch != nil else { pane.flash("This folder isn't in a git repository"); return }
         let current = pane.session.gitBranch ?? ""
         let cwd = pane.session.cwd, env = pane.session.env, risky = pane.session.gitRisky
         Task { @MainActor [weak self, weak pane] in
@@ -316,7 +183,9 @@ extension TerminalWindowController {
                     let target = kind == "remote" ? BranchList.shortName(name) : name
                     let cmd = kind == "create" ? "git switch -c " + ShellLexer.escape(target) : "git switch " + ShellLexer.escape(target)
                     if mods.contains(.option) { pane.insertIntoEditor(pane.editor.string + target); return }
-                    if pane.session.atPrompt { pane.run(cmd) } else { NSSound.beep() }
+                    if kind == "switch", target == current { pane.flash("Already on \(current)"); return }
+                    guard pane.session.atPrompt else { pane.flash("Wait for the running command to finish, then switch"); return }
+                    pane.run(cmd)
                 },
                 onCopy: { item in (item.payload as? (String, String))?.1 },
                 onDelete: nil,
@@ -486,24 +355,92 @@ extension TerminalWindowController {
             onDelete: { item in if let t = item.payload as? String { clip.remove(t) } }), pane: pane)
     }
 
+    func showTabSwitcher(for pane: PaneView) {
+        presentPicker(PickerPanel.Config(
+            title: "Switch to Tab",
+            placeholder: "Search by tab name, folder, branch, or SSH host…",
+            scopes: ["This Window", "All Windows"],
+            hint: "Return · Switch to tab   ⇥ Change scope",
+            provider: { [weak self] query, scope in
+                guard let self else { return [] }
+                let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                let windows = scope == 0 ? [self] : AppDelegate.shared.tabWindows
+                var results: [(item: PickerItem, score: Int)] = []
+                for (windowIndex, wc) in windows.enumerated() {
+                    let windowName = wc === self ? "This Window" : "Window \(windowIndex + 1) · \(wc.window?.title ?? "Terminal")"
+                    for (index, tab) in wc.tabs.enumerated() {
+                        let title = wc.title(of: tab)
+                        let tabPane = tab.focusedPane ?? wc.panes(inTab: index).first
+                        let location = tabPane?.tabLocation ?? ""
+                        let session = tabPane?.session
+                        let path = session?.isRemote == true ? session?.remoteCwd : session?.cwd
+                        let titleMatch = Fuzzy.match(query, title)
+                        let context = [title, location, path ?? "", scope == 0 ? "" : windowName].joined(separator: " ")
+                        guard let match = titleMatch ?? Fuzzy.match(query, context) else { continue }
+                        let details = scope == 0 ? location : [windowName, location].filter { !$0.isEmpty }.joined(separator: " · ")
+                        let number = "Tab \(index + 1)"
+                        let item = PickerItem(title: title, subtitle: details.isEmpty ? nil : details,
+                                              accessory: wc === self && index == self.selectedIndex ? number + " · Current" : number,
+                                              accessoryColor: nil, positions: titleMatch?.positions ?? [],
+                                              payload: tab.id, proportional: true)
+                        results.append((item, match.score))
+                    }
+                }
+                return results.sorted { $0.score > $1.score }.map(\.item)
+            },
+            onAccept: { item, _ in
+                guard let id = item.payload as? UUID else { return }
+                for wc in AppDelegate.shared.tabWindows {
+                    guard let index = wc.tabs.firstIndex(where: { $0.id == id }) else { continue }
+                    wc.selectTab(index, focus: false)
+                    NSApp.activate(ignoringOtherApps: true)
+                    if let window = wc.window {
+                        if window.isMiniaturized { window.deminiaturize(nil) }
+                        window.makeKeyAndOrderFront(nil)
+                    }
+                    wc.focusedPane?.focus()
+                    return
+                }
+            },
+            onCopy: nil,
+            onDelete: nil), pane: pane)
+    }
+
     func showCommandPalette(for pane: PaneView) {
         let notebook = Services.shared.notebookEntries
+        let workspaces = Workspace.ordered((try? Workspace.load()) ?? [])
         let shortcuts = AppDelegate.shared.shortcutLabels
+        let pluginActions = PluginHost.shared.actions(for: pane)
         presentPicker(PickerPanel.Config(
             title: "Commands",
-            placeholder: "Run an action or insert a saved command…",
+            placeholder: "Search every action and saved command (try “typo”, “port”, “record”)…",
             scopes: [],
-            hint: "⏎ run",
+            hint: "Choose an action or a saved command",
             provider: { query, _ in
                 var out: [(PickerItem, Int)] = []
                 let recent = Self.recentActions
-                for a in AnserAction.allCases {
-                    if let m = Fuzzy.match(query, a.title) {
-                        // Recently used actions float to the top.
-                        let boost = recent.firstIndex(of: a.rawValue).map { 400 - $0 * 40 } ?? 0
-                        let accessory = shortcuts[a] ?? (boost > 0 ? "recent" : nil)
-                        out.append((PickerItem(title: a.title, subtitle: boost > 0 && query.isEmpty ? "recently used" : nil, accessory: accessory,
-                                               accessoryColor: nil, positions: m.positions, payload: a), m.score + 5 + boost))
+                let words = query.lowercased().split(separator: " ").map(String.init)
+                for a in AnserAction.allCases where a != .commandPalette {
+                    // Match the title first; else what it's for (category and other words people use).
+                    var m = Fuzzy.match(query, a.title)
+                    var viaKeywords = false
+                    if m == nil, !words.isEmpty {
+                        let hay = (a.category + " " + a.keywords).lowercased()
+                        if words.allSatisfy({ w in hay.split(separator: " ").contains { $0.hasPrefix(w) } }) {
+                            m = Fuzzy.match("", a.title); viaKeywords = true
+                        }
+                    }
+                    guard let m else { continue }
+                    // Recently used actions float to the top.
+                    let boost = recent.firstIndex(of: a.rawValue).map { 400 - $0 * 40 } ?? 0
+                    let subtitle = boost > 0 && query.isEmpty ? a.category + " · recently used" : a.category
+                    out.append((PickerItem(title: a.title, subtitle: subtitle, accessory: shortcuts[a],
+                                           accessoryColor: nil, positions: viaKeywords ? [] : m.positions, payload: a), (viaKeywords ? 2 : m.score + 5) + boost))
+                }
+                for (i, pa) in pluginActions.enumerated() {
+                    if let m = Fuzzy.match(query, pa.action.title) {
+                        out.append((PickerItem(title: pa.action.title, subtitle: pa.action.run ?? pa.plugin.manifest.name, accessory: "plugin",
+                                               accessoryColor: .systemTeal, positions: m.positions, payload: PluginPick(index: i)), m.score + 3))
                     }
                 }
                 for e in notebook {
@@ -512,15 +449,35 @@ extension TerminalWindowController {
                                                positions: Fuzzy.match(query, e.displayTitle)?.positions ?? [], payload: e), m.score))
                     }
                 }
+                for (index, workspace) in workspaces.enumerated() {
+                    guard !query.isEmpty || workspace.pinned == true || workspace.lastOpened != nil,
+                          let match = Fuzzy.match(query, workspace.name) else { continue }
+                    let boost = query.isEmpty ? 500 - min(index, 99) : 0
+                    let row = PickerItem(title: workspace.name, subtitle: "Open workspace",
+                                         accessory: workspace.badge, accessoryColor: nil,
+                                         positions: match.positions, payload: workspace, proportional: true)
+                    out.append((row, match.score + boost))
+                }
                 return out.sorted { $0.1 > $1.1 }.map(\.0)
             },
             onAccept: { [weak pane] item, _ in
                 guard let pane else { return }
                 if let a = item.payload as? AnserAction { Self.noteRecentAction(a); AppDelegate.shared.perform(a, pane: pane) }
                 if let e = item.payload as? Notebook.Entry { pane.insertIntoEditor(e.command) }
+                if let workspace = item.payload as? Workspace { pane.windowController?.openWorkspace(workspace.name) }
+                if let pick = item.payload as? PluginPick, pick.index < pluginActions.count { PluginHost.shared.perform(pluginActions[pick.index], in: pane) }
             },
             onCopy: { item in (item.payload as? Notebook.Entry)?.command },
-            onDelete: nil), pane: pane)
+            onDelete: nil,
+            selectionHint: { item in
+                if let action = item.payload as? AnserAction { return "Return · " + action.title }
+                if item.payload is PluginPick { return "Return · Run plugin action" }
+                if let workspace = item.payload as? Workspace {
+                    return Self.openWindow(forWorkspace: workspace.name) == nil
+                        ? "Return · Open workspace" : "Return · Focus open window"
+                }
+                return "Return · Insert into editor"
+            }), pane: pane)
     }
 
     static var recentActions: [String] { UserDefaults.standard.stringArray(forKey: "AnserRecentActions") ?? [] }
@@ -536,7 +493,7 @@ extension TerminalWindowController {
 
     /// Like presentPicker, but returns the panel (for live updates).
     @discardableResult
-    private func presentPickerReturning(_ config: PickerPanel.Config, pane: PaneView) -> PickerPanel? {
+    func presentPickerReturning(_ config: PickerPanel.Config, pane: PaneView) -> PickerPanel? {
         presentPicker(config, pane: pane)
         return picker
     }
@@ -569,3 +526,6 @@ extension TerminalWindowController {
     }
 
 }
+
+/// A plugin action in the command palette.
+struct PluginPick { let index: Int }

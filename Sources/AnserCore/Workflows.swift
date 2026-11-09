@@ -40,7 +40,7 @@ public struct Workflow: Codable, Sendable, Equatable {
         self.name = name; self.description = description; self.steps = steps; self.params = params; self.stopOnError = stopOnError
     }
 
-    static let placeholder = try! NSRegularExpression(pattern: #"\{\{\s*([A-Za-z0-9_\-]+)\s*(?::([^}]*))?\}\}"#)
+    static let placeholder = try! NSRegularExpression(pattern: #"\{\{\s*(?!secret:|op:)([A-Za-z0-9_\-]+)\s*(?::([^}]*))?\}\}"#)
 
     /// Every parameter, in order of first use, merged with explicit `params`.
     public var allParams: [Param] {

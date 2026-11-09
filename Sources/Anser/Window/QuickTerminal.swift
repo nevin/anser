@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import AnserCore
 
 /// A terminal that drops down from the top of the screen when you press a
-/// global shortcut (Settings → Behavior → Quick terminal), from any app.
+/// global shortcut (Settings → Sessions & Windows → Quick terminal), from any app.
 /// Press the shortcut again to tuck it away and go back to the app you were in.
 final class QuickTerminal {
     static let shared = QuickTerminal()

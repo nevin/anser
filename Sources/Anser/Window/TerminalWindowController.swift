@@ -27,8 +27,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     /// A saved split layout: panes (with their folders) and splits.
     indirect enum Layout: Codable {
         /// `session`: the kept shell's id (anser-session), so it comes back after a restart.
-        case pane(cwd: String, session: String? = nil)
+        case pane(cwd: String, session: String? = nil, draft: CommandDraft? = nil)
         case split(vertical: Bool, children: [Layout], sizes: [Double])
+    }
+
+    struct CommandDraft: Codable {
+        var text: String
+        var cursor: Int
     }
 
     struct SavedTab: Codable {
@@ -53,6 +58,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     private var tabBarHeight: NSLayoutConstraint!
     /// The drop-down window from the global shortcut (not saved with the session).
     var isQuickTerminal = false
+    var workspaceName: String?
 
     var selectedTab: Tab? { tabs.indices.contains(selectedIndex) ? tabs[selectedIndex] : nil }
     var focusedPane: PaneView? { selectedTab?.focusedPane ?? allPanes.first }
@@ -154,9 +160,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
 
     private func build(_ node: Layout) -> NSView {
         switch node {
-        case let .pane(cwd, session):
+        case let .pane(cwd, session, draft):
             let path = FileManager.default.fileExists(atPath: cwd) ? cwd : NSHomeDirectory()
-            return makePane(cwd: path, sessionID: session)
+            let pane = makePane(cwd: path, sessionID: session)
+            if let draft, Services.shared.config.restoreDrafts, pane.session.cwd == cwd, !pane.session.isRemote {
+                pane.editor.setCommand(draft.text)
+                pane.editor.setSelectedRange(NSRange(location: max(0, min(draft.cursor, draft.text.utf16.count)), length: 0))
+            }
+            return pane
         case let .split(vertical, children, _):
             let split = makeSplit(vertical: vertical)
             for c in children { split.addArrangedSubview(build(c)) }
@@ -185,22 +196,35 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         for (c, v) in zip(children, split.arrangedSubviews) { applySplitSizes(c, v) }
     }
 
-    private func layout(of root: NSView) -> Layout {
-        if let p = root as? PaneView { return .pane(cwd: p.session.cwd, session: p.session.persistent ? p.session.id : nil) }
-        if let s = root as? NSSplitView {
-            let total = max(1, s.isVertical ? s.bounds.width : s.bounds.height)
-            return .split(vertical: s.isVertical, children: s.arrangedSubviews.map(layout(of:)),
-                          sizes: s.arrangedSubviews.map { Double((s.isVertical ? $0.frame.width : $0.frame.height) / total) })
+    private func layout(of root: NSView, tab: Tab, includeSession: Bool) -> Layout {
+        let view = tab.zoom.flatMap { root === $0.placeholder ? $0.pane : nil } ?? root
+        if let pane = view as? PaneView {
+            let session = pane.session
+            let config = Services.shared.config
+            var draft: CommandDraft?
+            if includeSession, config.restoreSession, config.restoreDrafts, !session.historyPaused, !session.isRemote, pane.sshTarget == nil {
+                let text = pane.editor.string
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   !config.shouldIgnoreInHistory(text), AIHelp.redact(text) == text {
+                    draft = CommandDraft(text: text, cursor: pane.editor.selectedRange().location)
+                }
+            }
+            return .pane(cwd: session.cwd, session: includeSession && session.persistent ? session.id : nil, draft: draft)
+        }
+        if let split = view as? NSSplitView {
+            let total = max(1, split.isVertical ? split.bounds.width : split.bounds.height)
+            return .split(vertical: split.isVertical, children: split.arrangedSubviews.map { layout(of: $0, tab: tab, includeSession: includeSession) },
+                          sizes: split.arrangedSubviews.map { Double((split.isVertical ? $0.frame.width : $0.frame.height) / total) })
         }
         return .pane(cwd: NSHomeDirectory())
     }
 
     /// The selected tab's split layout.
-    func snapshot() -> Layout? { selectedTab.map { layout(of: $0.root) } }
+    func snapshot() -> Layout? { selectedTab.map { layout(of: $0.root, tab: $0, includeSession: true) } }
 
-    /// Every tab, for saving the session.
-    func snapshotTabs() -> [SavedTab] {
-        tabs.map { SavedTab(layout: layout(of: $0.root), title: $0.customTitle, color: $0.color) }
+    /// Workspaces reuse the layout with fresh shells. Session restore keeps the live shell and eligible drafts.
+    func snapshotTabs(includeSession: Bool = true) -> [SavedTab] {
+        tabs.map { SavedTab(layout: layout(of: $0.root, tab: $0, includeSession: includeSession), title: $0.customTitle, color: $0.color) }
     }
 
     /// Puts a tab's root view into the content area.
@@ -242,6 +266,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         // the layout pass inside the animation group slide it in.
         sidebarWidth.constant = show ? Self.sidebarDefaultWidth : 0
         tabBar.updateSidebarButton()
+        refreshSidebar()
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.18
             ctx.allowsImplicitAnimation = true
@@ -458,10 +483,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     // MARK: Focus
 
     /// What a tab is doing, for its indicator in the tab bar.
-    enum Activity { case idle, running, done, failed }
+    enum Activity { case idle, running, waiting, done, failed }
 
     func activity(of tab: Tab) -> Activity {
-        if panes(in: tab.root).contains(where: { $0.session.running != nil }) { return .running }
+        let list = panes(in: tab.root)
+        if list.contains(where: { $0.waitState != nil }) { return .waiting }
+        if list.contains(where: { $0.session.running != nil }) { return .running }
         if tab.unseenFailure { return .failed }
         if tab.unseenDone { return .done }
         return .idle

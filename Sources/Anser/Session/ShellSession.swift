@@ -14,6 +14,7 @@ protocol ShellSessionDelegate: AnyObject {
 /// FIFO; this reads them and tracks prompt/command state and history.
 final class ShellSession {
     struct Block {
+        let id = UUID()
         var command: String
         var cwd: String
         var started: Date
@@ -126,6 +127,23 @@ final class ShellSession {
     private(set) var shellPID: Int32 = 0
     /// Don't save this tab's commands to history.
     var historyPaused = false
+    /// AWS_PROFILE, KUBECONFIG… from the shell, for the cloud context chip.
+    private(set) var cloudVars = CloudContext.Vars()
+    /// The command that finished most recently (even when it's kept out of order, like an ssh session's).
+    private(set) var lastFinished: Block?
+    /// Commands Anser rewrote before running (secrets filled in): what ran → what to keep in history.
+    var historyAliases: [String: String] = [:]
+    /// What this shell's hooks support ("load": Anser can load a project environment silently).
+    private(set) var capabilities: Set<String> = []
+    /// The ssh command this shell is connected through, while in an ssh session.
+    var remoteCommand: String? { remoteHost != nil ? outerBlock?.command : nil }
+
+    /// Where Anser leaves files for the shell to load (ESC [9990~). Private to you.
+    static var loadDirectory: String {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("anser-load")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        return dir
+    }
 
     /// `persistentID`: a shell kept by anser-session (the same id comes back
     /// after a restart). `restored`: what this shell looked like when Anser
@@ -186,6 +204,7 @@ final class ShellSession {
         var functions: [String]
         var historyPaused: Bool
         var remoteToken: String
+        var capabilities: [String]?
     }
 
     func savedState() -> SavedState {
@@ -195,7 +214,7 @@ final class ShellSession {
         return SavedState(cwd: cwd, integrated: integrated, atPrompt: atPrompt, running: running.map(saved),
                           blocks: blocks.suffix(200).map(saved), lastExit: lastExit, shellPID: shellPID, shell: env.shell,
                           path: env.path, aliases: env.aliases, functions: Array(env.functions), historyPaused: historyPaused,
-                          remoteToken: remoteToken)
+                          remoteToken: remoteToken, capabilities: Array(capabilities))
     }
 
     private func apply(_ r: SavedState) {
@@ -214,6 +233,7 @@ final class ShellSession {
         env.functions = Set(r.functions)
         historyPaused = r.historyPaused
         remoteToken = r.remoteToken
+        capabilities = Set(r.capabilities ?? [])
     }
 
     deinit { close() }
@@ -229,6 +249,11 @@ final class ShellSession {
             "GHOSTTY_SHELL_FEATURES": "cursor,title,sudo",
         ]
         env["ANSER_PROMPT_MODE"] = Services.shared.config.shellPrompt
+        // The self-test's shells keep their own history file, never the user's.
+        if Services.isSelfTest {
+            env["ANSER_PRIVATE_HISTFILE"] = NSTemporaryDirectory() + "anser-selftest-shell-history"
+            env["HISTFILE"] = env["ANSER_PRIVATE_HISTFILE"]
+        }
         // Gives the shell an `imgcat` (when it has none) that shows pictures.
         if let helper = SessionHost.shared.helperPath { env["ANSER_HELPER"] = helper }
         if !Services.shared.config.showLoginMessage { env["ANSER_HIDE_LOGIN"] = "1" }
@@ -246,6 +271,9 @@ final class ShellSession {
         if let extra = Profile.resolve(Services.shared.config.profiles, host: nil, cwd: cwd)?.env {
             for (k, v) in extra where !k.hasPrefix("ANSER_") && !["ZDOTDIR", "TERM_PROGRAM"].contains(k) { env[k] = v }
         }
+        env["ANSER_LOAD_DIR"] = Self.loadDirectory
+        // Aliases from Tools → Aliases…, loaded by the hooks.
+        env["ANSER_ALIASES"] = (Self.userShell.hasSuffix("fish") ? AliasStore.fishFile : AliasStore.posixFile).path
         if let boot = RemoteBootstrap.path {
             env["ANSER_SSH_BOOTSTRAP"] = boot
             env["ANSER_REMOTE_TOKEN"] = remoteToken
@@ -328,6 +356,7 @@ final class ShellSession {
                 b.exitCode = exitCode
                 b.duration = Date().timeIntervalSince(b.started)
                 Services.shared.history.recordFinish(id: b.historyID, exitCode: exitCode, duration: b.duration)
+                lastFinished = b
                 if let at = insertFinishedAt, at <= blocks.count { blocks.insert(b, at: at) } else { blocks.append(b) }
                 if blocks.count > 500 { blocks.removeFirst(blocks.count - 500) }
                 running = nil
@@ -341,7 +370,9 @@ final class ShellSession {
             refreshGit()
             delegate?.sessionDidShowPrompt(self)
 
-        case let .preexec(command, newCwd):
+        case let .preexec(ran, newCwd):
+            // History keeps `{{secret:name}}`, not the code that fetched it.
+            let command = historyAliases.removeValue(forKey: ran) ?? historyAliases.removeValue(forKey: ran.trimmingCharacters(in: .whitespacesAndNewlines)) ?? ran
             if !newCwd.isEmpty { cwd = newCwd }
             atPrompt = false
             let skip = historyPaused || Services.shared.config.shouldIgnoreInHistory(command)
@@ -351,6 +382,14 @@ final class ShellSession {
 
         case .buffer:
             break
+
+        case let .capabilities(caps):
+            capabilities = Set(caps)
+
+        case let .context(vars):
+            guard vars != cloudVars else { break }
+            cloudVars = vars
+            delegate?.sessionDidUpdateInfo(self)
         }
     }
 
@@ -381,6 +420,7 @@ final class ShellSession {
                 b.duration = Date().timeIntervalSince(b.started)
                 Services.shared.history.recordFinish(id: b.historyID, exitCode: ec, duration: b.duration)
                 blocks.append(b)
+                lastFinished = b
                 running = nil
             }
             atPrompt = true

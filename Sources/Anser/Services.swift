@@ -6,7 +6,10 @@ import UserNotifications
 final class Services {
     static let shared = Services()
 
-    let history = HistoryStore(path: HistoryStore.defaultPath)
+    /// The self-test gets its own throwaway history, so test commands never reach yours.
+    let history = HistoryStore(path: Services.isSelfTest
+        ? NSTemporaryDirectory() + "anser-selftest-history-\(ProcessInfo.processInfo.processIdentifier).sqlite"
+        : HistoryStore.defaultPath)
     private(set) var specs = SpecRegistry()
     private(set) var engine: CompletionEngine
     private(set) var config = AnserConfig()
@@ -42,7 +45,7 @@ final class Services {
         loadConfig()
         if !Self.isSelfTest { prepareNotebook(); watchNotebook() }
         let history = self.history
-        DispatchQueue.global(qos: .utility).async { history.importShellHistoryIfNeeded() }
+        if !Self.isSelfTest { DispatchQueue.global(qos: .utility).async { history.importShellHistoryIfNeeded() } }
         clipboard.start(limit: config.clipboardHistorySize)
         MemoryManager.shared.start()
     }
@@ -196,6 +199,9 @@ final class Services {
     /// Tests turn vim keys on without touching the user's config file.
     func setVimForTest(_ on: Bool) { config.editor.vimMode = on }
 
+    /// Exercise optional editor following without changing the config file.
+    func setEditorFollowsOutputForTest(_ on: Bool) { config.editorFollowsOutput = on }
+
     /// Tests set profiles without touching the user's config file.
     func setProfilesForTest(_ p: [Profile]) { config.profiles = p }
 
@@ -286,7 +292,25 @@ final class ClipboardHistory {
 
     func start(limit: Int) {
         self.limit = limit
-        timer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in self?.poll() }
+        schedule(every: 0.6)
+        // Check less often while Anser is in the background (fewer wake-ups, less battery);
+        // check right away when you come back.
+        NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.schedule(every: 1.5)
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.poll()
+            self?.schedule(every: 0.6)
+        }
+    }
+
+    private(set) var interval: TimeInterval = 0
+    private func schedule(every seconds: TimeInterval) {
+        guard seconds != interval else { return }
+        interval = seconds
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: true) { [weak self] _ in self?.poll() }
+        timer?.tolerance = seconds * 0.4
     }
 
     private func poll() {

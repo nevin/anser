@@ -11,6 +11,12 @@ final class CommandEditor: NSTextView {
 
     /// Gray history suggestion drawn after the caret.
     private(set) var ghostSuffix = "" { didSet { if ghostSuffix != oldValue { needsDisplay = true } } }
+    private var aiGhostTask: Task<Void, Never>?
+    private var aiGhostCache: [String: String] = [:]
+    /// Tests answer AI completions here instead of Ollama.
+    static var aiTransportForTests: AIHelp.Transport?
+    /// For tests: type text and refresh the ghost.
+    func setTextForTests(_ t: String) { string = t; setSelectedRange(NSRange(location: (t as NSString).length, length: 0)); updateGhost() }
 
     let popup = CompletionPopup()
     var popupContext: CompletionContext?
@@ -28,7 +34,7 @@ final class CommandEditor: NSTextView {
     // Mistakes as you type (CommandEditor+Power.swift).
     var issues: [CommandLint.Issue] = []
     var bracketPair: (Int, Int)?
-    // More cursors: ⌥-click, ⌥-drag, ⌥⌘D, ⌃⌘G.
+    // More cursors: ⌥-click, ⌥-drag, ⌥⌘G, ⌃⌘G.
     var extraSelections: [NSRange] = [] {
         didSet {
             needsDisplay = true
@@ -244,8 +250,36 @@ final class CommandEditor: NSTextView {
         if let full = Services.shared.history.suggestion(forPrefix: s, cwd: pane.session.cwd), full.count > s.count {
             let suffix = String(full.dropFirst(s.count))
             ghostSuffix = suffix.contains("\n") ? String(suffix.prefix(while: { $0 != "\n" })) + " …" : suffix
+            aiGhostTask?.cancel()
+        } else if let hit = aiGhostCache[s] {
+            ghostSuffix = hit
         } else {
             ghostSuffix = ""
+            requestAIGhost(for: s)
+        }
+    }
+
+    /// Asks the local model (Ollama) for a completion once you pause typing, when history has none.
+    private func requestAIGhost(for typed: String) {
+        aiGhostTask?.cancel()
+        let cfg = Services.shared.config
+        guard cfg.aiCompletions, cfg.aiProvider == AIHelp.Provider.ollama.rawValue, let pane,
+              typed.count >= 3, !typed.contains("\n"), AIHelp.redact(typed) == typed else { return }
+        let model = (cfg.ollamaModel?.isEmpty == false ? cfg.ollamaModel : nil) ?? "llama3.2"
+        let base = cfg.ollamaURL.flatMap(URL.init(string:)) ?? AIHelp.defaultOllamaURL
+        let shell = (pane.session.env.shell as NSString).lastPathComponent
+        let cwdName = (pane.session.displayCwd as NSString).lastPathComponent
+        let recent = Array(pane.session.blocks.suffix(8).map(\.command))
+        aiGhostTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard !Task.isCancelled else { return }
+            let suffix = await AICompletion.complete(typed: typed, shell: shell, cwdName: cwdName, recent: recent, model: model, base: base,
+                                                     transport: CommandEditor.aiTransportForTests)
+            guard let self, !Task.isCancelled, let suffix, self.string == typed, self.selectedRange().location == (typed as NSString).length else { return }
+            if self.aiGhostCache.count > 200 { self.aiGhostCache.removeAll() }
+            self.aiGhostCache[typed] = suffix
+            self.ghostSuffix = suffix
+            Services.shared.record("ghost.ai")
         }
     }
 
@@ -745,6 +779,7 @@ final class CommandEditor: NSTextView {
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        if let pane, pane.session.isRemote, pane.offerUpload(TerminalSurfaceView.fileURLs(sender.draggingPasteboard).map(\.path)) { return true }
         if insertFileURLs(from: sender.draggingPasteboard) { return true }
         return super.performDragOperation(sender)
     }

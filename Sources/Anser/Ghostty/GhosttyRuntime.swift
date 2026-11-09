@@ -78,7 +78,7 @@ final class GhosttyRuntime {
             "clipboard-read = ask",
         ]
         lines.append("clipboard-paste-protection = \(Services.shared.config.editor.confirmMultilinePaste)")
-        // Scrollback per tab (Settings → Behavior); the biggest memory use with many tabs.
+        // Scrollback per tab (Settings → Sessions & Windows); the biggest memory use with many tabs.
         lines.append("scrollback-limit = \(Services.shared.config.scrollbackMB * 1_000_000)")
         if Services.shared.config.copyOnSelect { lines.append("copy-on-select = clipboard") }
         lines += Services.shared.config.appearance.ghosttyLines(systemIsDark: Self.systemIsDark)
@@ -254,8 +254,13 @@ final class GhosttyRuntime {
             view?.cellSize = CGSize(width: Double(s.width), height: Double(s.height))
             return true
         case GHOSTTY_ACTION_SCROLLBAR:
-            // New output or scrolling: command blocks move with the text.
-            DispatchQueue.main.async { pane?.blocksOverlay.setNeedsRefresh() }
+            let scrollbar = action.action.scrollbar
+            let atBottom = scrollbar.offset >= scrollbar.total
+                || scrollbar.total - scrollbar.offset <= scrollbar.len
+            DispatchQueue.main.async {
+                pane?.viewportChanged(atBottom: atBottom)
+                pane?.blocksOverlay.setNeedsRefresh()
+            }
             return false
         case GHOSTTY_ACTION_RENDER, GHOSTTY_ACTION_COLOR_CHANGE,
              GHOSTTY_ACTION_RENDERER_HEALTH, GHOSTTY_ACTION_MOUSE_OVER_LINK, GHOSTTY_ACTION_SELECTION_CHANGED,

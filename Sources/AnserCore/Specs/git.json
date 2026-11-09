@@ -78,7 +78,7 @@
         { "name": "--", "description": "Separate paths from branches" }
       ] },
     { "name": "switch", "description": "Switch branches",
-      "args": { "name": "branch", "generators": "git_branches" },
+      "args": { "name": "branch", "generators": "git_switch_branches" },
       "options": [
         { "name": ["-c", "--create"], "description": "Create a new branch", "args": { "name": "new-branch" } },
         { "name": ["-C", "--force-create"], "description": "Create or reset a branch", "args": { "name": "new-branch" } },

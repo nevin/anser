@@ -1,15 +1,16 @@
 import AppKit
 import AnserCore
 
-/// The right-hand panel (book button at the right of the tab bar, ⌥⌘N):
-/// your Command Notebook, grouped, then your workflows (personal and this
-/// project's), using the window's full height. Click a command to put it in
+/// The right-hand Saved panel (book button at the right of the tab bar, ⌥⌘N):
+/// everything you've saved to run again — your Command Notebook, grouped, then
+/// workflows and runbooks (personal and this project's). The left sidebar keeps
+/// to where you are and what's running, so nothing shows twice. Click a command to put it in
 /// the editor; hover for Run (asks for any {{values}} first), Copy and Edit.
 final class NotebookPanelView: NSView, NSSearchFieldDelegate {
     weak var controller: TerminalWindowController?
     static let defaultWidth: CGFloat = 270
 
-    private let header = NSTextField(labelWithString: "NOTEBOOK")
+    private let header = NSTextField(labelWithString: "SAVED")
     private let search = NSSearchField()
     private let scroll = NSScrollView()
     private let stack = NSStackView()
@@ -25,11 +26,14 @@ final class NotebookPanelView: NSView, NSSearchFieldDelegate {
         let edit = ClosureButton(symbol: "square.and.pencil", tip: "Open the notebook editor: groups, names, notes") {
             NotebookWindow.shared.show()
         }
+        let library = ClosureButton(symbol: "square.grid.2x2", tip: "Open the Library: aliases, history, recordings and more (⌥⌘O)") { [weak self] in
+            LibraryWindowController.shared.show(for: self?.controller?.focusedPane)
+        }
         let close = ClosureButton(symbol: "xmark", tip: "Hide (⌥⌘N)") { [weak self] in self?.controller?.toggleNotebookPanel() }
-        for b in [add, edit, close] { b.widthAnchor.constraint(equalToConstant: 16).isActive = true }
-        let top = NSStackView(views: [header, NSView(), add, edit, close])
+        for b in [add, edit, library, close] { b.widthAnchor.constraint(equalToConstant: 16).isActive = true }
+        let top = NSStackView(views: [header, NSView(), add, edit, library, close])
         top.spacing = 10
-        search.placeholderString = "Search saved commands"
+        search.placeholderString = "Search notebook and runbooks"
         search.delegate = self
         search.sendsSearchStringImmediately = true
         search.controlSize = .small
@@ -57,7 +61,7 @@ final class NotebookPanelView: NSView, NSSearchFieldDelegate {
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
-        setAccessibilityLabel("Command Notebook")
+        setAccessibilityLabel("Saved commands")
         NotificationCenter.default.addObserver(forName: .anserNotebookChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { if self?.isHidden == false { self?.reload() } }
         }
@@ -91,14 +95,16 @@ final class NotebookPanelView: NSView, NSSearchFieldDelegate {
         let t = GhosttyRuntime.shared.theme
         header.textColor = t.foreground.withAlphaComponent(0.5)
         notebook = (try? Notebook.load(from: NotebookWindow.fileURL)) ?? Notebook()
-        header.stringValue = "NOTEBOOK · \(notebook.entryCount)"
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         rowCount = 0
         let groups = notebook.filtered(search.stringValue)
+        // Group names show as NOTEBOOK · GROUP when there are several, so they read apart from Workflows and Runbooks.
         let showGroupNames = notebook.groups.count > 1
+        if !showGroupNames, notebook.entryCount > 0 { addHeading("NOTEBOOK  ·  \(notebook.entryCount)", top: 6) }
+        // (Workflows follow as more notebook groups.)
         for g in groups where !g.entries.isEmpty || search.stringValue.isEmpty {
             if showGroupNames {
-                let label = NSTextField(labelWithString: g.name.uppercased() + "  ·  \(g.entries.count)")
+                let label = NSTextField(labelWithString: "NOTEBOOK · " + g.name.uppercased() + "  ·  \(g.entries.count)")
                 label.font = .systemFont(ofSize: 10, weight: .semibold)
                 label.textColor = t.foreground.withAlphaComponent(0.45)
                 let wrap = NSStackView(views: [label])
@@ -108,9 +114,11 @@ final class NotebookPanelView: NSView, NSSearchFieldDelegate {
             for e in g.entries { add(e) }
         }
         addWorkflows(showHeader: true)
+        addRunbooks()
+        header.stringValue = "SAVED · \(notebook.entryCount + workflowCount + runbookCount)"
         if rowCount == 0 {
             let empty = NSTextField(wrappingLabelWithString: search.stringValue.isEmpty
-                ? "No saved commands or workflows yet.\n\nClick + to save the command in the editor, or use the book button on any command's hover strip."
+                ? "Nothing saved yet.\n\nClick + to save the command in the editor, or right-click any command → Save to Notebook. Commands with several steps (workflows) and runbooks show here too."
                 : "Nothing matches “\(search.stringValue)”.")
             empty.font = .systemFont(ofSize: 12)
             empty.textColor = t.foreground.withAlphaComponent(0.5)
@@ -133,19 +141,62 @@ final class NotebookPanelView: NSView, NSSearchFieldDelegate {
         }
         workflowCount = flows.count
         guard !flows.isEmpty else { return }
-        let label = NSTextField(labelWithString: "WORKFLOWS  ·  \(flows.count)")
+        // Workflows are notebook entries with several steps, so they read as notebook groups.
+        for (source, name) in [(Workflow.Source.personal, "WORKFLOWS"), (.project, "THIS PROJECT")] {
+            let group = flows.filter { $0.source == source }
+            guard !group.isEmpty else { continue }
+            let label = NSTextField(labelWithString: "NOTEBOOK · \(name)  ·  \(group.count)")
+            label.font = .systemFont(ofSize: 10, weight: .semibold)
+            label.textColor = t.foreground.withAlphaComponent(0.45)
+            let wrap = NSStackView(views: [label])
+            wrap.edgeInsets = NSEdgeInsets(top: 10, left: 6, bottom: 2, right: 0)
+            stack.addArrangedSubview(wrap)
+            for w in group { addWorkflowRow(w) }
+        }
+    }
+
+    private func addWorkflowRow(_ w: Workflow) {
+        let shown = Notebook.Entry(title: w.name + "  ·  \(w.steps.count) step\(w.steps.count == 1 ? "" : "s")",
+                                   command: w.steps.joined(separator: "\n"), note: w.description ?? "")
+        let row = NotebookRow(entry: shown,
+            paste: { [weak self] in self?.workflow(w, insertOnly: true) },
+            run: { [weak self] in self?.workflow(w, insertOnly: false) },
+            edit: { if let f = w.file { NSWorkspace.shared.open(f) } })
+        stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
+        rowCount += 1
+    }
+
+    private func addHeading(_ text: String, top: CGFloat) {
+        let label = NSTextField(labelWithString: text)
         label.font = .systemFont(ofSize: 10, weight: .semibold)
-        label.textColor = t.foreground.withAlphaComponent(0.45)
+        label.textColor = GhosttyRuntime.shared.theme.foreground.withAlphaComponent(0.45)
         let wrap = NSStackView(views: [label])
-        wrap.edgeInsets = NSEdgeInsets(top: 14, left: 6, bottom: 2, right: 0)
+        wrap.edgeInsets = NSEdgeInsets(top: top, left: 6, bottom: 2, right: 0)
         stack.addArrangedSubview(wrap)
-        for w in flows {
-            let shown = Notebook.Entry(title: w.name + (w.source == .project ? "  ·  project" : ""),
-                                       command: w.steps.joined(separator: "\n"), note: w.description ?? "")
-            let row = NotebookRow(entry: shown,
-                paste: { [weak self] in self?.workflow(w, insertOnly: true) },
-                run: { [weak self] in self?.workflow(w, insertOnly: false) },
-                edit: { if let f = w.file { NSWorkspace.shared.open(f) } })
+    }
+
+    /// Runbooks (Markdown checklists with runnable steps): click opens one beside the terminal.
+    private(set) var runbookCount = 0
+    private func addRunbooks() {
+        guard let pane = controller?.focusedPane, !pane.session.isRemote else { runbookCount = 0; return }
+        let q = search.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
+        let books = Runbook.load(cwd: pane.session.cwd).filter {
+            q.isEmpty || $0.title.lowercased().contains(q) || $0.intro.lowercased().contains(q) || $0.steps.map(\.command).joined().lowercased().contains(q)
+        }
+        runbookCount = books.count
+        guard !books.isEmpty else { return }
+        addHeading("RUNBOOKS  ·  \(books.count)", top: 14)
+        for r in books {
+            let shown = Notebook.Entry(title: r.title + (r.source == .project ? "  ·  project" : ""),
+                                       command: "\(r.steps.count) step\(r.steps.count == 1 ? "" : "s"): " + r.steps.map(\.title).joined(separator: " → "),
+                                       note: r.intro)
+            let open = { [weak self] in
+                guard let pane = self?.controller?.focusedPane else { NSSound.beep(); return }
+                RunbookWindowController.show(r, pane: pane)
+            }
+            let row = NotebookRow(entry: shown, paste: open, run: open, edit: { if let f = r.file { NSWorkspace.shared.open(f) } })
+            row.toolTip = (r.intro.isEmpty ? "" : String(r.intro.prefix(200)) + "\n\n") + "Click to open beside the terminal"
             stack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
             rowCount += 1

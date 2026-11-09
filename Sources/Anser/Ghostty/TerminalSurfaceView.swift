@@ -45,6 +45,25 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
             surface = ghostty_surface_new(app, &cfg)
         }
         updateTrackingAreas()
+        registerForDraggedTypes([.fileURL])
+    }
+
+    // Files dropped on the terminal: their paths (or, in an ssh tab, an offer to upload them).
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        Self.fileURLs(sender.draggingPasteboard).isEmpty ? [] : .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = Self.fileURLs(sender.draggingPasteboard)
+        guard !urls.isEmpty, let pane else { return false }
+        if pane.offerUpload(urls.map(\.path)) { return true }
+        let text = urls.map { ShellLexer.escape($0.path) }.joined(separator: " ") + " "
+        if pane.editorUsable { pane.editor.insertText(text, replacementRange: pane.editor.selectedRange()); pane.focus() } else { sendText(text) }
+        return true
+    }
+
+    static func fileURLs(_ pb: NSPasteboard) -> [URL] {
+        (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -337,7 +356,8 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
             return
         }
         sendPos(event)
-        NSMenu.popUpContextMenu(contextMenu(), with: event, for: self)
+        let overlayPoint = pane?.blocksOverlay.convert(event.locationInWindow, from: nil)
+        NSMenu.popUpContextMenu(contextMenu(at: overlayPoint), with: event, for: self)
     }
 
     override func rightMouseUp(with event: NSEvent) {
@@ -407,8 +427,14 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
         ghostty_surface_mouse_pressure(surface, UInt32(event.stage), Double(event.pressure))
     }
 
-    private func contextMenu() -> NSMenu {
+    /// The right-click menu; `point` (in the blocks overlay) picks the command under the mouse.
+    func contextMenu(at point: NSPoint? = nil) -> NSMenu {
         let m = NSMenu()
+        // Right-clicked a command or its output: everything you can do with it.
+        if let pane, let point, let items = pane.blocksOverlay.commandMenuItems(at: point), !items.isEmpty {
+            items.forEach { m.addItem($0) }
+            m.addItem(.separator())
+        }
         // Right-clicked a file path in the output: open, preview, blame, reveal, copy.
         if let pane, let word = wordUnderMouse(), let link = pane.pathLink(word, viewport: viewportText()) {
             let name = (link.path as NSString).lastPathComponent
@@ -432,16 +458,21 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
         m.addItem(.separator())
         m.addItem(withTitle: "Copy Last Output", action: #selector(AppDelegate.copyLastOutput(_:)), keyEquivalent: "")
         m.addItem(withTitle: "Copy Last Command", action: #selector(AppDelegate.copyLastCommand(_:)), keyEquivalent: "")
-        m.addItem(withTitle: "Search History…", action: #selector(AppDelegate.historySearch(_:)), keyEquivalent: "")
-        m.addItem(ClosureMenuItem(title: "Find in All Tabs…") { [weak pane] in
+        m.addItem(withTitle: "Search…", action: #selector(AppDelegate.historySearch(_:)), keyEquivalent: "")
+        m.addItem(ClosureMenuItem(title: "Search All Tabs…") { [weak pane] in
             guard let pane else { return }
             pane.windowController?.showSearchAllTabs(for: pane)
         })
         m.addItem(.separator())
-        m.addItem(withTitle: "Split Right", action: #selector(AppDelegate.splitRight(_:)), keyEquivalent: "")
-        m.addItem(withTitle: "Split Down", action: #selector(AppDelegate.splitDown(_:)), keyEquivalent: "")
-        m.addItem(ClosureMenuItem(title: "Split Left") { [weak pane] in if let pane { pane.windowController?.split(pane, vertical: true, before: true) } })
-        m.addItem(ClosureMenuItem(title: "Split Up") { [weak pane] in if let pane { pane.windowController?.split(pane, vertical: false, before: true) } })
+        let split = NSMenuItem(title: "Split", action: nil, keyEquivalent: "")
+        let sm = NSMenu()
+        sm.addItem(withTitle: "Split Right", action: #selector(AppDelegate.splitRight(_:)), keyEquivalent: "")
+        sm.addItem(withTitle: "Split Down", action: #selector(AppDelegate.splitDown(_:)), keyEquivalent: "")
+        sm.addItem(ClosureMenuItem(title: "Split Left") { [weak pane] in if let pane { pane.windowController?.split(pane, vertical: true, before: true) } })
+        sm.addItem(ClosureMenuItem(title: "Split Up") { [weak pane] in if let pane { pane.windowController?.split(pane, vertical: false, before: true) } })
+        split.submenu = sm
+        split.image = NSImage(systemSymbolName: "rectangle.split.2x1", accessibilityDescription: nil)
+        m.addItem(split)
         m.addItem(.separator())
         m.addItem(withTitle: "Clear", action: #selector(AppDelegate.clearScreen(_:)), keyEquivalent: "")
         m.addItem(ClosureMenuItem(title: "Deep Clean…") { [weak pane] in pane?.confirmDeepClean() })

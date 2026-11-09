@@ -63,7 +63,7 @@ enum Shortcuts {
             (["⌥", "⌘", "E"], "Edit in $EDITOR"),
             (["⌘", "E"], "Editor on / off"),
             (["⌥", "click"], "Another cursor (⌥-drag: a column)"),
-            (["⌥", "⌘", "D"], "Select the next match too"),
+            (["⌥", "⌘", "G"], "Select the next match too"),
             (["⌃", "⌘", "G"], "Select every match"),
             (["⌘", "/"], "Comment lines out / in"),
             (["⇧", "⌥", "↓"], "Duplicate line"),
@@ -71,22 +71,36 @@ enum Shortcuts {
             (["#…", "⇥"], "Describe it, AI writes the command"),
         ]),
         ("Find & navigate", [
+            (["⌘", "R"], "Search: history, tab, output, all tabs, saved"),
             (["⌃", "R"], "History right under the editor"),
-            (["⌘", "R"], "Search all history"),
-            (["⌘", "B"], "Commands in this tab"),
-            (["⌘", "F"], "Find in output"),
-            (["⌘", "J"], "Jump to a recent folder"),
+            (["⌘", "B"], "Search this tab's commands"),
+            (["⇧", "⌘", "F"], "Search all tabs"),
             (["⌥", "⇧", "⌘", "F"], "Search command output"),
-            (["⇧", "⌘", "F"], "Find in all tabs"),
-            (["⌥", "⌘", "N"], "Command Notebook"),
-            (["⌥", "⌘", "R"], "Run a workflow"),
-            (["⌘", "I"], "Ask AI for a command"),
-            (["⇧", "⌘", "S"], "Export tab (Markdown, JSON, PDF…)"),
-            (["⇧", "⌘", "P"], "Command palette"),
+            (["⌘", "F"], "Find on screen"),
+            (["⌘", "J"], "Jump to a recent folder"),
+            (["⇧", "⌘", "P"], "Command palette: every action"),
             (["⌘", "↑"], "Previous prompt"),
+            (["⌘", "I"], "Ask AI for a command"),
+        ]),
+        ("Saved: ⌥⌘", [
+            (["⌥", "⌘", "N"], "Saved panel: notebook and runbooks"),
+            (["⌥", "⌘", "S"], "Save command to the Notebook"),
+            (["⌥", "⌘", "R"], "Run from the Notebook"),
+            (["⌥", "⌘", "O"], "Library: manage everything"),
+            (["⌥", "⌘", "A"], "Aliases"),
+            (["right-click"], "Every action for a command"),
+        ]),
+        ("Windows & panels: ⌃⌘", [
+            (["⌃", "⌘", "S"], "Sidebar"),
+            (["⌃", "⌘", "H"], "History (mistakes, compact)"),
+            (["⌃", "⌘", "O"], "Filter output"),
+            (["⌃", "⌘", "L"], "Log viewer"),
+            (["⌃", "⌘", "W"], "Watch a command's output"),
+            (["⌃", "⌘", "R"], "Record this tab / stop"),
         ]),
         ("Copy & paste", [
             (["⇧", "⌘", "C"], "Copy last output"),
+            (["⇧", "⌘", "S"], "Export tab (Markdown, JSON, PDF…)"),
             (["⌥", "⌘", "C"], "Copy last command"),
             (["⇧", "⌘", "V"], "Clipboard history"),
         ]),
@@ -173,7 +187,7 @@ final class ShortcutsPanel: NSPanel {
             return col
         }
         let groups = Shortcuts.groups
-        let cols = NSStackView(views: [column(groups[0..<2]), column(groups[2..<groups.count])])
+        let cols = NSStackView(views: [column(groups[0..<1]), column(groups[1..<4]), column(groups[4..<groups.count])])
         cols.orientation = .horizontal
         cols.alignment = .top
         cols.spacing = 40
@@ -227,22 +241,27 @@ final class WelcomeView: NSView {
         let close = NSButton(title: "Got it", target: self, action: #selector(closeTapped))
         close.bezelStyle = .rounded
         close.keyEquivalent = ""
+        let tour = NSButton(title: "Take the Tour", target: self, action: #selector(tourTapped))
+        tour.bezelStyle = .rounded
 
         let stack = NSStackView(views: [title, sub, rows])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
         stack.setCustomSpacing(12, after: sub)
-        for v in [stack, close] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
+        for v in [stack, close, tour] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
             stack.topAnchor.constraint(equalTo: topAnchor, constant: 18),
             close.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
             close.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -14),
+            tour.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -8),
+            tour.centerYAnchor.constraint(equalTo: close.centerYAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     @objc private func closeTapped() { onClose() }
+    @objc private func tourTapped() { onClose(); TourWindowController.shared.show() }
 }

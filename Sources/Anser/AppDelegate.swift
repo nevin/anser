@@ -21,8 +21,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private(set) var shortcutLabels: [AnserAction: String] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Startup.mark("launched")
         Diagnostics.shared.start()
         Services.shared.start()
+        Startup.mark("services")
+        PluginHost.shared.reload()
+        if !Services.isSelfTest {
+            TunnelManager.shared.startAutomatic()
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 20) { _ = HistoryAutoClean.runIfDue() }
+        }
         guard GhosttyRuntime.shared.start() else {
             let a = NSAlert()
             a.messageText = "Anser couldn't start the terminal engine"
@@ -32,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             return
         }
         UNUserNotificationCenter.current().delegate = self
+        Startup.mark("terminal engine")
         buildMenu()
         loadKeybindings()
         installKeyMonitor()
@@ -46,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let selfTest = ProcessInfo.processInfo.environment["ANSER_SELFTEST"] != nil
         let restored = !selfTest && Services.shared.config.restoreSession && restoreSession()
         if !restored { newWindow(cwd: nil) }
+        Startup.mark("windows")
         // Shells left from before that no window came back to are ended.
         if SessionHost.shared.helperPath != nil {
             SessionHost.shared.keepOnly(Set(allPanes.filter(\.session.persistent).map(\.session.id)))
@@ -56,6 +65,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         NSApp.activate(ignoringOtherApps: true)
         if let err = Services.shared.configError { showConfigError(err) }
         didFinishLaunching = true
+        Startup.mark("ready")
+        // Restored tabs reattach to shells already at their prompt: ready once the window has drawn.
+        DispatchQueue.main.async { [weak self] in
+            if self?.allPanes.contains(where: { $0.session.atPrompt }) == true { Startup.firstPrompt() }
+        }
+        HistorySyncService.shared.configure()
+        WhatsNewWindowController.showIfUpdated()
+        NSApp.servicesProvider = self
+        NSUpdateDynamicServices()
         openPendingURLs()
         SelfTest.runIfRequested()
     }
@@ -90,6 +108,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        TunnelManager.shared.stopAll()
+        OutputWatchManager.shared.stopAll()
+        if Services.shared.config.syncHistory, !Services.isSelfTest { HistorySyncService.shared.syncNow(wait: true) }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST"] == nil { saveSession() }
         let panes = allPanes.filter(\.session.persistent)
         if keepingShellsOnQuit {
@@ -109,11 +130,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// quit brings your shells back.
     private func startAutosave() {
         guard ProcessInfo.processInfo.environment["ANSER_SELFTEST"] == nil else { return }
-        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-            guard let self, SessionHost.shared.keepOnQuit, !self.isTerminating else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            guard let self, Services.shared.config.restoreSession, !self.isTerminating else { return }
             self.saveSession()
-            self.allPanes.filter(\.session.persistent).forEach { SessionHost.shared.save($0.session) }
+            if SessionHost.shared.keepOnQuit {
+                self.allPanes.filter(\.session.persistent).forEach { SessionHost.shared.save($0.session) }
+            }
         }
+        t.tolerance = 5
     }
 
     // MARK: Session restore
@@ -122,20 +146,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         var frame: String
         var tabs: [TerminalWindowController.SavedTab]
         var selected: Int?
+        var workspaceName: String?
     }
 
     private var sessionURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Anser/session.json")
     }
 
+    private var lastSavedSession: Data?
+
     private func saveSession() {
         var saved: [SavedWindow] = []
         for wc in windows where !wc.isQuickTerminal {
             guard let w = wc.window else { continue }
             let tabs = wc.snapshotTabs()
-            if !tabs.isEmpty { saved.append(SavedWindow(frame: NSStringFromRect(w.frame), tabs: tabs, selected: wc.selectedIndex)) }
+            if !tabs.isEmpty { saved.append(SavedWindow(frame: NSStringFromRect(w.frame), tabs: tabs, selected: wc.selectedIndex, workspaceName: wc.workspaceName)) }
         }
-        if let data = try? JSONEncoder().encode(saved) { try? data.write(to: sessionURL) }
+        guard let data = try? JSONEncoder().encode(saved) else { return }
+        // Autosave runs every 20 seconds: skip the disk write when nothing changed.
+        guard data != lastSavedSession else { return }
+        lastSavedSession = data
+        let destination = sessionURL
+        // Drafts are private. Stage the file on the same volume with restrictive permissions before replacing it.
+        let fm = FileManager.default
+        let staging = destination.deletingLastPathComponent().appendingPathComponent(".session-\(UUID())")
+        do {
+            try fm.createDirectory(at: staging, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            defer { try? fm.removeItem(at: staging) }
+            let file = staging.appendingPathComponent("session.json")
+            try data.write(to: file)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            guard rename(file.path, destination.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        } catch { Diagnostics.shared.log("Could not save window layout") }
     }
 
     private func restoreSession() -> Bool {
@@ -143,6 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
               let saved = try? JSONDecoder().decode([SavedWindow].self, from: data), !saved.isEmpty else { return false }
         for sw in saved {
             let wc = TerminalWindowController(tabs: sw.tabs, selected: sw.selected ?? 0, frame: NSRectFromString(sw.frame))
+            wc.workspaceName = sw.workspaceName
             windows.append(wc)
             wc.showWindow(nil)
             wc.window?.makeKeyAndOrderFront(nil)
@@ -236,6 +281,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         windows.append(wc)
     }
 
+    /// Windows and tabs that can be switched to from a tab picker.
+    var tabWindows: [TerminalWindowController] {
+        windows.filter { !$0.isQuickTerminal || $0.window?.isVisible == true }
+    }
+
     /// Every pane in every window.
     var allPanes: [PaneView] { windows.flatMap(\.allPanesEverywhere) }
 
@@ -313,6 +363,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // Shell
         let shellItem = NSMenuItem()
         let shell = NSMenu(title: "Shell")
+        /// A submenu with a symbol, for grouping.
+        func group(_ title: String, _ symbol: String, _ items: [NSMenuItem]) -> NSMenuItem {
+            let g = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            let m = NSMenu(title: title)
+            items.forEach { m.addItem($0) }
+            g.submenu = m
+            g.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            return g
+        }
         shell.addItem(item("New Window", #selector(newWindowAction(_:)), "n", for: .newWindow))
         shell.addItem(item("New Tab", #selector(newTabAction(_:)), "t", for: .newTab))
         shell.addItem(.separator())
@@ -322,20 +381,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         shell.addItem(actionItem(.splitUp, "Split Up", ""))
         shell.addItem(.separator())
         shell.addItem(item("Re-run Last Command", #selector(rerunLast(_:)), "r", [.command, .shift], for: .rerunLastCommand))
+        shell.addItem(actionItem(.whenDone, "When This Finishes…", ""))
         shell.addItem(actionItem(.broadcastInput, "Type in All Panes of This Tab", "b", [.command, .option, .shift]))
-        shell.addItem(actionItem(.shareTab, "Share This Tab (Read-Only)…", ""))
         shell.addItem(.separator())
-        shell.addItem(item("Export Tab…", #selector(exportMarkdown(_:)), "s", [.command, .shift], for: .exportMarkdown))
-        shell.addItem(actionItem(.exportLastOutput, "Export Last Command’s Output…", "s", [.command, .option, .shift]))
-        shell.addItem(item("Copy Tab as Markdown", #selector(copyMarkdown(_:)), "", for: .copyMarkdown))
-        shell.addItem(item("Toggle Command Editor", #selector(toggleEditor(_:)), "e", for: .toggleEditor))
-        shell.addItem(item("Expand Command Editor", #selector(toggleExpandedEditor(_:)), "e", [.command, .shift], for: .expandEditor))
-        shell.addItem(item("Split / Join Command Lines", #selector(formatCommand(_:)), "f", [.command, .option], for: .formatCommand))
-        shell.addItem(item("Edit Command in $EDITOR", #selector(editExternally(_:)), "e", [.command, .option], for: .externalEditor))
+        shell.addItem(group("Run and Watch", "eye", [
+            actionItem(.watchAndRerun, "Re-run When Files Change", ""),
+            actionItem(.watchOutput, "Watch a Command’s Output…", "w", [.command, .control]),
+            actionItem(.failedTests, "Failed Tests…", ""),
+            actionItem(.projectEnvironment, "Load Project Environment", ""),
+            actionItem(.killPort, "Kill Process on Port…", ""),
+        ]))
+        shell.addItem(group("Remote", "network", [
+            actionItem(.uploadToServer, "Upload Files to Server…", ""),
+            actionItem(.downloadFromServer, "Download File from Server…", ""),
+            actionItem(.forwardRemotePort, "Open a Server Port on This Mac…", ""),
+        ]))
+        shell.addItem(group("Command Editor", "character.cursor.ibeam", [
+            item("Toggle Command Editor", #selector(toggleEditor(_:)), "e", for: .toggleEditor),
+            item("Expand Command Editor", #selector(toggleExpandedEditor(_:)), "e", [.command, .shift], for: .expandEditor),
+            item("Split / Join Command Lines", #selector(formatCommand(_:)), "f", [.command, .option], for: .formatCommand),
+            item("Edit Command in $EDITOR", #selector(editExternally(_:)), "e", [.command, .option], for: .externalEditor),
+        ]))
         shell.addItem(.separator())
         shell.addItem(item("Close", #selector(closePane(_:)), "w", for: .closePane))
         shellItem.submenu = shell
         main.addItem(shellItem)
+
+        // Output: look at, keep and share what commands printed.
+        /// An old shortcut kept working for a release, without showing in the menu.
+        func legacy(_ a: AnserAction, _ key: String, _ mods: NSEvent.ModifierFlags) -> NSMenuItem {
+            let i = NSMenuItem(title: a.title + " (old shortcut)", action: #selector(performMenuAction(_:)), keyEquivalent: key)
+            i.keyEquivalentModifierMask = mods
+            i.representedObject = a.rawValue
+            i.isHidden = true
+            i.allowsKeyEquivalentWhenHidden = true
+            return i
+        }
+        let outputItem = NSMenuItem()
+        let output = NSMenu(title: "Output")
+        output.addItem(actionItem(.filterOutput, "Filter Output…", "o", [.command, .control]))
+        output.addItem(legacy(.filterOutput, "l", [.command, .option]))
+        output.addItem(actionItem(.logViewer, "Log Viewer", "l", [.command, .control]))
+        output.addItem(actionItem(.compareLastRun, "Compare with Previous Run", ""))
+        output.addItem(actionItem(.viewOutputAsData, "View Output as Table / JSON", ""))
+        output.addItem(.separator())
+        output.addItem(item("Export Tab…", #selector(exportMarkdown(_:)), "s", [.command, .shift], for: .exportMarkdown))
+        output.addItem(actionItem(.exportLastOutput, "Export Last Command’s Output…", "s", [.command, .option, .shift]))
+        output.addItem(item("Copy Tab as Markdown", #selector(copyMarkdown(_:)), "", for: .copyMarkdown))
+        output.addItem(.separator())
+        output.addItem(actionItem(.shareCommand, "Share Command and Output…", ""))
+        output.addItem(actionItem(.shareTab, "Share This Tab (Read-Only)…", ""))
+        output.addItem(.separator())
+        output.addItem(actionItem(.recordTab, "Record This Tab", "r", [.command, .control]))
+        output.addItem(actionItem(.openRecording, "Open Recording…", ""))
+        outputItem.submenu = output
 
         // Edit
         let editItem = NSMenuItem()
@@ -353,7 +452,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         edit.addItem(item("Clipboard History…", #selector(clipboardHistory(_:)), "v", [.command, .shift], for: .clipboardHistory))
         edit.addItem(.separator())
         edit.addItem(item("Find…", #selector(findInTerminal(_:)), "f", for: .findInTerminal))
-        edit.addItem(actionItem(.searchAllTabs, "Find in All Tabs…", "f", [.command, .shift]))
+        edit.addItem(actionItem(.searchAllTabs, "Search All Tabs…", "f", [.command, .shift]))
         edit.addItem(item("Pause History for This Tab", #selector(pauseHistory(_:)), "", for: .pauseHistory))
         editItem.submenu = edit
         main.addItem(editItem)
@@ -368,23 +467,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         view.addItem(item("Toggle Sidebar", #selector(toggleSidebar(_:)), "s", [.command, .control], for: .toggleSidebar))
         view.addItem(.separator())
         view.addItem(item("Clear", #selector(clearScreen(_:)), "k", for: .clearScreen))
-        view.addItem(actionItem(.deepClean, "Deep Clean…", "k", [.command, .shift]))
+        view.addItem(actionItem(.deepClean, "Deep Clean", "k", [.command, .shift]))
         view.addItem(item("Jump to Previous Prompt", #selector(jumpPrev(_:)), String(Character(UnicodeScalar(NSUpArrowFunctionKey)!)), for: .jumpToPreviousPrompt))
         view.addItem(item("Jump to Next Prompt", #selector(jumpNext(_:)), String(Character(UnicodeScalar(NSDownArrowFunctionKey)!)), for: .jumpToNextPrompt))
         view.addItem(.separator())
         view.addItem(item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control]))
         viewItem.submenu = view
         main.addItem(viewItem)
+        main.addItem(outputItem)
 
         // Go
         let goItem = NSMenuItem()
         let go = NSMenu(title: "Go")
-        go.addItem(item("Search History…", #selector(historySearch(_:)), "r", for: .historySearch))
-        go.addItem(actionItem(.searchOutput, "Search Command Output…", "f", [.command, .option, .shift]))
-        go.addItem(item("Command Palette…", #selector(commandPalette(_:)), "p", [.command, .shift], for: .commandPalette))
-        go.addItem(item("Commands in This Tab…", #selector(blockNavigator(_:)), "b", for: .blockNavigator))
-        go.addItem(item("Jump to Folder…", #selector(jumpToFolder(_:)), "j", for: .jumpToFolder))
+        go.addItem(item("Search…", #selector(historySearch(_:)), "r", for: .historySearch))
+        go.addItem(item("Search This Tab…", #selector(blockNavigator(_:)), "b", for: .blockNavigator))
+        go.addItem(actionItem(.searchOutput, "Search Output…", "f", [.command, .option, .shift]))
+        go.addItem(actionItem(.searchSaved, "Search Saved Commands…", ""))
         go.addItem(.separator())
+        go.addItem(item("Command Palette…", #selector(commandPalette(_:)), "p", [.command, .shift], for: .commandPalette))
+        go.addItem(item("Jump to Folder…", #selector(jumpToFolder(_:)), "j", for: .jumpToFolder))
         go.addItem(.separator())
         go.addItem(item("Next Pane", #selector(nextPane(_:)), "]", for: .focusNextPane))
         go.addItem(item("Previous Pane", #selector(prevPane(_:)), "[", for: .focusPreviousPane))
@@ -412,16 +513,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // Tools
         let toolsItem = NSMenuItem()
         let tools = NSMenu(title: "Tools")
-        tools.addItem(actionItem(.notebook, "Command Notebook", "n", [.command, .option]))
-        tools.addItem(actionItem(.editNotebook, "Edit Notebook…", ""))
+        tools.addItem(actionItem(.library, "Library…", "o", [.command, .option]))
+        tools.addItem(actionItem(.notebook, "Saved Panel", "n", [.command, .option]))
         tools.addItem(actionItem(.saveToNotebook, "Save Command to Notebook", "s", [.command, .option]))
+        tools.addItem(item("Run from Notebook…", #selector(runWorkflow(_:)), "r", [.command, .option], for: .runWorkflow))
+        tools.addItem(actionItem(.runbooks, "Runbooks…", ""))
+        // Managing things opens them as tabs of the Library window.
+        tools.addItem(group("Manage", "square.grid.2x2", [
+            actionItem(.editNotebook, "Notebook…", ""),
+            actionItem(.aliases, "Aliases…", "a", [.command, .option]),
+            actionItem(.editHistory, "History…", "h", [.command, .control]),
+            actionItem(.manageSecrets, "Secrets…", ""),
+            actionItem(.managePlugins, "Plugins…", ""),
+            .separator(),
+            actionItem(.syncHistoryNow, "Sync History Now", ""),
+        ]))
+        tools.addItem(group("Create", "plus.square", [
+            item("Save Several Commands to Notebook…", #selector(saveWorkflow(_:)), "", for: .saveWorkflow),
+            actionItem(.newRunbook, "New Runbook…", ""),
+            actionItem(.openWorkflowsFolder, "Open Workflows Folder", ""),
+        ]))
         tools.addItem(.separator())
-        tools.addItem(item("Workflows…", #selector(runWorkflow(_:)), "r", [.command, .option], for: .runWorkflow))
-        tools.addItem(item("Save Commands as Workflow…", #selector(saveWorkflow(_:)), "", for: .saveWorkflow))
-        tools.addItem(actionItem(.openWorkflowsFolder, "Open Workflows Folder", ""))
+        tools.addItem(group("Servers", "server.rack", [
+            actionItem(.runOnServers, "Run on Several Servers…", ""),
+            actionItem(.addTunnel, "Add SSH Tunnel…", ""),
+        ]))
         tools.addItem(.separator())
         tools.addItem(item("Ask AI for a Command…", #selector(askClaude(_:)), "i", for: .askClaude))
         tools.addItem(item("Explain Last Error with AI", #selector(explainError(_:)), "i", [.command, .option], for: .explainError))
+        tools.addItem(actionItem(.aiTask, "Do a Task with AI, Step by Step…", ""))
         toolsItem.submenu = tools
         main.addItem(toolsItem)
 
@@ -434,6 +554,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         win.addItem(item("Show Previous Tab", #selector(prevTab(_:)), "[", [.command, .shift], for: .previousTab))
         win.addItem(item("Show Next Tab", #selector(nextTab(_:)), "]", [.command, .shift], for: .nextTab))
         win.addItem(item("Rename Tab…", #selector(renameTab(_:)), "i", [.command, .shift], for: .renameTab))
+        win.addItem(actionItem(.saveWorkspace, "Save Window as Workspace…", ""))
+        win.addItem(actionItem(.openWorkspace, "Open Workspace…", ""))
         win.addItem(item("Move Tab Left", #selector(moveTabLeft(_:)), String(Character(UnicodeScalar(NSLeftArrowFunctionKey)!)), [.command, .option], for: .moveTabLeft))
         win.addItem(item("Move Tab Right", #selector(moveTabRight(_:)), String(Character(UnicodeScalar(NSRightArrowFunctionKey)!)), [.command, .option], for: .moveTabRight))
         win.addItem(item("Move Tab to New Window", #selector(moveTabToNewWindow(_:)), "", for: .moveTabToNewWindow))
@@ -451,7 +573,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let helpItem = NSMenuItem()
         let help = NSMenu(title: "Help")
         help.addItem(item("Keyboard Shortcuts", #selector(showShortcuts(_:)), "/", for: .showShortcuts))
-        help.addItem(item("Show Welcome Tips", #selector(showWelcomeTips(_:))))
+        help.addItem(actionItem(.whatsNew, "What's New in Anser", ""))
+        help.addItem(actionItem(.tour, "Take the Tour", ""))
         help.addItem(.separator())
         help.addItem(item("Report a Problem…", #selector(reportProblem(_:))))
         help.addItem(actionItem(.showUsage, "Your Feature Usage…", ""))
@@ -491,6 +614,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         if menuItem.action == #selector(explainError(_:)) {
             menuItem.title = Services.shared.aiEnabled ? "Explain Last Error with \(Services.shared.aiName)" : "Explain Last Error with AI"
+        }
+        if menuItem.representedObject as? String == AnserAction.recordTab.rawValue {
+            menuItem.title = currentPane?.recorder != nil ? "Stop Recording" : "Record This Tab"
         }
         if menuItem.action == #selector(toggleSidebar(_:)) {
             menuItem.title = (currentController?.sidebarVisible ?? false) ? "Hide Sidebar" : "Show Sidebar"
@@ -684,7 +810,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc func reloadConfig(_ s: Any?) {
         Services.shared.loadConfig()
         QuickTerminal.shared.configure(Services.shared.config.quickTerminalHotkey)
-        allPanes.forEach { $0.updateProfile() }
+        allPanes.forEach { $0.updateProfile(); $0.cloudCache = nil; $0.refreshBar() }
+        HistorySyncService.shared.configure()
+        PluginHost.shared.reload()
         loadKeybindings()
         GhosttyRuntime.shared.reloadConfig()
         if let err = Services.shared.configError { showConfigError(err) }
@@ -741,6 +869,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case .nextTab: currentController?.selectNextTab(true)
         case .previousTab: currentController?.selectNextTab(false)
         case .closeTab: closeTab(nil)
+        case .switchToTab: pane.windowController?.showTabSwitcher(for: pane)
+        case .saveWorkspace: pane.windowController?.promptToSaveWorkspace()
+        case .openWorkspace: pane.windowController?.showWorkspaces(for: pane)
         case .expandEditor: pane.toggleExpanded()
         case .formatCommand: pane.formatCommand()
         case .externalEditor: pane.editInExternalEditor()
@@ -764,8 +895,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case .showUsage: showUsage()
         case .gitBlame: pane.windowController?.showBlameFilePicker(for: pane)
         case .searchAllTabs: pane.windowController?.showSearchAllTabs(for: pane)
+        case .searchSaved: pane.windowController?.showSearch(for: pane, scope: .saved)
         case .shareTab: pane.shareTab()
-        case .deepClean: pane.confirmDeepClean()
+        case .deepClean: pane.deepClean(removeFromHistory: false)
+        case .filterOutput: pane.toggleFilterPanel()
+        case .killPort: ServerMonitor.promptKillPort(in: pane.window, pane: pane)
+        case .compareLastRun:
+            if let i = pane.lastBlockIndexWithOutput { pane.compareWithPreviousRun(block: i) } else { pane.flash("Run a command first") }
+        case .viewOutputAsData:
+            if let i = pane.lastBlockIndexWithOutput { pane.viewOutputAsData(block: i) } else { pane.flash("Run a command first") }
+        case .manageSecrets: SecretsWindowController.shared.show()
+        case .whatsNew: WhatsNewWindowController.shared.show()
+        case .syncHistoryNow: syncHistoryNow(pane: pane)
+        case .managePlugins: SettingsWindowController.shared.show(section: "Plugins")
+        case .shareCommand:
+            if let i = pane.lastBlockIndexWithOutput { pane.shareCommand(block: i) } else { pane.flash("Run a command first") }
+        case .whenDone: pane.promptWhenDone()
+        case .watchAndRerun: pane.toggleWatch()
+        case .failedTests: pane.showFailedTestsMenu(from: pane.testsChip)
+        case .projectEnvironment: pane.projectEnvironmentAction()
+        case .runbooks: pane.showRunbooksMenu()
+        case .newRunbook: pane.newRunbook()
+        case .aiTask:
+            if Services.shared.aiEnabled { AgentPanel.show(for: pane) } else { pane.offerAISetup() }
+        case .uploadToServer: pane.promptUpload()
+        case .downloadFromServer: pane.promptDownload()
+        case .addTunnel: TunnelManager.shared.edit(nil, over: pane.window)
+        case .aliases: AliasesWindowController.shared.show(for: pane)
+        case .logViewer: pane.openLogViewer()
+        case .recordTab: pane.toggleRecording()
+        case .openRecording: ReplayWindowController.openFile()
+        case .editHistory: HistoryEditorWindowController.shared.show(for: pane)
+        case .watchOutput: pane.promptOutputWatch()
+        case .library: LibraryWindowController.shared.show(for: pane)
+        case .tour: TourWindowController.shared.show()
+        case .runOnServers: MultiHostWindowController.shared.show(command: pane.editor.string.trimmingCharacters(in: .whitespacesAndNewlines))
+        case .forwardRemotePort: pane.promptForwardPort()
         }
     }
 

@@ -24,12 +24,20 @@ end
 
 set -g __anser_ec 0
 set -g __anser_path ""
+set -g __anser_ctx ""
 
 function __anser_postexec --on-event fish_postexec
     set -g __anser_ec $status
 end
 
 function __anser_prompt --on-event fish_prompt
+    set -l aws $AWS_PROFILE
+    test -z "$aws"; and set aws $AWS_VAULT
+    set -l ctx "$aws"\t"$KUBECONFIG"\t"$DOCKER_CONTEXT"\t"$CLOUDSDK_CORE_PROJECT"\t"$VIRTUAL_ENV"
+    if test "$ctx" != "$__anser_ctx"
+        set -g __anser_ctx $ctx
+        __anser_send "ctx"\t$ctx
+    end
     set -l p (string join : $PATH)
     if test "$p" != "$__anser_path"
         set -g __anser_path $p
@@ -48,3 +56,21 @@ end
 # Anser sends ESC [9999~ to clear text typed straight into the shell.
 bind \e\[9999~ 'commandline -r ""'
 bind -M insert \e\[9999~ 'commandline -r ""' 2>/dev/null
+
+# Anser sends ESC [9990~ to load a project's environment it wrote to a file.
+set -g __anser_load_dir "$ANSER_LOAD_DIR"
+set -e ANSER_LOAD_DIR
+function __anser_load
+    set -l f "$__anser_load_dir/load-$fish_pid.sh"
+    test -n "$__anser_load_dir" -a -f "$f" -a -O "$f"; or return 0
+    source $f
+    command rm -f -- $f
+    set -g __anser_ctx ""
+    commandline -f repaint
+end
+bind \e\[9990~ __anser_load
+bind -M insert \e\[9990~ __anser_load 2>/dev/null
+test -n "$__anser_load_dir"; and __anser_send "caps"\tload
+# Aliases you made in Anser (Tools → Aliases…).
+test -r "$ANSER_ALIASES"; and source "$ANSER_ALIASES"
+set -e ANSER_ALIASES

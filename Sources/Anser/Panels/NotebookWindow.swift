@@ -9,7 +9,7 @@ extension Notification.Name {
 /// paste it into the terminal you were using, run it, or copy it.
 /// Floats above the terminal windows so it stays handy while you work.
 @MainActor
-final class NotebookWindow: NSPanel, NSOutlineViewDataSource, NSOutlineViewDelegate, NSTextFieldDelegate, NSTextViewDelegate, NSSearchFieldDelegate {
+final class NotebookWindow: NSWindow, NSOutlineViewDataSource, NSOutlineViewDelegate, NSTextFieldDelegate, NSTextViewDelegate, NSSearchFieldDelegate {
     static let shared = NotebookWindow()
 
     /// Where the notebook is saved (a test can point it elsewhere).
@@ -44,10 +44,8 @@ final class NotebookWindow: NSPanel, NSOutlineViewDataSource, NSOutlineViewDeleg
 
     private init() {
         super.init(contentRect: NSRect(x: 0, y: 0, width: 780, height: 480),
-                   styleMask: [.titled, .closable, .resizable, .utilityWindow], backing: .buffered, defer: true)
-        title = "Command Notebook"
-        isFloatingPanel = true
-        hidesOnDeactivate = true
+                   styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: true)
+        title = "Notebook"
         isReleasedWhenClosed = false
         minSize = NSSize(width: 560, height: 320)
         setFrameAutosaveName("AnserNotebook")
@@ -64,6 +62,7 @@ final class NotebookWindow: NSPanel, NSOutlineViewDataSource, NSOutlineViewDeleg
 
     func show() {
         if !isVisible { reloadFromDisk(); if frameAutosaveName.isEmpty || frame.origin == .zero { center() } }
+        LibraryTabs.host(self, pane: nil)
         makeKeyAndOrderFront(nil)
         if selectedEntryID == nil, let first = roots.first?.children.first { select(first) }
     }

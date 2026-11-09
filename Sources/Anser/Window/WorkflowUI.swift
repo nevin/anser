@@ -6,13 +6,15 @@ extension TerminalWindowController {
 
     // MARK: Run
 
+    /// Tools → Run from Notebook (⌥⌘R): notebook entries and workflows (entries with several steps) in one list.
     func showWorkflows(for pane: PaneView) {
         let workflows = WorkflowStore.load(cwd: pane.session.cwd)
-        guard !workflows.isEmpty else {
+        let notebook = (try? Notebook.load(from: NotebookWindow.fileURL)) ?? Notebook()
+        guard !workflows.isEmpty || notebook.entryCount > 0 else {
             let a = NSAlert()
-            a.messageText = "No workflows yet"
-            a.informativeText = "A workflow is a saved multi-step command with {{parameters}}. Create one from this tab's commands with Shell → Save Commands as Workflow…, or add JSON files to ~/.config/anser/workflows (personal) or .anser/workflows in a repo (shared with your team)."
-            a.addButton(withTitle: "Save Commands as Workflow…")
+            a.messageText = "Nothing in the Notebook yet"
+            a.informativeText = "Save a command with ⌥⌘S or right-click → Save to Notebook. For several steps with {{values}}, save commands from this tab with Tools → Create → Save Several Commands to Notebook…; a repo can share its own in .anser/workflows."
+            a.addButton(withTitle: "Save Several Commands…")
             a.addButton(withTitle: "OK")
             if let w = window {
                 a.beginSheetModal(for: w) { [weak self, weak pane] r in
@@ -21,19 +23,26 @@ extension TerminalWindowController {
             }
             return
         }
-        presentWorkflowPicker(workflows, pane: pane)
+        presentWorkflowPicker(workflows, notebook: notebook, pane: pane)
     }
 
-    private func presentWorkflowPicker(_ workflows: [Workflow], pane: PaneView) {
+    private func presentWorkflowPicker(_ workflows: [Workflow], notebook: Notebook, pane: PaneView) {
+        let entries: [(group: String, entry: Notebook.Entry)] = notebook.groups.flatMap { g in g.entries.map { (g.name, $0) } }
         showPicker(PickerPanel.Config(
-            title: "Workflows",
-            placeholder: "Find a workflow…",
-            scopes: ["All", "This project", "Personal"],
-            hint: "⏎ run   ⌥⏎ put in editor   ⌘⏎ edit file   ⌘⌫ move to Trash",
+            title: "Run from Notebook",
+            placeholder: "Find a saved command…",
+            scopes: ["All", "Notebook", "Several steps", "This project"],
+            hint: "⏎ run   ⌥⏎ put in editor   ⌘⏎ edit   ⌘⌫ move a workflow to the Trash",
             provider: { query, scope in
-                workflows.compactMap { w in
-                    if scope == 1 && w.source != .project { return nil }
-                    if scope == 2 && w.source != .personal { return nil }
+                let notebookItems: [PickerItem] = scope == 0 || scope == 1 ? entries.compactMap { group, e in
+                    guard let m = Fuzzy.match(query, e.displayTitle) ?? Fuzzy.match(query, e.command) else { return nil }
+                    return PickerItem(title: e.displayTitle, subtitle: group + " · " + e.command.replacingOccurrences(of: "\n", with: " ⏎ "),
+                                      accessory: nil, accessoryColor: nil, positions: Fuzzy.match(query, e.displayTitle)?.positions ?? m.positions,
+                                      payload: e, proportional: true)
+                } : []
+                return notebookItems + workflows.compactMap { w in
+                    if scope == 1 { return nil }
+                    if scope == 3 && w.source != .project { return nil }
                     guard let m = Fuzzy.match(query, w.name) ?? (w.description.flatMap { Fuzzy.match(query, $0) }) else { return nil }
                     let params = w.allParams.map(\.name)
                     let sub = [w.description, "\(w.steps.count) step\(w.steps.count == 1 ? "" : "s")", params.isEmpty ? nil : "asks for " + params.joined(separator: ", ")]
@@ -42,19 +51,25 @@ extension TerminalWindowController {
                     return PickerItem(title: w.name, subtitle: sub, accessory: w.source == .project ? (trusted ? "project" : "project · untrusted") : nil,
                                       accessoryColor: trusted ? .systemTeal : .systemOrange, positions: Fuzzy.match(query, w.name)?.positions ?? [], payload: w,
                                       proportional: true)
-                } + (query.isEmpty || "new workflow".contains(query.lowercased())
-                     ? [PickerItem(title: "New workflow…", subtitle: "Save commands from this tab as a reusable workflow", accessory: nil,
+                } + (query.isEmpty || "save several commands new workflow".contains(query.lowercased())
+                     ? [PickerItem(title: "Save several commands…", subtitle: "Save commands from this tab as one notebook entry with steps", accessory: nil,
                                    accessoryColor: nil, positions: [], payload: NewWorkflowRow(), proportional: true)] : [])
             },
             onAccept: { [weak self, weak pane] item, mods in
                 guard let self, let pane else { return }
                 if item.payload is NewWorkflowRow { self.showSaveWorkflow(for: pane); return }
+                if let e = item.payload as? Notebook.Entry {
+                    if mods.contains(.command) { NotebookWindow.shared.show(); NotebookWindow.shared.selectEntry(e.id); return }
+                    if mods.contains(.option) || !pane.session.atPrompt { pane.insertIntoEditor(e.command); pane.focus(); return }
+                    self.runNotebookEntry(e, in: pane)
+                    return
+                }
                 guard let w = item.payload as? Workflow else { return }
                 if mods.contains(.command), let f = w.file { NSWorkspace.shared.open(f); return }
                 // Putting it in the editor runs nothing, so only running needs trust.
                 self.startWorkflow(w, in: pane, insertOnly: mods.contains(.option))
             },
-            onCopy: { ($0.payload as? Workflow)?.render([:]) },
+            onCopy: { ($0.payload as? Workflow)?.render([:]) ?? ($0.payload as? Notebook.Entry)?.command },
             onDelete: { [weak self] item in
                 // Personal workflows only (a project's belong to the repo); the Trash keeps a copy.
                 guard let w = item.payload as? Workflow, let f = w.file else { return }
@@ -68,6 +83,9 @@ extension TerminalWindowController {
             preview: { item in
                 if item.payload is NewWorkflowRow {
                     return Self.workflowPreview(nil)
+                }
+                if let e = item.payload as? Notebook.Entry {
+                    return Self.workflowPreview(Workflow(name: e.displayTitle, description: e.note.isEmpty ? nil : e.note, steps: [e.command]))
                 }
                 guard let w = item.payload as? Workflow else { return nil }
                 return Self.workflowPreview(w)
@@ -88,7 +106,7 @@ extension TerminalWindowController {
         }
         func heading(_ s: String) { add(s.uppercased() + "\n", .systemFont(ofSize: 10, weight: .semibold), t.dim) }
         guard let w else {
-            add("Turn commands you ran in this tab into a workflow you can run again with one keystroke.\n\n")
+            add("Turn commands you ran in this tab into one notebook entry with steps (a workflow), ready to run again with ⌥⌘R.\n\n")
             add("Use {{name}} in a step to ask for a value each time, or {{name:default}} to pre-fill it.", body, t.dim)
             return out
         }
@@ -266,7 +284,7 @@ extension TerminalWindowController {
         stack.frame.size = stack.fittingSize
 
         let a = NSAlert()
-        a.messageText = "Save commands as a workflow"
+        a.messageText = "Save several commands to the Notebook"
         a.accessoryView = stack
         a.addButton(withTitle: "Save")
         a.addButton(withTitle: "Cancel")
@@ -280,7 +298,7 @@ extension TerminalWindowController {
             let wf = Workflow(name: title, description: desc.stringValue.isEmpty ? nil : desc.stringValue, steps: steps)
             do {
                 let url = try WorkflowStore.save(wf, to: project ?? WorkflowStore.personalDirectory)
-                pane.flash("Saved workflow “\(title)”")
+                pane.flash("Saved “\(title)” to the Notebook")
                 Diagnostics.shared.log("workflow saved: \(url.lastPathComponent)")
             } catch {
                 self.window.map { NSAlert(error: error).beginSheetModal(for: $0) }

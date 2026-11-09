@@ -413,3 +413,102 @@ public final class AIHelp: Sendable {
         return out
     }
 }
+
+// MARK: Step-by-step tasks
+
+/// One step of an AI task: what ran and how it went.
+public struct AgentStep: Sendable, Equatable {
+    public var command: String
+    public var exitCode: Int?
+    public var output: String
+    /// You skipped it instead of running it.
+    public var skipped: Bool
+    /// What you said instead (answer to a question, or a note).
+    public var note: String?
+    public init(command: String, exitCode: Int? = nil, output: String = "", skipped: Bool = false, note: String? = nil) {
+        self.command = command; self.exitCode = exitCode; self.output = output; self.skipped = skipped; self.note = note
+    }
+}
+
+/// What the AI wants to do next.
+public enum AgentReply: Sendable, Equatable {
+    /// Run this command (with a one-line reason).
+    case run(command: String, why: String)
+    case done(summary: String)
+    /// It needs something from you first.
+    case ask(question: String)
+
+    public static func parse(_ text: String) -> AgentReply {
+        let blocks = AIHelp.codeBlocks(text)
+        let lines = text.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        func after(_ prefix: String) -> String? {
+            guard let i = lines.firstIndex(where: { $0.uppercased().hasPrefix(prefix) }) else { return nil }
+            let rest = ([String(lines[i].dropFirst(prefix.count))] + lines[(i + 1)...]).joined(separator: "\n")
+            return rest.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let cmd = blocks.first {
+            // The explanation is the prose outside the code block.
+            var why: [String] = []
+            var inBlock = false
+            for l in lines {
+                if l.hasPrefix("```") { inBlock.toggle(); continue }
+                if !inBlock, !l.isEmpty, !l.uppercased().hasPrefix("NEXT:") { why.append(l) }
+            }
+            return .run(command: cmd, why: why.joined(separator: " "))
+        }
+        if let q = after("QUESTION:") { return .ask(question: q) }
+        if let d = after("DONE:") { return .done(summary: d) }
+        return .done(summary: text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+extension AIHelp {
+    /// The next step toward `goal`, given the steps so far. Stateless: the whole task goes with every request.
+    public func nextStep(goal: String, steps: [AgentStep], context: Context, maxSteps: Int = 20) async throws -> AgentReply {
+        try await send(Self.agentPrompt(goal: goal, steps: steps, context: context, maxSteps: maxSteps), effort: "medium").reply
+    }
+
+    public static func agentPrompt(goal: String, steps: [AgentStep], context: Context, maxSteps: Int = 20) -> String {
+        var p = """
+        You are doing a task in the user's terminal, one command at a time. They see each command and approve it before it runs.
+
+        Task: \(redact(goal))
+
+        \(context.summary)
+
+        """
+        if steps.isEmpty {
+            p += "Nothing has run yet.\n"
+        } else {
+            p += "Steps so far:\n"
+            for (i, s) in steps.enumerated() {
+                p += "\n\(i + 1). "
+                if s.command.isEmpty {
+                    p += "(the user said) \(redact(s.note ?? ""))\n"
+                    continue
+                }
+                p += "```sh\n\(redact(s.command))\n```\n"
+                if s.skipped { p += "The user skipped this command\(s.note.map { ": \(redact($0))" } ?? "").\n"; continue }
+                p += "Exit code: \(s.exitCode.map(String.init) ?? "unknown")\n"
+                let out = redact(tail(s.output, lines: 60)).trimmingCharacters(in: .whitespacesAndNewlines)
+                p += out.isEmpty ? "(no output)\n" : "Output (last lines):\n```\n\(out)\n```\n"
+            }
+        }
+        p += """
+
+        Reply in exactly one of these forms:
+        1. One short sentence on what the next step does and why, then exactly one ```sh block with exactly one command (it may use && or pipes). No other code blocks.
+        2. A line starting with DONE: and two or three sentences on what was done and anything the user should check.
+        3. A line starting with QUESTION: when you need something only the user knows.
+
+        Prefer read-only commands to look around before changing anything. Never use interactive programs (editors, pagers, prompts); \
+        add flags like --yes or --no-pager where needed. Avoid destructive commands unless the task requires them, and say plainly what they destroy. \
+        If a step failed, fix the cause rather than repeating it. Stop with DONE: after at most \(maxSteps) steps.
+        """
+        return p
+    }
+}
+
+extension AIHelp.Answer {
+    var reply: AgentReply { AgentReply.parse(text) }
+}

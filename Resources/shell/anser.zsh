@@ -15,7 +15,7 @@ fi
 # Don't leak into child programs or nested shells.
 builtin unset ANSER_FIFO ANSER_SHELL_DIR ANSER_GHOSTTY_INTEGRATION ANSER_HELPER
 
-typeset -g _anser_alias_sig="" _anser_func_sig="" _anser_path=""
+typeset -g _anser_alias_sig="" _anser_func_sig="" _anser_path="" _anser_ctx=""
 
 _anser_esc() {
     REPLY=${1//\\/\\\\}
@@ -26,6 +26,12 @@ _anser_esc() {
 _anser_send() { builtin print -rn -u $_anser_fd -- "$1"$'\n' 2>/dev/null }
 
 _anser_sync() {
+    # Cloud context variables, for the status row's context chip.
+    local ctx="${AWS_PROFILE:-$AWS_VAULT}"$'\t'"$KUBECONFIG"$'\t'"$DOCKER_CONTEXT"$'\t'"$CLOUDSDK_CORE_PROJECT"$'\t'"$VIRTUAL_ENV"
+    if [[ "$ctx" != "$_anser_ctx" ]]; then
+        _anser_ctx=$ctx
+        _anser_send "ctx"$'\t'"$ctx"
+    fi
     if [[ "$PATH" != "$_anser_path" ]]; then
         _anser_path=$PATH
         _anser_esc "$PATH"
@@ -43,6 +49,24 @@ _anser_sync() {
         _anser_send "functions"$'\t'"${(j: :)${(k)functions:#_*}}"
     fi
 }
+
+# Anser sends ESC [9990~ to load a project's environment (.env values, a
+# virtualenv) without typing a command: it writes the file, this sources it.
+typeset -g _anser_load_dir=$ANSER_LOAD_DIR
+builtin unset ANSER_LOAD_DIR
+_anser_load() {
+    local f="$_anser_load_dir/load-$$.sh"
+    [[ -n $_anser_load_dir && -f $f && -O $f ]] || return 0
+    builtin source "$f"
+    command rm -f -- "$f"
+    _anser_ctx=""
+    _anser_sync
+    zle reset-prompt
+}
+[[ -n $_anser_load_dir ]] && _anser_send "caps"$'\t'"load"
+# Aliases you made in Anser (Tools → Aliases…).
+[[ -r "$ANSER_ALIASES" ]] && builtin source "$ANSER_ALIASES"
+builtin unset ANSER_ALIASES
 
 # Anser sends ESC [9999~ to clear text typed straight into the shell before
 # it runs a command from its editor. Works in emacs and vi keymaps.
@@ -101,16 +125,21 @@ _anser_precmd() {
     if [[ "${precmd_functions[1]}" != "_anser_precmd" ]]; then
         precmd_functions=(_anser_precmd ${precmd_functions:#_anser_precmd})
     fi
+    # Anser's self-test: keep its commands out of the user's real shell history
+    # (/etc/zshrc sets HISTFILE after our hooks load, so set it here).
+    [[ -n "${ANSER_PRIVATE_HISTFILE:-}" && "$HISTFILE" != "$ANSER_PRIVATE_HISTFILE" ]] && HISTFILE=$ANSER_PRIVATE_HISTFILE
     if (( ! _anser_bound )); then
         _anser_bound=1
         zle -N _anser_clear_line
         zle -N _anser_mode_full
         zle -N _anser_mode_default
+        zle -N _anser_load
         local km
         for km in emacs viins vicmd; do
             builtin bindkey -M $km $'\e[9999~' _anser_clear_line 2>/dev/null
             builtin bindkey -M $km $'\e[9998~' _anser_mode_full 2>/dev/null
             builtin bindkey -M $km $'\e[9997~' _anser_mode_default 2>/dev/null
+            builtin bindkey -M $km $'\e[9990~' _anser_load 2>/dev/null
         done
         builtin autoload -Uz add-zle-hook-widget && add-zle-hook-widget line-finish _anser_line_finish
     fi

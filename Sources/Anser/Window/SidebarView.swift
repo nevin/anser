@@ -18,6 +18,12 @@ final class SidebarView: NSView {
 
     final class FlippedStack: NSStackView { override var isFlipped: Bool { true } }
 
+    /// Where each section starts in the stack while building (title, index), and sections you hid.
+    private var sectionStarts: [(title: String, index: Int)] = []
+    private var hiddenNow: [String] = []
+    /// Section titles in the order shown (for tests and moving).
+    private(set) var orderedSections: [String] = []
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         stack.orientation = .vertical
@@ -40,6 +46,17 @@ final class SidebarView: NSView {
         setAccessibilityLabel("Sidebar")
         NotificationCenter.default.addObserver(forName: .anserNotebookChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.controller?.refreshSidebar() }
+        }
+        NotificationCenter.default.addObserver(forName: .anserPluginsChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.controller?.refreshSidebar() }
+        }
+        NotificationCenter.default.addObserver(forName: ServerMonitor.changed, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.controller?.refreshSidebar() }
+        }
+        for name in [ContainerMonitor.changed, TunnelManager.changed, OutputWatchManager.changed] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.controller?.refreshSidebar() }
+            }
         }
     }
 
@@ -86,9 +103,11 @@ final class SidebarView: NSView {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         rowCount = 0
         sectionTitles = []
+        sectionStarts = []
+        hiddenNow = []
         lastPane = pane
         lastChanges = changes
-        defer { needsLayout = true }
+        defer { arrangeSections(); needsLayout = true }
         let t = GhosttyRuntime.shared.theme
         let s = pane.session
         let fm = FileManager.default
@@ -134,6 +153,186 @@ final class SidebarView: NSView {
             }
         }
 
+        // Failed tests from the last test run: open one, re-run just it.
+        if let (report, cmd, cwd) = pane.testReport, !report.failures.isEmpty, section("Failed tests", count: report.failures.count) {
+            for f in report.failures.prefix(20) {
+                let re = TestFailures.rerunCommand(f, runner: report.runner, original: cmd)
+                var actions: [SidebarRow.Action] = []
+                if let re { actions.append(.init(symbol: "play.circle", tip: "Re-run this test") { pane.rerunTests([f], command: re, cwd: cwd) }) }
+                row(symbol: "xmark.circle", text: f.name, detail: f.location.map { ($0 as NSString).lastPathComponent }, color: t.red,
+                    tooltip: [f.name, f.location, f.message].compactMap { $0 }.joined(separator: "\n") + "\nClick to open · ▶ re-runs it",
+                    actions: actions, wraps: true) {
+                    pane.openTestLocation(f, cwd: cwd)
+                }
+            }
+            if let all = TestFailures.rerunCommand(report.failures, runner: report.runner, original: cmd) {
+                row(symbol: "arrow.clockwise", text: "Re-run all failed", detail: report.runner.displayName, color: t.dim, tooltip: all) {
+                    pane.rerunTests(report.failures, command: all, cwd: cwd)
+                }
+            }
+        }
+
+        // Servers your tabs started, in every window.
+        let servers = ServerMonitor.shared.all
+        if !servers.isEmpty, section("Servers", count: servers.count) {
+            for (p, srv) in servers {
+                let tab = p.windowController.flatMap { wc in wc.tab(for: p).map { wc.title(of: $0) } } ?? ""
+                row(symbol: "server.rack", text: ":\(srv.port)  \(srv.process)", detail: tab, color: t.green,
+                    tooltip: "\(srv.url)\nClick to open · right-click to copy or stop",
+                    actions: [.init(symbol: "stop.circle", tip: "Stop \(srv.process)") { ServerMonitor.stop(pid: srv.pid) }],
+                    menu: { ServerMonitor.menu(for: srv, pane: p) }) {
+                    if let u = URL(string: srv.url) { NSWorkspace.shared.open(u) }
+                }
+            }
+        }
+
+        // One-click project tasks: npm scripts, Make targets, just recipes…
+        if !s.isRemote, let project = ProjectTasks.find(from: s.cwd), section("Tasks", count: project.tasks.count) {
+            let name = (project.root as NSString).lastPathComponent
+            func runTask(_ task: ProjectTasks.Task) {
+                let cmd = project.root == s.cwd ? task.command : "cd \(ShellLexer.escape(project.root)) && \(task.command)"
+                if s.atPrompt { pane.run(cmd) } else { AppDelegate.shared.openTab(cwd: project.root, run: task.command) }
+            }
+            for task in project.tasks.prefix(30) {
+                let symbol = ["dev", "start", "run", "serve", "watch"].contains(task.name) ? "play.circle" : (task.name.contains("test") ? "checkmark.circle" : "hammer")
+                row(symbol: symbol, text: task.name, detail: task.group, color: t.foreground,
+                    tooltip: task.command + (task.detail.map { "\n" + $0 } ?? "") + "\nClick to run in \(name) · right-click for more",
+                    actions: [.init(symbol: "plus.square.on.square", tip: "Run in a new tab") { AppDelegate.shared.openTab(cwd: project.root, run: task.command) }],
+                    menu: {
+                        let m = NSMenu()
+                        m.addItem(ClosureMenuItem(title: "Run") { runTask(task) })
+                        m.addItem(ClosureMenuItem(title: "Run in New Tab") { AppDelegate.shared.openTab(cwd: project.root, run: task.command) })
+                        m.addItem(ClosureMenuItem(title: "Put in Editor") { pane.insertIntoEditor(task.command) })
+                        m.addItem(ClosureMenuItem(title: "Copy Command") { TerminalWindowController.copy(task.command) })
+                        return m
+                    }) { runTask(task) }
+            }
+            if project.tasks.count > 30 {
+                row(symbol: "ellipsis", text: "\(project.tasks.count - 30) more", detail: nil, color: t.dim, action: nil)
+            }
+        }
+
+        // Sections from plugins.
+        for (title, rows) in PluginHost.shared.sections(for: pane) where section(title, count: rows.count) {
+            for r in rows {
+                row(symbol: r.run != nil ? "play.circle" : (r.open != nil ? "arrow.up.forward.square" : "puzzlepiece.extension"), text: r.text, detail: r.detail,
+                    color: TabBarView.color(r.color) ?? t.foreground, tooltip: r.text + (r.run.map { "\nClick to run: \($0)" } ?? "")) {
+                    if let cmd = r.run {
+                        if s.atPrompt { pane.submitFromEditor(cmd) } else { AppDelegate.shared.openTab(cwd: s.cwd, run: cmd) }
+                    } else if let o = r.open, let url = PluginOutput.safeToOpen(o) {
+                        PluginHost.open(url)
+                    }
+                }
+            }
+        }
+
+        // Docker containers (when Docker is running) and Kubernetes pods (when you ask).
+        let cm = ContainerMonitor.shared
+        cm.refreshDocker(env: s.env)
+        if cm.dockerAvailable, !cm.containers.isEmpty, section("Containers", count: cm.containers.filter(\.isRunning).count) {
+            for c in cm.containers {
+                let env = s.env
+                let menu: () -> NSMenu? = {
+                    let m = NSMenu()
+                    m.addItem(ClosureMenuItem(title: "Follow Logs") { AppDelegate.shared.openTab(cwd: nil, run: Containers.logs(c)) })
+                    if c.isRunning {
+                        m.addItem(ClosureMenuItem(title: "Open a Shell Inside") { AppDelegate.shared.openTab(cwd: nil, run: Containers.shell(c)) })
+                        if let port = c.hostPort {
+                            m.addItem(ClosureMenuItem(title: "Open http://localhost:\(port)") { if let u = URL(string: "http://localhost:\(port)") { NSWorkspace.shared.open(u) } })
+                        }
+                        m.addItem(ClosureMenuItem(title: "Restart") { cm.docker(["restart", c.name], env: env) { _ in pane.flash("Restarted \(c.name)") } })
+                        m.addItem(ClosureMenuItem(title: "Stop") { cm.docker(["stop", c.name], env: env) { _ in pane.flash("Stopped \(c.name)") } })
+                    } else {
+                        m.addItem(ClosureMenuItem(title: "Start") { cm.docker(["start", c.name], env: env) { _ in pane.flash("Started \(c.name)") } })
+                    }
+                    m.addItem(.separator())
+                    m.addItem(ClosureMenuItem(title: "Copy Name") { TerminalWindowController.copy(c.name) })
+                    return m
+                }
+                row(symbol: c.isRunning ? "shippingbox.fill" : "shippingbox", text: c.name, detail: c.isRunning ? (c.hostPort.map { ":\($0)" } ?? c.image) : "stopped",
+                    color: c.isRunning ? t.foreground : t.dim, tooltip: "\(c.image)\n\(c.status)\(c.ports.isEmpty ? "" : "\n" + c.ports)\nClick for logs · right-click for more",
+                    actions: c.isRunning ? [.init(symbol: "terminal", tip: "Open a shell inside") { AppDelegate.shared.openTab(cwd: nil, run: Containers.shell(c)) }] : [],
+                    menu: menu) {
+                    AppDelegate.shared.openTab(cwd: nil, run: Containers.logs(c))
+                }
+            }
+        }
+        let kube = CloudContext.current(vars: s.cloudVars).kube
+        if !s.isRemote, let ctx = kube, CommandIndex.shared.contains("kubectl", env: s.env), section("Pods", count: cm.pods[ctx]?.pods.count) {
+            var extra: [String: String] = [:]
+            if let k = s.cloudVars.kubeconfig { extra["KUBECONFIG"] = k }
+            if let list = cm.pods[ctx] {
+                if let err = list.error {
+                    row(symbol: "exclamationmark.triangle", text: "Couldn't list pods", detail: nil, color: t.yellow, tooltip: err, wraps: true, action: nil)
+                }
+                for p in list.pods.prefix(30) {
+                    let menu: () -> NSMenu? = {
+                        let m = NSMenu()
+                        m.addItem(ClosureMenuItem(title: "Follow Logs") { AppDelegate.shared.openTab(cwd: nil, run: Containers.logs(p)) })
+                        m.addItem(ClosureMenuItem(title: "Open a Shell Inside") { AppDelegate.shared.openTab(cwd: nil, run: Containers.shell(p)) })
+                        m.addItem(ClosureMenuItem(title: "Describe") { if s.atPrompt { pane.run(Containers.describe(p)) } else { AppDelegate.shared.openTab(cwd: nil, run: Containers.describe(p)) } })
+                        m.addItem(ClosureMenuItem(title: "Copy Name") { TerminalWindowController.copy(p.name) })
+                        return m
+                    }
+                    row(symbol: p.isHealthy ? "circle.fill" : "exclamationmark.circle", text: p.name, detail: p.statusText,
+                        color: p.isHealthy ? t.foreground : (p.phase == "Pending" ? t.yellow : t.red),
+                        tooltip: "\(p.namespace)/\(p.name)\n\(p.statusText)\nClick for logs · right-click for more", menu: menu) {
+                        AppDelegate.shared.openTab(cwd: nil, run: Containers.logs(p))
+                    }
+                }
+                row(symbol: "arrow.clockwise", text: cm.isLoadingPods(ctx) ? "Loading…" : "Refresh", detail: ctx, color: t.dim, tooltip: "kubectl get pods in \(ctx)") {
+                    cm.loadPods(context: ctx, env: s.env, extra: extra)
+                }
+            } else {
+                row(symbol: "arrow.down.circle", text: cm.isLoadingPods(ctx) ? "Loading pods…" : "Load pods", detail: ctx, color: t.dim,
+                    tooltip: "Lists pods with kubectl in context \(ctx). Only when you click, since the cluster may be far away.") {
+                    cm.loadPods(context: ctx, env: s.env, extra: extra)
+                }
+            }
+        }
+
+        // Commands watched in the background.
+        let watches = OutputWatchManager.shared.watches
+        if !watches.isEmpty, section("Watching", count: watches.count) {
+            for w in watches {
+                let failing = (w.lastExit ?? 0) != 0 && w.lastRun != nil
+                let every = w.intervalMinutes >= 60 ? "\(Int(w.intervalMinutes / 60))h" : "\(Int(w.intervalMinutes))m"
+                let detail = w.lastRun == nil ? "running…" : (failing ? "failing" : (w.lastChange.map { "changed " + RelativeTime.format($0) } ?? "every \(every)"))
+                row(symbol: failing ? "exclamationmark.circle" : (w.changes > 0 ? "eye.trianglebadge.exclamationmark" : "eye"), text: w.command, detail: detail,
+                    color: failing ? t.red : (w.changes > 0 ? t.yellow : t.foreground),
+                    tooltip: "\(w.command)\nEvery \(every) in \(PathDisplay.short(w.cwd)) · \(w.runs) runs, \(w.changes) changes\nClick to see the output · right-click for more",
+                    menu: { [weak self] in OutputWatchManager.shared.menu(for: w, window: self?.window) }) { [weak self] in
+                    OutputWatchManager.shared.showChange(w, over: self?.window)
+                }
+            }
+        }
+
+        // SSH tunnels kept open in the background.
+        let tunnels = Services.shared.config.tunnels
+        if !tunnels.isEmpty, section("Tunnels", count: tunnels.filter { TunnelManager.shared.isOn($0) }.count) {
+            let tm = TunnelManager.shared
+            for tn in tunnels {
+                let state = tm.state(tn)
+                let (symbol, color, detail): (String, NSColor, String) = {
+                    switch state {
+                    case .stopped: return ("circle", t.dim, "off")
+                    case .starting: return ("circle.dotted", t.yellow, "opening…")
+                    case .up: return ("circle.fill", t.green, ":\(tn.localPort)")
+                    case .retrying: return ("arrow.clockwise.circle", t.yellow, "reconnecting")
+                    case .failed: return ("exclamationmark.circle", t.red, "failed")
+                    }
+                }()
+                var tip = tn.summary
+                if case let .failed(why) = state { tip += "\n" + why }
+                if case let .retrying(_, why) = state { tip += "\n" + why }
+                row(symbol: symbol, text: tn.name.isEmpty ? tn.host : tn.name, detail: detail, color: color,
+                    tooltip: tip + "\nClick to open or close · right-click for more", menu: { tm.menu(for: tn, pane: pane) }) {
+                    tm.toggle(tn)
+                }
+            }
+            row(symbol: "plus", text: "Add tunnel…", detail: nil, color: t.dim) { [weak self] in tm.edit(nil, over: self?.window) }
+        }
+
         if section("Recent folders") {
         // Where you are, highlighted, then recent folders with their parent folder
         // in gray so look-alike names ("src", "app") can be told apart.
@@ -170,36 +369,110 @@ final class SidebarView: NSView {
             }
         }
 
-        // Saved commands from the Command Notebook: click puts one in the editor.
-        let notebook = (try? Notebook.load(from: NotebookWindow.fileURL)) ?? Notebook()
-        if section("Notebook", count: notebook.entryCount) {
-            for g in notebook.groups where !g.entries.isEmpty {
-                for e in g.entries.prefix(12) {
-                    row(symbol: "book.closed", text: e.displayTitle, detail: notebook.groups.count > 1 ? g.name : nil, color: t.foreground,
-                        tooltip: e.command + (e.note.isEmpty ? "" : "\n\n" + e.note) + "\nClick to put it in the editor", wraps: true) {
-                        pane.insertIntoEditor(e.command)
-                    }
-                }
-            }
-            row(symbol: notebook.entryCount == 0 ? "plus" : "book", text: notebook.entryCount == 0 ? "Save a command…" : "Open Notebook…",
-                detail: "⌥⌘N", color: t.dim) {
-                if notebook.entryCount == 0 { pane.saveToNotebook() } else { NotebookWindow.shared.show() }
-            }
-        }
-
-        // Saved workflows (personal and this project's): click to run, with its parameter form.
-        let workflows = s.isRemote ? [] : WorkflowStore.load(cwd: s.cwd)
-        if !workflows.isEmpty, section("Workflows", count: workflows.count) {
-            for w in workflows.prefix(10) {
-                row(symbol: w.source == .project ? "folder.badge.gearshape" : "list.bullet.rectangle", text: w.name,
-                    detail: "\(w.steps.count) step\(w.steps.count == 1 ? "" : "s")", color: t.foreground,
-                    tooltip: (w.description.map { $0 + "\n" } ?? "") + w.steps.joined(separator: "\n") + "\nClick to view and run", wraps: true) { [weak self] in
-                    self?.controller?.showWorkflows(for: pane)
-                }
-            }
-        }
-
+        // Saved things (Notebook, workflows, runbooks) live in the panel on the right;
+        // the sidebar keeps to where you are and what's running. See addSavedRow().
     }
+
+    // MARK: Customizing
+
+    /// Puts sections in your order, and adds a row for the ones you hid.
+    private func arrangeSections() {
+        let views = stack.arrangedSubviews
+        guard !sectionStarts.isEmpty else { addHiddenRow(); addSavedRow(); return }
+        var chunks: [(title: String, views: [NSView], original: Int)] = []
+        for (i, start) in sectionStarts.enumerated() {
+            let end = i + 1 < sectionStarts.count ? sectionStarts[i + 1].index : views.count
+            chunks.append((start.title, Array(views[start.index..<max(start.index, end)]), i))
+        }
+        let order = SidebarPrefs.order
+        let ranked = chunks.sorted { a, b in
+            let ra = order.firstIndex(of: a.title) ?? (1000 + a.original), rb = order.firstIndex(of: b.title) ?? (1000 + b.original)
+            return ra < rb
+        }
+        orderedSections = ranked.map(\.title)
+        if ranked.map(\.title) != chunks.map(\.title) {
+            for v in views { stack.removeArrangedSubview(v) }
+            for (ci, c) in ranked.enumerated() {
+                for v in c.views { stack.addArrangedSubview(v) }
+                if ci > 0, let prevLast = ranked[ci - 1].views.last { stack.setCustomSpacing(12, after: prevLast) }
+                if let header = c.views.first { stack.setCustomSpacing(4, after: header) }
+            }
+            sectionTitles = ranked.compactMap { c in (c.views.first as? SidebarHeader)?.titleText }
+        }
+        addHiddenRow()
+        addSavedRow()
+    }
+
+    /// One link to the Saved panel when it's closed, so saved commands are a click away without repeating them here.
+    private(set) var savedRowText: String?
+    private func addSavedRow() {
+        savedRowText = nil
+        guard let pane = lastPane, controller?.notebookPanelVisible != true else { return }
+        let t = GhosttyRuntime.shared.theme
+        let s = pane.session
+        let notebook = (try? Notebook.load(from: NotebookWindow.fileURL)) ?? Notebook()
+        let flows = s.isRemote ? 0 : WorkflowStore.load(cwd: s.cwd).count
+        let books = s.isRemote ? 0 : Runbook.load(cwd: s.cwd).count
+        let total = notebook.entryCount + flows + books
+        if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(12, after: last) }
+        let text = total == 0 ? "Saved commands" : "Saved commands · \(total)"
+        savedRowText = text
+        row(symbol: "book.closed", text: text, detail: "⌥⌘N", color: t.dim,
+            tooltip: "Your Notebook (workflows included) and runbooks, in the panel on the right") { [weak self] in
+            self?.controller?.toggleNotebookPanel()
+        }
+    }
+
+    private func addHiddenRow() {
+        guard !hiddenNow.isEmpty, let pane = lastPane else { return }
+        let t = GhosttyRuntime.shared.theme
+        if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(12, after: last) }
+        let names = hiddenNow
+        row(symbol: "eye.slash", text: "\(names.count) hidden section\(names.count == 1 ? "" : "s")", detail: nil, color: t.dim,
+            tooltip: names.joined(separator: ", ") + "\nClick to show one again", menu: { [weak self] in self?.hiddenMenu(names) }) { [weak self] in
+            guard let self, let m = self.hiddenMenu(names) else { return }
+            m.popUp(positioning: nil, at: NSPoint(x: 20, y: 0), in: self.stack.arrangedSubviews.last ?? self)
+        }
+        _ = pane
+    }
+
+    private func hiddenMenu(_ names: [String]) -> NSMenu? {
+        let m = NSMenu()
+        for n in names { m.addItem(ClosureMenuItem(title: "Show “\(n)”") { [weak self] in SidebarPrefs.setHidden(n, false); self?.rebuildNow() }) }
+        m.addItem(.separator())
+        m.addItem(ClosureMenuItem(title: "Show All") { [weak self] in SidebarPrefs.hidden = []; self?.rebuildNow() })
+        return m
+    }
+
+    private func headerMenu(_ title: String) -> NSMenu {
+        let m = NSMenu()
+        let i = orderedSections.firstIndex(of: title) ?? 0
+        let top = ClosureMenuItem(title: "Move to Top") { [weak self] in self?.move(title, to: 0) }
+        top.isEnabled = i > 0
+        let up = ClosureMenuItem(title: "Move Up") { [weak self] in self?.move(title, to: i - 1) }
+        up.isEnabled = i > 0
+        let down = ClosureMenuItem(title: "Move Down") { [weak self] in self?.move(title, to: i + 1) }
+        down.isEnabled = i < orderedSections.count - 1
+        for item in [top, up, down] { m.addItem(item) }
+        m.addItem(.separator())
+        m.addItem(ClosureMenuItem(title: "Hide “\(title)”") { [weak self] in SidebarPrefs.setHidden(title, true); self?.rebuildNow() })
+        m.addItem(ClosureMenuItem(title: "Reset Sidebar") { [weak self] in SidebarPrefs.order = []; SidebarPrefs.hidden = []; self?.rebuildNow() })
+        return m
+    }
+
+    /// Moves a section and remembers the whole order.
+    func move(_ title: String, to index: Int) {
+        var order = orderedSections
+        guard let from = order.firstIndex(of: title) else { return }
+        order.remove(at: from)
+        order.insert(title, at: max(0, min(order.count, index)))
+        // Keep sections that aren't showing right now (no servers, say) in their saved place too.
+        let rest = SidebarPrefs.order.filter { !order.contains($0) }
+        SidebarPrefs.order = order + rest
+        rebuildNow()
+    }
+
+    func rebuildNow() { if let p = lastPane { build(pane: p, changes: lastChanges) } }
 
     private func confirmDiscard(_ path: String, then go: @escaping () -> Void) {
         let a = NSAlert()
@@ -215,10 +488,14 @@ final class SidebarView: NSView {
     /// Adds a section header; returns false when the section is folded.
     @discardableResult
     private func section(_ title: String, count: Int? = nil) -> Bool {
+        // Hidden sections aren't built at all.
+        if SidebarPrefs.hidden.contains(title) { hiddenNow.append(title); return false }
+        sectionStarts.append((title, stack.arrangedSubviews.count))
         let folded = collapsedSections.contains(title)
         let text = title.uppercased() + (count.map { " · \($0)" } ?? "")
         sectionTitles.append(text)
         let h = SidebarHeader(title: text, folded: folded) { [weak self] in self?.toggleSection(title) }
+        h.menuProvider = { [weak self] in self?.headerMenu(title) }
         if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(12, after: last) }
         stack.addArrangedSubview(h)
         h.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
@@ -242,8 +519,13 @@ final class SidebarView: NSView {
 /// A clickable section title with a fold arrow.
 private final class SidebarHeader: NSView {
     private let action: () -> Void
+    let titleText: String
+    /// Right-click: move or hide the section.
+    var menuProvider: (() -> NSMenu?)?
+    override func menu(for event: NSEvent) -> NSMenu? { menuProvider?() }
     init(title: String, folded: Bool, action: @escaping () -> Void) {
         self.action = action
+        titleText = title
         super.init(frame: NSRect(x: 0, y: 0, width: 200, height: 18))
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 18).isActive = true
@@ -422,4 +704,26 @@ final class ClosureButton: NSButton {
     }
     required init?(coder: NSCoder) { fatalError() }
     @objc private func fire() { run() }
+}
+
+/// Your sidebar order and hidden sections.
+enum SidebarPrefs {
+    /// Tests keep these in their own store.
+    static var defaults: UserDefaults = .standard
+
+    static var order: [String] {
+        get { defaults.stringArray(forKey: "sidebarOrder") ?? [] }
+        set { defaults.set(newValue, forKey: "sidebarOrder") }
+    }
+
+    static var hidden: Set<String> {
+        get { Set(defaults.stringArray(forKey: "sidebarHidden") ?? []) }
+        set { defaults.set(Array(newValue).sorted(), forKey: "sidebarHidden") }
+    }
+
+    static func setHidden(_ title: String, _ on: Bool) {
+        var h = hidden
+        if on { h.insert(title) } else { h.remove(title) }
+        hidden = h
+    }
 }

@@ -114,11 +114,76 @@ extension PaneView {
 
     // MARK: Actions from the status row
 
+    /// The local job in front of this pane's shell (nil at the prompt, for ssh sessions, or before the shell said hello).
+    var foregroundJob: ForegroundJob.Info? {
+        guard !session.isRemote, session.shellPID > 1, !session.atPrompt else { return nil }
+        return ForegroundJob.of(shellPID: session.shellPID)
+    }
+
+    /// A command that opens a full-screen program itself (`git branch` → less, `git log`, `psql` → less)
+    /// gets the whole window, like vim does, so q, arrows and search reach it.
+    func checkForegroundProgram() {
+        guard let job = foregroundJob else {
+            if fullscreenDetected { leaveDetectedFullscreen() }
+            return
+        }
+        let apps = Set(Services.shared.config.fullscreenApps)
+        let inFront = job.names.contains { apps.contains($0) }
+        if inFront, !fullscreenProgram {
+            fullscreenProgram = true
+            fullscreenDetected = true
+            needsLayout = true
+            layoutSubtreeIfNeeded()
+            if isFocusedPane { window?.makeFirstResponder(surfaceView) }
+        } else if !inFront, fullscreenDetected {
+            leaveDetectedFullscreen()
+        }
+    }
+
+    private func leaveDetectedFullscreen() {
+        fullscreenDetected = false
+        fullscreenProgram = false
+        needsLayout = true
+    }
+
+    /// Stop: ⌃C first. A pager (which ignores ⌃C) is ended right away; anything else
+    /// still running gets SIGTERM on the next click, then SIGKILL.
     @objc func stopRunning() {
-        sendControl("c")
         if let wc = windowController, wc.isBroadcasting(self) {
             for p in wc.panes(inSameTabAs: self) where p !== self && !p.session.atPrompt { p.sendControl("c") }
         }
+        let job = foregroundJob
+        if let job, ForegroundJob.isPager(job) {
+            ForegroundJob.send(SIGTERM, to: job)
+            Services.shared.record("stop.pager")
+            return
+        }
+        stopPresses += 1
+        switch stopPresses {
+        case 1:
+            sendControl("c")
+            let command = session.running?.command
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self, self.stopPresses == 1, !self.session.atPrompt, self.session.running?.command == command else { return }
+                self.updateStopButton()
+                self.flash("Still running: click Force Stop to end it")
+            }
+        case 2:
+            if let job { ForegroundJob.send(SIGTERM, to: job) } else { sendControl("c") }
+            Services.shared.record("stop.term")
+            updateStopButton()
+        default:
+            if let job { ForegroundJob.send(SIGKILL, to: job) } else { sendControl("c") }
+            Services.shared.record("stop.kill")
+        }
+    }
+
+    /// "Stop", then "Force Stop" once ⌃C didn't end it.
+    func updateStopButton() {
+        let force = stopPresses >= 1 && !session.atPrompt
+        stopButton.title = force ? " Force Stop" : " Stop"
+        stopButton.toolTip = force ? "End the program now (it didn't stop on ⌃C)" : "Stop the running program (⌃C; click again to force it)"
+        needsLayout = true
     }
 
     // MARK: Running from the editor
@@ -158,7 +223,9 @@ extension PaneView {
             }
             return
         }
-        guard let p = profile, p.needsConfirmation(command), let w = window else { go(); return }
+        // A folder/host profile, or one for the cloud context this command talks to (e.g. a prod cluster).
+        guard let p = [profile, contextProfile(for: command)].compactMap({ $0 }).first(where: { $0.needsConfirmation(command) }),
+              let w = window else { go(); return }
         let a = NSAlert()
         a.alertStyle = .warning
         a.messageText = "Run this \(p.badge.map { "on \($0)" } ?? "here")?"
@@ -340,7 +407,11 @@ extension PaneView {
     }
 
     func showResultMenu() {
-        guard let last = session.blocks.last else { return }
+        resultMenu()?.popUp(positioning: nil, at: NSPoint(x: statusChip.frame.minX, y: statusChip.frame.maxY + 4), in: bar)
+    }
+
+    func resultMenu() -> NSMenu? {
+        guard let last = session.blocks.last else { return nil }
         let m = NSMenu()
         func add(_ title: String, _ symbol: String, _ action: @escaping () -> Void) {
             let item = ClosureMenuItem(title: title, action: action)
@@ -355,11 +426,11 @@ extension PaneView {
         }
         add("Copy Output", "doc.on.clipboard") { AppDelegate.shared.copyLastOutput(nil) }
         add("Copy Command", "terminal") { TerminalWindowController.copy(last.command) }
-        add("Show in Commands List", "square.stack.3d.up") { [weak self] in
+        add("Find in This Tab’s Commands", "square.stack.3d.up") { [weak self] in
             guard let self else { return }
             self.windowController?.showBlocks(for: self)
         }
-        m.popUp(positioning: nil, at: NSPoint(x: statusChip.frame.minX, y: statusChip.frame.maxY + 4), in: bar)
+        return m
     }
 
 }

@@ -65,7 +65,28 @@ public final class ScriptRunner: Sendable {
         await Self.execute(argv, cwd: cwd, env: env, timeout: timeout)
     }
 
-    static func execute(_ argv: [String], cwd: String, env: ShellEnvironment, timeout: TimeInterval) async -> String? {
+    /// Runs with extra environment variables (plugins get ANSER_CWD and friends).
+    public func run(argv: [String], cwd: String, env: ShellEnvironment, extra: [String: String], timeout: TimeInterval) async -> String? {
+        await Self.execute(argv, cwd: cwd, env: env, timeout: timeout, extra: extra)
+    }
+
+    /// Runs and also returns the exit status (nil when it couldn't start or was stopped).
+    public func runWithStatus(argv: [String], cwd: String, env: ShellEnvironment, extra: [String: String] = [:], timeout: TimeInterval) async -> (output: String, status: Int32?) {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let dir = FileManager.default.fileExists(atPath: cwd) ? cwd : env.home
+                var e = ProcessInfo.processInfo.environment
+                e["PATH"] = env.pathString
+                for (k, v) in GitSafety.environment { e[k] = v }
+                e["NO_COLOR"] = "1"
+                for (k, v) in extra { e[k] = v }
+                guard let r = ProcessRunner.run(argv, cwd: dir, environment: e, timeout: timeout) else { cont.resume(returning: ("couldn't start \(argv.first ?? "")", nil)); return }
+                cont.resume(returning: (String(decoding: r.output, as: UTF8.self), r.exitStatus))
+            }
+        }
+    }
+
+    static func execute(_ argv: [String], cwd: String, env: ShellEnvironment, timeout: TimeInterval, extra: [String: String] = [:]) async -> String? {
         await withCheckedContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let dir = FileManager.default.fileExists(atPath: cwd) ? cwd : env.home
@@ -77,6 +98,7 @@ public final class ScriptRunner: Sendable {
                 e["PAGER"] = "cat"
                 e["MANPAGER"] = "cat"
                 e["TERM"] = "dumb"
+                for (k, v) in extra { e[k] = v }
                 guard let r = ProcessRunner.run(argv, cwd: dir, environment: e, timeout: timeout) else {
                     cont.resume(returning: nil); return
                 }
@@ -94,7 +116,7 @@ public final class ScriptRunner: Sendable {
 /// Native generators that specs can reference by name.
 public enum Generators {
     public static let names = [
-        "git_branches", "git_local_branches", "git_remote_branches", "git_remotes", "git_tags",
+        "git_branches", "git_local_branches", "git_remote_branches", "git_switch_branches", "git_remotes", "git_tags",
         "git_changed_files", "git_staged_files", "git_stashes", "git_commits", "git_aliases",
         "npm_scripts", "make_targets", "ssh_hosts", "processes", "env_vars", "commands",
         "brew_installed", "docker_containers", "docker_images", "just_recipes",
@@ -121,6 +143,18 @@ public enum Generators {
                 let when = parts.count > 1 ? RelativeTime.format(unix: parts[1]) : nil
                 let desc = [when, parts.count > 2 ? parts[2] : nil].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
                 res.append(Suggestion(name: n, description: desc.isEmpty ? nil : String(desc.prefix(80))))
+            }
+            return res
+        case "git_switch_branches":
+            // `git switch` takes "feature", not "origin/feature": remote-only branches go in by their short name.
+            let locals = await run("git_local_branches", cwd: cwd, env: env)
+            var have = Set(locals.map(\.name))
+            var res = locals
+            for b in await run("git_remote_branches", cwd: cwd, env: env) {
+                guard let slash = b.name.firstIndex(of: "/") else { continue }
+                let short = String(b.name[b.name.index(after: slash)...])
+                guard !short.isEmpty, have.insert(short).inserted else { continue }
+                res.append(Suggestion(name: short, description: ["remote", b.description].compactMap { $0 }.joined(separator: " · ")))
             }
             return res
         case "git_remotes":

@@ -58,8 +58,32 @@ if [[ -n "$ANSER_FIFO" && -p "$ANSER_FIFO" ]] && exec 249<>"$ANSER_FIFO"; then
     }
     _anser_send() { builtin printf '%s\n' "$1" >&249 2>/dev/null; }
 
+    # ESC [9990~ loads a project's environment that Anser wrote to a file.
+    _anser_load_dir=$ANSER_LOAD_DIR
+    unset ANSER_LOAD_DIR
+    _anser_load() {
+        local f="$_anser_load_dir/load-$$.sh"
+        [[ -n $_anser_load_dir && -f $f && -O $f ]] || return 0
+        builtin source "$f"
+        command rm -f -- "$f"
+        _anser_ctx=""
+    }
+    for _anser_km in emacs vi-insert vi-command; do
+        builtin bind -m "$_anser_km" -x '"\e[9990~": _anser_load' 2>/dev/null
+    done
+    unset _anser_km
+    [[ -n $_anser_load_dir ]] && _anser_send "caps"$'\t'"load"
+    # Aliases you made in Anser (Tools → Aliases…).
+    [[ -r "$ANSER_ALIASES" ]] && builtin source "$ANSER_ALIASES"
+    unset ANSER_ALIASES
+
     _anser_precmd() {
         local ec=$?
+        local ctx="${AWS_PROFILE:-$AWS_VAULT}"$'\t'"$KUBECONFIG"$'\t'"$DOCKER_CONTEXT"$'\t'"$CLOUDSDK_CORE_PROJECT"$'\t'"$VIRTUAL_ENV"
+        if [[ "$ctx" != "$_anser_ctx" ]]; then
+            _anser_ctx=$ctx
+            _anser_send "ctx"$'\t'"$ctx"
+        fi
         if [[ "$PATH" != "$_anser_path" ]]; then
             _anser_path=$PATH
             _anser_esc "$PATH"
@@ -111,3 +135,6 @@ if [[ -n "$ANSER_FIFO" && -p "$ANSER_FIFO" ]] && exec 249<>"$ANSER_FIFO"; then
     precmd_functions=(_anser_precmd "${precmd_functions[@]}")
     preexec_functions+=(_anser_preexec)
 fi
+
+# Anser's self-test: keep its commands out of the user's real shell history.
+[[ -n "${ANSER_PRIVATE_HISTFILE:-}" ]] && HISTFILE=$ANSER_PRIVATE_HISTFILE

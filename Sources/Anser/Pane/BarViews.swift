@@ -118,11 +118,39 @@ final class GutterView: NSView {
 }
 
 /// A small icon + text label used in the status row.
+/// What a status-row chip means; each has one color everywhere.
+enum ChipRole {
+    /// Something went wrong (failed command, failed tests, conflicts).
+    case problem
+    /// Waiting on you or on something queued (a prompt, a reconnect, "then run…").
+    case waiting
+    /// Facts about now (servers, watching, loaded environment).
+    case info
+    /// Something Anser offers (an alias, a fix, loading a .env). Fades after a while.
+    case suggestion
+
+    func color(_ t: Theme) -> NSColor {
+        switch self {
+        case .problem: t.red
+        case .waiting: .systemOrange
+        case .info: t.blue
+        case .suggestion: t.green
+        }
+    }
+}
+
 final class ChipView: NSView {
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
     private var tracking: NSTrackingArea?
-    private var hovering = false { didSet { needsDisplay = true } }
+    private var hovering = false { didSet { needsDisplay = true; updateAlpha() } }
+    /// Suggestions fade a little once they've been showing a while (hovering brings them back).
+    var faded = false { didSet { if faded != oldValue { updateAlpha() } } }
+    /// Set by `set(role:…)`: suggestions take part in fading.
+    private(set) var role: ChipRole?
+    /// When the current text first showed (for fading).
+    private(set) var shownSince: Date?
+    private func updateAlpha() { alphaValue = faded && !hovering ? 0.45 : 1 }
     /// Filled pill look (used for action chips like "Fix").
     var filled: NSColor? { didSet { needsDisplay = true } }
     var onClick: (() -> Void)?
@@ -142,7 +170,17 @@ final class ChipView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Sets a chip by meaning: the color comes from the role, and `filled` gives the pill look for things you can act on.
+    func set(role: ChipRole, symbol: String?, text: String, tooltip: String? = nil, filled: Bool = false, theme: Theme) {
+        let c = role.color(theme)
+        self.filled = filled ? c : nil
+        self.role = role
+        set(symbol: symbol, text: text, color: c, tooltip: tooltip)
+    }
+
     func set(symbol: String?, text: String, color: NSColor, tooltip: String? = nil) {
+        if text != label.stringValue { shownSince = text.isEmpty ? nil : Date(); faded = false }
+        if text.isEmpty { role = nil }
         icon.image = symbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }
         icon.contentTintColor = color
         icon.isHidden = icon.image == nil
@@ -154,6 +192,10 @@ final class ChipView: NSView {
         setAccessibilityRole(onClick != nil ? .button : .staticText)
         setAccessibilityLabel(text + (tooltip.map { ". " + $0.replacingOccurrences(of: "\n", with: ". ") } ?? ""))
     }
+
+    var text: String { label.stringValue }
+    var textColorForTests: NSColor? { label.textColor }
+    var image: NSImage? { icon.image }
 
     private var inset: CGFloat { filled != nil ? 7 : 3 }
 

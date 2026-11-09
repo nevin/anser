@@ -546,6 +546,24 @@ final class SafetyTests: XCTestCase {
         try? FileManager.default.removeItem(at: repo); try? FileManager.default.removeItem(at: clean)
     }
 
+    /// `git switch` suggestions: local branches, plus remote-only ones by the short name git accepts.
+    func testSwitchBranchSuggestions() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("switch-\(UUID().uuidString)")
+        let repo = base.appendingPathComponent("repo")
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        sh("""
+            git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init \
+            && git init -q --bare ../origin.git && git remote add origin ../origin.git \
+            && git branch feature/x && git branch shared && git push -q origin main feature/x shared \
+            && git branch -D feature/x
+            """, in: repo)
+        let names = await Generators.run("git_switch_branches", cwd: repo.path, env: ShellEnvironment()).map(\.name)
+        XCTAssertTrue(names.contains("main") && names.contains("shared") && names.contains("feature/x"), "\(names)")
+        XCTAssertFalse(names.contains { $0.hasPrefix("origin/") }, "\(names)")
+        XCTAssertEqual(names.filter { $0 == "shared" }.count, 1)
+        try? FileManager.default.removeItem(at: base)
+    }
+
     func testOpenSafety() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("open-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir.appendingPathComponent("Evil.app"), withIntermediateDirectories: true)

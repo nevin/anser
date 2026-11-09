@@ -24,12 +24,70 @@ final class PaneView: NSView, ShellSessionDelegate {
     let statusChip = ChipView()
     let changesChip = ChipView()
     let fixChip = ChipView()
-    private let explainChip = ChipView()
+    let explainChip = ChipView()
     private let badgeChip = ChipView()
     private let broadcastChip = ChipView()
     private let prChip = ChipView()
     private let conflictChip = ChipView()
     private let shareChip = ChipView()
+    let waitChip = ChipView()
+    let serverChip = ChipView()
+    let contextChip = ChipView()
+    let reconnectChip = ChipView()
+    let testsChip = ChipView()
+    let watchChip = ChipView()
+    let afterChip = ChipView()
+    let envChip = ChipView()
+    let aliasChip = ChipView()
+    let logChip = ChipView()
+    let recChip = ChipView()
+    let hintChip = ChipView()
+    /// "+3": the chips that didn't fit (or are over the limit), in a menu.
+    let moreChip = ChipView()
+    /// At most this many chips besides the folder and branch, so the row stays calm.
+    static let maxExtraChips = 4
+    private var fadeWork: DispatchWorkItem?
+    let forwardChip = ChipView()
+    /// What fixed this command last time it failed (from history).
+    var fixHint: (command: String, steps: [String])?
+    /// Ports a program in this ssh tab announced, and the ones forwarded to this Mac.
+    var remotePortsSeen: [Int] = []
+    var forwardedPorts: [Int: SSHTunnel] = [:]
+    var dismissedRemotePorts: Set<Int> = []
+    /// Shell code to send at the next prompt (alias changes made while a command ran).
+    var pendingShellScript: String?
+    /// The alias suggestion showing in the status row.
+    var aliasTip: (command: String, name: String, existing: Bool)?
+    /// Recording this tab (Shell → Record This Tab).
+    var recorder: TabRecorder?
+    /// Failed tests from the last test command (see TestFailures).
+    var testReport: (report: TestFailures.Report, command: String, cwd: String)?
+    /// One-shot callbacks for the next command that finishes: (block, output).
+    var finishWatchers: [(ShellSession.Block, String) -> Void] = []
+    /// What to do when the running command finishes (notify, run next).
+    var afterSteps: [AfterStep] = []
+    /// Re-runs a command when files change.
+    var fileWatch: FileWatch?
+    /// The project environment Anser loaded into this shell, or is offering to.
+    var envLoaded: ProjectEnv.Loaded?
+    var envOffer: ProjectEnv.Found?
+    var envCheckedCwd: String?
+    var lastHandledFinish: UUID?
+    /// Names of failed tests being re-run from the tests chip.
+    var pendingTestRerun: Set<String>?
+    /// The last environment script handed to the shell (for tests).
+    var lastEnvScript: String?
+    /// A running program is waiting for an answer (see InputWait).
+    var waitState: InputWait.Wait?
+    var waitScreen = ""
+    var waitScreenChangedAt = Date()
+    /// A dropped ssh session being reconnected (or offered).
+    var reconnect: ReconnectState?
+    /// Filter Output (⌃⌘O), over the terminal.
+    var filterPanel: OutputFilterPanel?
+    var cloudCache: (at: Date, vars: CloudContext.Vars, ctx: CloudContext)?
+    /// Chips from plugins (see PluginHost).
+    var pluginChipViews: [ChipView] = []
     /// Settings from a matching profile (Settings → Profiles).
     var profile: Profile?
     var pullRequest: GitInfo.PullRequest?
@@ -50,6 +108,9 @@ final class PaneView: NSView, ShellSessionDelegate {
     private let hintLabel = NSTextField(labelWithString: "")
     var buttons: [NSButton] = []
     private let moreButton = NSButton()
+    private var overflowChips: [ChipView] = []
+    /// Texts of the chips folded under "+N" (tests).
+    var overflowChipTexts: [String] { overflowChips.map(\.text) }
     /// Shown above the terminal when the tab is split.
     private let header = PaneHeaderView()
     /// Dims the terminal of panes that don't have focus.
@@ -74,6 +135,10 @@ final class PaneView: NSView, ShellSessionDelegate {
     private var closed = false
     /// A full-screen program (vim, less…) is running: the bar steps aside.
     var fullscreenProgram = false
+    /// Set when a command opened a full-screen program itself (git → less), so it's undone when that ends.
+    var fullscreenDetected = false
+    /// Stop presses for the running command: ⌃C, then SIGTERM, then SIGKILL.
+    var stopPresses = 0
     var findBar: FindBar?
     /// File being edited in $EDITOR; read back at the next prompt.
     var externalEditFile: String?
@@ -81,6 +146,7 @@ final class PaneView: NSView, ShellSessionDelegate {
     /// Top edge of the bar when it follows the output (pane coordinates), or
     /// nil when it sits at the bottom of the pane.
     private(set) var followTop: CGFloat?
+    private(set) var viewportAtBottom = true
     private var followCheckScheduled = false
     private var followTimer: Timer?
 
@@ -190,7 +256,9 @@ final class PaneView: NSView, ShellSessionDelegate {
 
         hintLabel.font = .systemFont(ofSize: 11)
         hintLabel.lineBreakMode = .byTruncatingTail
-        for v in [badgeChip, broadcastChip, shareChip, cwdChip, branchChip, prChip, conflictChip, changesChip, statusChip, fixChip, explainChip, hintLabel] as [NSView] { bar.addSubview(v) }
+        for v in [waitChip, reconnectChip, badgeChip, contextChip, broadcastChip, shareChip, cwdChip, branchChip, prChip, conflictChip, changesChip,
+                  serverChip, statusChip, fixChip, explainChip, hintLabel] as [NSView] { bar.addSubview(v) }
+        setUpLiveChips()
         shareChip.onClick = { [weak self] in
             guard let self, let s = TabShare.share(for: self) else { return }
             self.showShareMenu(s)
@@ -232,7 +300,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         stopButton.bezelStyle = .rounded
         stopButton.controlSize = .small
         stopButton.font = .systemFont(ofSize: 11, weight: .medium)
-        stopButton.toolTip = "Send ⌃C to the running program"
+        stopButton.toolTip = "Stop the running program (⌃C; click again to force it)"
         stopButton.target = self
         stopButton.action = #selector(stopRunning)
         stopButton.isHidden = true
@@ -251,7 +319,7 @@ final class PaneView: NSView, ShellSessionDelegate {
             buttons.append(b)
         }
         button("clock.arrow.circlepath", "Search history (⌘R or ⌃R)", #selector(AppDelegate.historySearch(_:)))
-        button("square.stack.3d.up", "Commands in this tab (⌘B)", #selector(AppDelegate.blockNavigator(_:)))
+        button("square.stack.3d.up", "Search this tab’s commands (⌘B)", #selector(AppDelegate.blockNavigator(_:)))
         button("doc.on.clipboard", "Copy last output (⇧⌘C)", #selector(AppDelegate.copyLastOutput(_:)))
         button("arrow.up.left.and.arrow.down.right", "Expand editor (⇧⌘E)", #selector(AppDelegate.toggleExpandedEditor(_:)))
         button("command", "Command palette (⇧⌘P)", #selector(AppDelegate.commandPalette(_:)))
@@ -313,6 +381,10 @@ final class PaneView: NSView, ShellSessionDelegate {
         if let fb = findBar {
             fb.frame.origin = NSPoint(x: max(8, w - fb.frame.width - 12), y: bounds.height - fb.frame.height - 10)
         }
+        if let fp = filterPanel {
+            let fh = min(max(160, target.height * 0.6), target.height - 8)
+            fp.frame = NSRect(x: 8, y: target.maxY - fh - 6, width: max(200, w - 16), height: fh)
+        }
         let h = barHeight
         followTop = computeFollowTop()
         let barY = followTop.map { max(0, $0 - h) } ?? 0
@@ -345,35 +417,70 @@ final class PaneView: NSView, ShellSessionDelegate {
                                     width: max(20, runningHint.frame.minX - rlx - 12), height: runningLabel.frame.height)
         runningHint.isHidden = !showRunning || runningLabel.frame.width < 120
 
-        // Status row. Priority: chips, then buttons (folded into "…" when
-        // tight), then the hint text in whatever room is left.
-        // Chips sit centered in the status row, their left edge in line with the editor box.
+        // Reserve room for the actions menu before placing any chips.
         let y = ((Self.statusHeight - Self.chipHeight) / 2).rounded()
-        let chips = [badgeChip, broadcastChip, shareChip, cwdChip, branchChip, prChip, conflictChip, changesChip, statusChip, fixChip, explainChip].filter { !$0.isHidden }
-        var chipWidths = chips.map(\.preferredWidth)
-        let spacing = CGFloat(max(0, chips.count - 1)) * 8
-        let roomForChips = w - 2 * pad - 30
-        // Shrink the folder chip first (its path truncates from the left).
-        if let i = chips.firstIndex(where: { $0 === cwdChip }), chipWidths.reduce(0, +) + spacing > roomForChips {
-            let others = chipWidths.reduce(0, +) - chipWidths[i]
-            chipWidths[i] = max(70, roomForChips - others - spacing)
-        }
-        var bx = w - pad
+        let chips = [recChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, badgeChip, contextChip, envChip, broadcastChip, shareChip, cwdChip, branchChip, prChip, conflictChip, changesChip,
+                     serverChip, statusChip, testsChip, fixChip, hintChip, explainChip, aliasChip] + pluginChipViews
+        let moreX = w - pad - 18
         buttons.forEach { $0.isHidden = true }
         moreButton.isHidden = false
-        bx -= 18
-        moreButton.frame = NSRect(x: bx, y: ((Self.statusHeight - 18) / 2).rounded(), width: 18, height: 18)
-        bx -= 8
-        var x = pad
-        for (chip, cw) in zip(chips, chipWidths) {
-            chip.frame = NSRect(x: x, y: y, width: min(cw, max(40, bx - x - 4)), height: Self.chipHeight)
-            x = chip.frame.maxX + 8
+        moreButton.frame = NSRect(x: moreX, y: ((Self.statusHeight - 18) / 2).rounded(), width: 18, height: 18)
+
+        let spacing: CGFloat = 8
+        let room = moreX - spacing - pad
+        // Recording, sharing and typing in all panes affect privacy or where input goes: they come first and never fold into +N.
+        let mustShow: [ChipView] = [recChip, shareChip, broadcastChip]
+        let priorities = mustShow + [waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, hintChip, badgeChip, contextChip, conflictChip, statusChip, testsChip, cwdChip, serverChip,
+                          envChip, fixChip, aliasChip, branchChip, changesChip, prChip, explainChip] + pluginChipViews
+        var active = priorities.filter { !$0.text.isEmpty }.map { ($0, $0.preferredWidth) }
+        // Keep the row calm: the folder and branch, plus the most important few.
+        var extras = 0
+        active = active.filter { chip, _ in
+            if chip === cwdChip || chip === branchChip || mustShow.contains(where: { $0 === chip }) { return true }
+            extras += 1
+            return extras <= Self.maxExtraChips
         }
+        let overLimit = priorities.filter { !$0.text.isEmpty }.count - active.count
+        let moreRoom: CGFloat = 34
+        let excess = max(0, active.reduce(CGFloat.zero) { $0 + $1.1 + spacing } - spacing - room + (overLimit > 0 ? moreRoom : 0))
+        var widths: [ObjectIdentifier: CGFloat] = [:]
+        var remaining = room + spacing - (overLimit > 0 ? moreRoom : 0)
+        for (chip, preferred) in active {
+            let width = chip === cwdChip ? max(min(preferred, 70), preferred - excess) : preferred
+            let must = mustShow.contains { $0 === chip }
+            guard must || width + spacing <= remaining else { continue }
+            widths[ObjectIdentifier(chip)] = width
+            remaining -= width + spacing
+        }
+
+        var x = pad
+        overflowChips = []
+        for chip in chips {
+            let width = widths[ObjectIdentifier(chip)]
+            chip.isHidden = width == nil
+            guard let width else {
+                if !chip.text.isEmpty { overflowChips.append(chip) }
+                continue
+            }
+            chip.frame = NSRect(x: x, y: y, width: width, height: Self.chipHeight)
+            x = chip.frame.maxX + spacing
+        }
+        if overflowChips.isEmpty {
+            moreChip.set(symbol: nil, text: "", color: theme.dim)
+        } else {
+            let attention = overflowChips.contains { $0.role == .problem || $0.role == .waiting || $0.filled == theme.red }
+            moreChip.set(symbol: nil, text: "+\(overflowChips.count)", color: attention ? .systemOrange : theme.foreground.withAlphaComponent(0.6),
+                         tooltip: overflowChips.map(\.text).joined(separator: "\n") + "\nClick to see them")
+            moreChip.isHidden = false
+            moreChip.frame = NSRect(x: x, y: y, width: moreChip.preferredWidth, height: Self.chipHeight)
+            x = moreChip.frame.maxX + spacing
+        }
+        updateFading()
         if let welcome {
             let ww = min(560, w - 40)
             welcome.frame = NSRect(x: (w - ww) / 2, y: bounds.height - welcome.frame.height - 24, width: ww, height: welcome.frame.height)
         }
-        let hintW = bx - x - 10
+        let hintW = moreX - x - 10
         hintLabel.isHidden = hintW < 150 || hintLabel.stringValue.isEmpty
         hintLabel.frame = NSRect(x: x, y: y + (Self.chipHeight - 15) / 2, width: max(0, hintW), height: 15)
     }
@@ -383,7 +490,7 @@ final class PaneView: NSView, ShellSessionDelegate {
     /// While the screen isn't full, the editor sits just under the last line
     /// of output instead of at the bottom, so your eyes don't jump.
     private func computeFollowTop() -> CGFloat? {
-        guard Services.shared.config.editorFollowsOutput, editorEnabled, !fullscreenProgram, !editorExpanded,
+        guard viewportAtBottom, Services.shared.config.editorFollowsOutput, editorEnabled, !fullscreenProgram, !editorExpanded,
               let surface = surfaceView.surface, surfaceView.frame.height > 0 else { return nil }
         var x = 0.0, y = 0.0, cw = 0.0, ch = 0.0
         ghostty_surface_ime_point(surface, &x, &y, &cw, &ch)
@@ -400,6 +507,14 @@ final class PaneView: NSView, ShellSessionDelegate {
         // Close to the bottom anyway: sit at the bottom (full band and divider) rather than squeezed a few points above it.
         guard top - barHeight > 20, top < sf.maxY else { return nil }
         return top.rounded()
+    }
+
+    func viewportChanged(atBottom: Bool) {
+        guard viewportAtBottom != atBottom else { return }
+        viewportAtBottom = atBottom
+        // The cursor belongs to the live screen. Its position cannot place
+        // the editor safely over a viewport showing older output.
+        if Services.shared.config.editorFollowsOutput { needsLayout = true }
     }
 
     /// Re-checks the bar position soon (coalesced; output can stream fast).
@@ -419,9 +534,11 @@ final class PaneView: NSView, ShellSessionDelegate {
         followTimer = nil
         guard on, Services.shared.config.editorFollowsOutput else { return }
         followTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in self?.scheduleFollowCheck() }
+        followTimer?.tolerance = 0.04
     }
 
     @objc private func showMoreMenu() {
+        layoutSubtreeIfNeeded()
         let m = actionsMenu()
         m.popUp(positioning: nil, at: NSPoint(x: moreButton.frame.minX, y: moreButton.frame.maxY + 4), in: bar)
     }
@@ -444,15 +561,28 @@ final class PaneView: NSView, ShellSessionDelegate {
         clear.image = NSImage(systemSymbolName: "eraser", accessibilityDescription: nil)
         m.addItem(clear)
         let deep = ClosureMenuItem(title: "Deep Clean…") { [weak self] in self?.confirmDeepClean() }
-        deep.keyEquivalent = "k"; deep.keyEquivalentModifierMask = [.command, .shift]
         deep.image = NSImage(systemSymbolName: "sparkles.rectangle.stack", accessibilityDescription: nil)
         m.addItem(deep)
+        m.addItem(.separator())
+        if session.running != nil {
+            let after = ClosureMenuItem(title: "When This Finishes…") { [weak self] in self?.promptWhenDone() }
+            after.image = NSImage(systemSymbolName: "bell", accessibilityDescription: nil)
+            m.addItem(after)
+        }
+        let watch = ClosureMenuItem(title: fileWatch == nil ? "Re-run Last Command When Files Change" : "Stop Watching Files") { [weak self] in self?.toggleWatch() }
+        watch.image = NSImage(systemSymbolName: "eye", accessibilityDescription: nil)
+        m.addItem(watch)
+        if testReport != nil {
+            let tests = ClosureMenuItem(title: "Failed Tests…") { [weak self] in self?.showFailedTestsMenu(from: self?.testsChip) }
+            tests.image = NSImage(systemSymbolName: "xmark.octagon", accessibilityDescription: nil)
+            m.addItem(tests)
+        }
         m.addItem(.separator())
         let save = ClosureMenuItem(title: "Save Command to Notebook") { [weak self] in self?.saveToNotebook() }
         save.keyEquivalent = "s"; save.keyEquivalentModifierMask = [.command, .option]
         save.image = NSImage(systemSymbolName: "book.closed", accessibilityDescription: nil)
         m.addItem(save)
-        let nb = ClosureMenuItem(title: "Command Notebook") { [weak self] in self?.windowController?.toggleNotebookPanel() }
+        let nb = ClosureMenuItem(title: "Saved Panel") { [weak self] in self?.windowController?.toggleNotebookPanel() }
         nb.keyEquivalent = "n"; nb.keyEquivalentModifierMask = [.command, .option]
         m.addItem(nb)
         let open = (window?.windowController as? TerminalWindowController)?.sidebarVisible ?? false
@@ -460,12 +590,89 @@ final class PaneView: NSView, ShellSessionDelegate {
         sb.keyEquivalentModifierMask = [.command, .control]
         sb.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: nil)
         m.addItem(sb)
+
+        if let statusMenu = overflowStatusMenu() {
+            m.addItem(.separator())
+            let item = NSMenuItem(title: "Pane Status", action: nil, keyEquivalent: "")
+            item.submenu = statusMenu
+            m.addItem(item)
+        }
         return m
+    }
+
+    /// The chips that don't fit in the status row, as menu items.
+    func overflowStatusMenu() -> NSMenu? {
+        if !overflowChips.isEmpty {
+            let statusMenu = NSMenu()
+            statusMenu.autoenablesItems = false
+            for chip in overflowChips {
+                let item: NSMenuItem
+                if chip === statusChip || chip === shareChip {
+                    item = NSMenuItem(title: chip.text, action: nil, keyEquivalent: "")
+                    if chip === shareChip, let share = TabShare.share(for: self) {
+                        item.submenu = shareMenu(share)
+                    } else if chip === statusChip {
+                        item.submenu = resultMenu()
+                    }
+                    item.isEnabled = item.submenu != nil
+                } else if let action = chip.onClick {
+                    item = ClosureMenuItem(title: chip.text, action: action)
+                } else {
+                    item = NSMenuItem(title: chip.text, action: nil, keyEquivalent: "")
+                    item.isEnabled = false
+                }
+                item.image = chip.image
+                item.toolTip = chip.toolTip
+                statusMenu.addItem(item)
+                if let menu = chip.menuProvider?() {
+                    let options = NSMenuItem(title: "Folder Options", action: nil, keyEquivalent: "")
+                    options.submenu = menu
+                    statusMenu.addItem(options)
+                }
+            }
+            return statusMenu
+        }
+        return nil
+    }
+
+    // MARK: Fading suggestions
+
+    /// Chips that are offers rather than facts: they fade after 20 seconds (hover brings them back).
+    var suggestionChips: [ChipView] {
+        var list: [ChipView] = [aliasChip, hintChip, logChip, explainChip]
+        if fixCommand != nil { list.append(fixChip) }
+        if envOffer != nil { list.append(envChip) }
+        if forwardedPorts.isEmpty, !remotePortsSeen.isEmpty { list.append(forwardChip) }
+        return list
+    }
+
+    static var fadeAfter: TimeInterval = 20
+
+    private func updateFading() {
+        let now = Date()
+        var next: TimeInterval?
+        let suggestions = suggestionChips
+        // Timed dimming is easy to miss: skip it with Reduce Motion or Increase Contrast.
+        let ws = NSWorkspace.shared
+        let steady = ws.accessibilityDisplayShouldReduceMotion || ws.accessibilityDisplayShouldIncreaseContrast
+        for chip in [aliasChip, hintChip, logChip, explainChip, fixChip, envChip, forwardChip] {
+            if steady { chip.faded = false; continue }
+            guard suggestions.contains(where: { $0 === chip }), !chip.isHidden, let since = chip.shownSince else { chip.faded = false; continue }
+            let age = now.timeIntervalSince(since)
+            chip.faded = age >= Self.fadeAfter
+            if age < Self.fadeAfter { next = min(next ?? .infinity, Self.fadeAfter - age) }
+        }
+        fadeWork?.cancel()
+        guard let next else { return }
+        let work = DispatchWorkItem { [weak self] in self?.needsLayout = true }
+        fadeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + next + 0.05, execute: work)
     }
 
     var actionsMenuButtonVisible: Bool { !moreButton.isHidden }
 
     func editorContentChanged() {
+        refreshContextChip()
         needsLayout = true
         gutter.needsDisplay = true
         // Keep the caret visible inside a tall editor.
@@ -560,7 +767,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         ("⇧⏎ adds a line, ⇧⌘E expands the editor", ["⇧⏎"]),
         ("⇧⌘P opens the command palette", []),
         ("⌥↑ selects word, then command, then line", []),
-        ("⌥⌘R runs a saved workflow", []),
+        ("⌥⌘R runs anything from your Notebook", []),
         ("⌘B lists the commands in this tab", []),
     ]
     static let keyTipsRow = "⇥ complete   ↑ history   ⌘R search   ⇧⏎ new line   ⌥⌘E open in $EDITOR"
@@ -634,8 +841,8 @@ final class PaneView: NSView, ShellSessionDelegate {
             badgeChip.set(symbol: nil, text: "", color: dim)
         }
         if let wc = windowController, wc.isBroadcasting(self) {
-            broadcastChip.filled = t.yellow
-            broadcastChip.set(symbol: "dot.radiowaves.left.and.right", text: "all panes", color: t.yellow,
+            broadcastChip.filled = ChipRole.waiting.color(t)
+            broadcastChip.set(symbol: "dot.radiowaves.left.and.right", text: "all panes", color: ChipRole.waiting.color(t),
                               tooltip: "Commands you run here also run in every pane of this tab. Click to stop.")
         } else {
             broadcastChip.filled = nil
@@ -645,7 +852,7 @@ final class PaneView: NSView, ShellSessionDelegate {
             let n = share.viewerCount
             shareChip.filled = t.blue
             shareChip.set(symbol: "dot.radiowaves.up.forward", text: n == 0 ? "Sharing" : "Sharing · \(n) watching", color: t.blue,
-                          tooltip: "This tab is shared read-only at \(share.link)\nClick to copy the link or stop sharing.")
+                          tooltip: "This tab is shared read-only at \(share.link)" + (share.code.map { "\nCode: \($0)" } ?? "") + "\nClick to copy the link or stop sharing.")
         } else {
             shareChip.filled = nil
             shareChip.set(symbol: nil, text: "", color: dim)
@@ -673,8 +880,7 @@ final class PaneView: NSView, ShellSessionDelegate {
             changesChip.set(symbol: nil, text: "", color: dim)
         }
         if let fix = fixCommand {
-            fixChip.filled = t.yellow
-            fixChip.set(symbol: "wand.and.stars", text: "Did you mean: " + fix, color: t.yellow, tooltip: "Put the corrected command in the editor")
+            fixChip.set(role: .suggestion, symbol: "wand.and.stars", text: "Did you mean: " + fix, tooltip: "Put the corrected command in the editor", filled: true, theme: t)
         } else if let last = s.lastBlockInContext, (last.exitCode ?? 0) != 0, !last.command.isEmpty, s.atPrompt {
             fixChip.filled = t.foreground
             fixChip.set(symbol: "arrow.uturn.backward", text: "Edit & retry", color: t.foreground.withAlphaComponent(0.75), tooltip: last.command)
@@ -683,14 +889,13 @@ final class PaneView: NSView, ShellSessionDelegate {
             fixChip.set(symbol: nil, text: "", color: dim)
         }
         if Services.shared.aiEnabled, let last = s.lastBlockInContext, (last.exitCode ?? 0) != 0, !last.command.isEmpty, s.atPrompt {
-            explainChip.filled = t.magenta
-            explainChip.set(symbol: "sparkles", text: "Explain", color: t.magenta, tooltip: "Ask \(Services.shared.aiName) why this failed (⌥⌘I)")
+            explainChip.set(role: .suggestion, symbol: "sparkles", text: "Explain", tooltip: "Ask \(Services.shared.aiName) why this failed (⌥⌘I)", filled: true, theme: t)
         } else {
             explainChip.filled = nil
             explainChip.set(symbol: nil, text: "", color: dim)
         }
         if s.historyPaused {
-            statusChip.set(symbol: "pause.circle", text: "history paused", color: t.yellow)
+            statusChip.set(role: .waiting, symbol: "pause.circle", text: "history paused", theme: t)
         } else if let last = s.lastBlockInContext, (last.exitCode ?? 0) != 0 {
             // Success needs no badge (each command shows ✓ and its time in
             // the output); a failure stays visible here.
@@ -716,6 +921,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         if showRunning { spinner.isHidden = false; spinner.startAnimation(nil) } else { spinner.stopAnimation(nil); spinner.isHidden = true }
         runningHint.isHidden = !showRunning
         if showRunning { hintLabel.stringValue = "" } else { updateHint() }
+        refreshLiveChips()
         updateRunningLabel()
         needsLayout = true
     }
@@ -761,6 +967,7 @@ final class PaneView: NSView, ShellSessionDelegate {
     func flash(_ text: String) { AppDelegate.shared.flash(self, text) }
 
     func sessionDidShowPrompt(_ session: ShellSession) {
+        Startup.firstPrompt()
         if let b = session.blocks.last, session.running == nil, b.duration != nil {
             Diagnostics.shared.log(String(format: "command end: %@ exit=%d %.2fs", HistoryStore.programName(b.command) ?? "?", b.exitCode ?? 0, b.duration ?? 0))
         }
@@ -779,6 +986,16 @@ final class PaneView: NSView, ShellSessionDelegate {
             Services.shared.tip(in: self) { $0.commandFinished(exitCode: last.exitCode ?? 0, aiEnabled: ai) }
         }
         if session.running == nil { sshTarget = nil }
+        clearWaiting()
+        ServerMonitor.shared.wake()
+        PluginHost.shared.refresh(self)
+        PluginHost.shared.commandFinished(in: self)
+        commandFinishedForRunTools()
+        checkProjectEnvironment()
+        flushPendingShellScript()
+        recorder?.capture()
+        handleCommandFinishedForReconnect()
+        filterPanel?.reload()
         updateProfile()
         refreshGitExtras()
         pendingRunningSwitch?.cancel()
@@ -790,6 +1007,8 @@ final class PaneView: NSView, ShellSessionDelegate {
         let wasRunning = showRunning
         showRunning = false
         if fullscreenProgram { fullscreenProgram = false; needsLayout = true }
+        fullscreenDetected = false
+        if stopPresses > 0 { stopPresses = 0; updateStopButton() }
         rawDirty = false
         fixCommand = nil
         if session.lastExit == 127, let cmd = session.blocks.last?.command, let prog = HistoryStore.programName(cmd),
@@ -817,6 +1036,12 @@ final class PaneView: NSView, ShellSessionDelegate {
 
     func sessionDidStartCommand(_ session: ShellSession, command: String) {
         Diagnostics.shared.log("command start: \(HistoryStore.programName(command) ?? "?")")
+        ServerMonitor.shared.wake()
+        commandStartedForReconnect(command)
+        commandStartedForRunTools(command)
+        commandStartedForHabits(command)
+        waitScreen = ""
+        waitScreenChangedAt = Date()
         let ai = Services.shared.aiEnabled
         runningTiming = Self.usefulTiming(for: command)
         sshTarget = SSHConfig.target(of: command)
@@ -843,11 +1068,23 @@ final class PaneView: NSView, ShellSessionDelegate {
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.session.atPrompt else { return }
             self.showRunning = true
+            self.checkForegroundProgram()
             if self.isFocusedPane, self.window?.firstResponder === self.editor {
                 self.window?.makeFirstResponder(self.surfaceView)
             }
             self.refreshBar()
-            self.runningTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.updateRunningLabel() }
+            var tick = 0
+            self.runningTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                tick += 1
+                // Hidden panes (other tabs, Anser in the background) update less often.
+                let visible = self.sessionIsVisible
+                if visible { self.updateRunningLabel() }
+                if visible || tick % 3 == 0 { self.checkWaiting() }
+                if visible { self.checkForegroundProgram() }
+                if self.session.isRemote, tick % 2 == 0 { self.checkRemotePorts() }
+            }
+            self.runningTimer?.tolerance = 0.25
         }
         pendingRunningSwitch = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
@@ -907,11 +1144,16 @@ final class PaneView: NSView, ShellSessionDelegate {
         return (cwd as NSString).lastPathComponent
     }
 
+    var tabLocation: String {
+        if session.isRemote {
+            return "ssh: \(session.remoteHost ?? "")\(session.remoteCwd.map { ":" + $0 } ?? "")"
+        }
+        return PathDisplay.short(session.cwd, max: 60) + (session.gitBranch.map { "  (\($0))" } ?? "")
+    }
+
     /// Hover text for this pane's tab: where it is and what's running.
     var tabTooltip: String {
-        var lines: [String] = []
-        if session.isRemote { lines.append("ssh: \(session.remoteHost ?? "")\(session.remoteCwd.map { ":" + $0 } ?? "")") }
-        else { lines.append(PathDisplay.short(session.cwd, max: 60) + (session.gitBranch.map { "  (\($0))" } ?? "")) }
+        var lines = [tabLocation]
         if let r = session.running, !r.command.isEmpty { lines.append("Running: " + String(r.command.prefix(80))) }
         else if let b = session.blocks.last, (b.exitCode ?? 0) != 0 { lines.append("Last command failed (exit \(b.exitCode ?? 0))") }
         return lines.joined(separator: "\n")
@@ -963,6 +1205,11 @@ final class PaneView: NSView, ShellSessionDelegate {
             surfaceView.binding("text:\\x1b[9999~")
             rawDirty = false
         }
+        var command = command
+        if SecretRefs.contains(command) {
+            guard let filled = fillSecrets(command) else { return }
+            command = filled
+        }
         if !command.isEmpty { surfaceView.sendText(command) }
         surfaceView.sendSyntheticKey(keyCode: kVK_Return, text: "\r", unshifted: "\r")
     }
@@ -1000,7 +1247,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         Services.shared.record("clear")
     }
 
-    /// Deep Clean (⇧⌘K): asks first, then resets everything about this tab's screen.
+    /// Menu option that also lets the user remove this tab's runs from History.
     func confirmDeepClean() {
         guard let w = window else { return }
         let a = NSAlert()
@@ -1082,6 +1329,15 @@ final class PaneView: NSView, ShellSessionDelegate {
         if keep { SessionHost.shared.save(session) } else if session.persistent { SessionHost.shared.end(session.id) }
         runningTimer?.invalidate()
         followTimer?.invalidate()
+        reconnect?.timer?.invalidate()
+        reconnect = nil
+        fileWatch?.stop()
+        fileWatch = nil
+        recorder?.stop()
+        stopForwards()
+        PluginHost.shared.forget(self)
+        filterPanel?.removeFromSuperview()
+        filterPanel = nil
         editor.hidePopup()
         surfaceView.destroy()
         session.close(keepShell: keep)

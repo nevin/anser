@@ -173,16 +173,48 @@ public struct AnserConfig: Codable, Sendable {
     public var historyIgnore: [String] = AnserConfig.defaultHistoryIgnore
     /// Reopen windows, tabs, splits and their folders on launch.
     public var restoreSession: Bool = true
+    /// Restore unfinished local commands with the window layout.
+    public var restoreDrafts: Bool = true
     /// Replace the shell's prompt with a short "❯", since the bar already shows folder and branch.
     public var compactPrompt: Bool = false
     /// The editor sits right under the last output line until the screen
     /// fills, instead of at the bottom of the window.
-    public var editorFollowsOutput: Bool = true
+    public var editorFollowsOutput: Bool = false
     /// Show macOS's "Last login: …" line when a tab opens.
     public var showLoginMessage: Bool = false
     /// Keyboard tips under an empty editor. "auto" shows them while you're new
     /// (your first few hundred commands), then hides them.
     public var keyTips: String = "auto"
+    /// Mark the tab and notify when a running program waits for an answer (y/n, password, an AI agent's approval).
+    public var waitAlerts: Bool = true
+    /// Show servers a tab started (anything listening on a port) as a chip.
+    public var serverChips: Bool = true
+    /// The cloud context chip: "auto" (when a command uses kubectl, aws, docker…), "always" or "off".
+    public var showCloudContext: String = "auto"
+    /// Reconnect a dropped ssh session by itself (otherwise Anser only offers to).
+    public var sshAutoReconnect: Bool = true
+    /// Share command history between your Macs, through `syncFolder` (or iCloud Drive/Anser).
+    public var syncHistory: Bool = false
+    /// Folder for history sync; nil = the notebook's synced folder, else iCloud Drive/Anser.
+    public var syncFolder: String?
+    /// Plugins (folders in ~/.config/anser/plugins) that are turned on.
+    public var enabledPlugins: [String] = []
+    /// Values for plugin settings: plugin id → key → value (secret ones are in the Keychain).
+    public var pluginSettings: [String: [String: String]] = [:]
+    /// Offer to load a project's environment (.env, virtualenv, Node version) when you cd into it.
+    public var offerProjectEnvironment: Bool = true
+    /// ssh port forwards Anser keeps open in the background.
+    public var tunnels: [SSHTunnel] = []
+    /// After a test command fails, list the failed tests (open, re-run one).
+    public var testFailureList: Bool = true
+    /// Suggest an alias for long commands you keep typing.
+    public var suggestAliases: Bool = true
+    /// Once a week, move typos and commands that were never found to Recently Deleted.
+    public var autoCleanHistory: Bool = false
+    /// Grey inline completions from a local Ollama model when history has none.
+    public var aiCompletions: Bool = false
+    /// Named groups of ssh hosts for Run on Servers ("web": ["web1", "web2"]).
+    public var hostGroups: [String: [String]] = [:]
     /// Hide the command bar while these full-screen programs run.
     public var fullscreenApps: [String] = AnserConfig.defaultFullscreenApps
 
@@ -249,12 +281,28 @@ public struct AnserConfig: Codable, Sendable {
         helpCommands = try c.decodeIfPresent([String].self, forKey: .helpCommands) ?? []
         historyIgnore = try c.decodeIfPresent([String].self, forKey: .historyIgnore) ?? d.historyIgnore
         restoreSession = try c.decodeIfPresent(Bool.self, forKey: .restoreSession) ?? d.restoreSession
+        restoreDrafts = try c.decodeIfPresent(Bool.self, forKey: .restoreDrafts) ?? d.restoreDrafts
         compactPrompt = try c.decodeIfPresent(Bool.self, forKey: .compactPrompt) ?? d.compactPrompt
         shellPrompt = try c.decodeIfPresent(String.self, forKey: .shellPrompt) ?? (compactPrompt ? "compact" : d.shellPrompt)
         fullscreenApps = try c.decodeIfPresent([String].self, forKey: .fullscreenApps) ?? d.fullscreenApps
         editorFollowsOutput = try c.decodeIfPresent(Bool.self, forKey: .editorFollowsOutput) ?? d.editorFollowsOutput
         showLoginMessage = try c.decodeIfPresent(Bool.self, forKey: .showLoginMessage) ?? d.showLoginMessage
         keyTips = try c.decodeIfPresent(String.self, forKey: .keyTips) ?? d.keyTips
+        waitAlerts = try c.decodeIfPresent(Bool.self, forKey: .waitAlerts) ?? d.waitAlerts
+        serverChips = try c.decodeIfPresent(Bool.self, forKey: .serverChips) ?? d.serverChips
+        showCloudContext = try c.decodeIfPresent(String.self, forKey: .showCloudContext) ?? d.showCloudContext
+        sshAutoReconnect = try c.decodeIfPresent(Bool.self, forKey: .sshAutoReconnect) ?? d.sshAutoReconnect
+        syncHistory = try c.decodeIfPresent(Bool.self, forKey: .syncHistory) ?? d.syncHistory
+        syncFolder = try c.decodeIfPresent(String.self, forKey: .syncFolder)
+        enabledPlugins = try c.decodeIfPresent([String].self, forKey: .enabledPlugins) ?? []
+        pluginSettings = try c.decodeIfPresent([String: [String: String]].self, forKey: .pluginSettings) ?? [:]
+        offerProjectEnvironment = try c.decodeIfPresent(Bool.self, forKey: .offerProjectEnvironment) ?? d.offerProjectEnvironment
+        tunnels = (try? c.decodeIfPresent([SSHTunnel].self, forKey: .tunnels)) ?? []
+        testFailureList = try c.decodeIfPresent(Bool.self, forKey: .testFailureList) ?? d.testFailureList
+        suggestAliases = try c.decodeIfPresent(Bool.self, forKey: .suggestAliases) ?? d.suggestAliases
+        autoCleanHistory = try c.decodeIfPresent(Bool.self, forKey: .autoCleanHistory) ?? d.autoCleanHistory
+        aiCompletions = try c.decodeIfPresent(Bool.self, forKey: .aiCompletions) ?? d.aiCompletions
+        hostGroups = try c.decodeIfPresent([String: [String]].self, forKey: .hostGroups) ?? [:]
     }
 
     public static var directory: URL {
@@ -320,8 +368,9 @@ public struct AnserConfig: Codable, Sendable {
       "historyIgnore": ["*password=*", "*token=*", "*secret=*", "*api_key=*", "export *secret*"],
       "helpCommands": [],
       "restoreSession": true,
+      "restoreDrafts": true,
       "shellPrompt": "hidden",
-      "editorFollowsOutput": true,
+      "editorFollowsOutput": false,
       "showLoginMessage": false,
       "keyTips": "auto",
       "appearance": {
@@ -371,9 +420,10 @@ public enum AnserAction: String, CaseIterable, Sendable {
     case increaseFontSize, decreaseFontSize, resetFontSize
     case findInTerminal, blockNavigator, pauseHistory, openSettings
     case expandEditor, formatCommand, externalEditor
-    case renameTab, nextTab, previousTab, closeTab
+    case renameTab, nextTab, previousTab, closeTab, switchToTab
     case jumpToFolder, switchBranch, changedFiles, showShortcuts
     case moveTabLeft, moveTabRight, moveTabToNewWindow
+    case saveWorkspace, openWorkspace
     case zoomPane, toggleSidebar
     case runWorkflow, saveWorkflow, exportMarkdown, copyMarkdown, reportProblem
     case explainError, askClaude
@@ -382,10 +432,16 @@ public enum AnserAction: String, CaseIterable, Sendable {
     case quickTerminal, broadcastInput, searchOutput, resolveConflicts, openPullRequest
     case importSettings, checkForUpdates, showUsage
     case gitBlame, searchAllTabs, shareTab, deepClean
+    case filterOutput, killPort, compareLastRun, viewOutputAsData, manageSecrets, whatsNew, syncHistoryNow
+    case managePlugins, shareCommand
+    case watchAndRerun, whenDone, failedTests, projectEnvironment, runbooks, newRunbook, aiTask
+    case uploadToServer, downloadFromServer, addTunnel
+    case aliases, logViewer, recordTab, openRecording, editHistory
+    case watchOutput, runOnServers, forwardRemotePort, library, tour, searchSaved
 
     public var title: String {
         switch self {
-        case .historySearch: "Search History"
+        case .historySearch: "Search (history, this tab, output, all tabs, saved)"
         case .clipboardHistory: "Clipboard History"
         case .commandPalette: "Command Palette"
         case .copyLastOutput: "Copy Last Output"
@@ -410,7 +466,7 @@ public enum AnserAction: String, CaseIterable, Sendable {
         case .decreaseFontSize: "Smaller Text"
         case .resetFontSize: "Reset Text Size"
         case .findInTerminal: "Find in Terminal"
-        case .blockNavigator: "Command Blocks in This Tab"
+        case .blockNavigator: "Search This Tab's Commands"
         case .pauseHistory: "Pause History for This Tab"
         case .openSettings: "Settings"
         case .expandEditor: "Expand Command Editor"
@@ -420,6 +476,7 @@ public enum AnserAction: String, CaseIterable, Sendable {
         case .nextTab: "Next Tab"
         case .previousTab: "Previous Tab"
         case .closeTab: "Close Tab"
+        case .switchToTab: "Switch to Tab"
         case .jumpToFolder: "Jump to Folder"
         case .switchBranch: "Git: Switch or Create Branch"
         case .changedFiles: "Git: Changed Files"
@@ -427,17 +484,19 @@ public enum AnserAction: String, CaseIterable, Sendable {
         case .moveTabLeft: "Move Tab Left"
         case .moveTabRight: "Move Tab Right"
         case .moveTabToNewWindow: "Move Tab to New Window"
+        case .saveWorkspace: "Save Window as Workspace"
+        case .openWorkspace: "Open Workspace"
         case .zoomPane: "Zoom Pane / Restore Split"
         case .toggleSidebar: "Toggle Sidebar"
-        case .runWorkflow: "Workflows (view and run)"
-        case .saveWorkflow: "Save Commands as Workflow"
+        case .runWorkflow: "Run from Notebook (commands and workflows)"
+        case .saveWorkflow: "Save Several Commands to Notebook (a workflow)"
         case .exportMarkdown: "Export Tab (Markdown, JSON, PDF…)"
         case .copyMarkdown: "Copy Tab as Markdown"
         case .reportProblem: "Report a Problem"
         case .explainError: "Explain Last Error with AI"
         case .askClaude: "Ask AI for a Command"
-        case .notebook: "Command Notebook (side panel)"
-        case .editNotebook: "Edit Notebook"
+        case .notebook: "Saved Panel (notebook and runbooks)"
+        case .editNotebook: "Manage Notebook"
         case .saveToNotebook: "Save Command to Notebook"
         case .exportLastOutput: "Export Last Command's Output"
         case .openWorkflowsFolder: "Open Workflows Folder"
@@ -455,9 +514,104 @@ public enum AnserAction: String, CaseIterable, Sendable {
         case .checkForUpdates: "Check for Updates"
         case .showUsage: "Your Feature Usage"
         case .gitBlame: "Git: Blame File"
-        case .searchAllTabs: "Find in All Tabs"
+        case .searchAllTabs: "Search All Tabs"
         case .shareTab: "Share This Tab (Read-Only)"
         case .deepClean: "Deep Clean (reset and forget this tab's output)"
+        case .filterOutput: "Filter Output (search, errors only, fold repeats)"
+        case .killPort: "Kill Process on Port…"
+        case .compareLastRun: "Compare Last Command with Its Previous Run"
+        case .viewOutputAsData: "View Last Output as Table / JSON"
+        case .manageSecrets: "Manage Secrets…"
+        case .whatsNew: "What's New in Anser"
+        case .syncHistoryNow: "Sync History Now"
+        case .managePlugins: "Plugins…"
+        case .shareCommand: "Share Last Command and Output…"
+        case .watchAndRerun: "Re-run Last Command When Files Change"
+        case .whenDone: "When This Command Finishes… (notify, run next)"
+        case .failedTests: "Failed Tests (open, re-run one)"
+        case .projectEnvironment: "Project Environment (.env, virtualenv, Node)"
+        case .runbooks: "Runbooks"
+        case .newRunbook: "New Runbook…"
+        case .aiTask: "Do a Task with AI, Step by Step…"
+        case .uploadToServer: "Upload Files to Server…"
+        case .downloadFromServer: "Download File from Server…"
+        case .addTunnel: "Add SSH Tunnel…"
+        case .aliases: "Aliases (add, edit, suggestions)…"
+        case .logViewer: "Log Viewer (levels, filters, pretty JSON)"
+        case .recordTab: "Record This Tab / Stop Recording"
+        case .openRecording: "Open a Tab Recording…"
+        case .editHistory: "Edit History (delete mistakes, compact)…"
+        case .watchOutput: "Watch a Command's Output (notify on change)…"
+        case .runOnServers: "Run on Several Servers…"
+        case .forwardRemotePort: "Open a Server Port on This Mac…"
+        case .library: "Library (notebook, runbooks, aliases, history, recordings)"
+        case .tour: "Take the Tour"
+        case .searchSaved: "Search Saved Commands (notebook, workflows, runbooks)"
+        }
+    }
+}
+
+extension AnserAction {
+    /// A short heading for the command palette ("History", "Git"…).
+    public var category: String {
+        switch self {
+        case .historySearch, .pauseHistory, .searchOutput, .editHistory, .searchSaved: "History"
+        case .clipboardHistory, .copyLastOutput, .copyLastCommand, .exportMarkdown, .copyMarkdown, .exportLastOutput, .shareCommand, .shareTab: "Copy & share"
+        case .newTab, .newWindow, .closeTab, .renameTab, .nextTab, .previousTab, .switchToTab, .moveTabLeft, .moveTabRight, .moveTabToNewWindow,
+             .saveWorkspace, .openWorkspace, .quickTerminal: "Tabs & windows"
+        case .splitRight, .splitDown, .splitLeft, .splitUp, .closePane, .focusNextPane, .focusPreviousPane, .zoomPane, .broadcastInput: "Panes"
+        case .clearScreen, .deepClean, .findInTerminal, .searchAllTabs, .blockNavigator, .jumpToPreviousPrompt, .jumpToNextPrompt,
+             .filterOutput, .compareLastRun, .viewOutputAsData, .logViewer, .recordTab, .openRecording: "Output"
+        case .toggleEditor, .expandEditor, .formatCommand, .externalEditor, .increaseFontSize, .decreaseFontSize, .resetFontSize: "Editor"
+        case .rerunLastCommand, .whenDone, .watchAndRerun, .watchOutput, .failedTests, .killPort, .projectEnvironment: "Run"
+        case .jumpToFolder: "Folders"
+        case .switchBranch, .changedFiles, .gitHistory, .gitStashes, .gitFetch, .gitPull, .gitPush, .resolveConflicts, .openPullRequest, .gitBlame: "Git"
+        case .notebook, .editNotebook, .saveToNotebook, .runWorkflow, .saveWorkflow, .openWorkflowsFolder, .runbooks, .newRunbook, .aliases, .library: "Library"
+        case .explainError, .askClaude, .aiTask: "AI"
+        case .uploadToServer, .downloadFromServer, .addTunnel, .runOnServers, .forwardRemotePort: "Servers"
+        case .manageSecrets, .managePlugins, .openConfig, .reloadConfig, .openSettings, .showShortcuts, .importSettings, .checkForUpdates,
+             .showUsage, .reportProblem, .whatsNew, .syncHistoryNow, .toggleSidebar, .commandPalette, .tour: "Anser"
+        }
+    }
+
+    /// Other words people use for it, so the palette finds it ("typo" → Edit History).
+    public var keywords: String {
+        switch self {
+        case .editHistory: "typo mistakes delete clean compact remove forget"
+        case .historySearch: "find previous ctrl-r recall search everything"
+        case .aliases: "shortcut abbreviation short name"
+        case .library: "saved snippets everything"
+        case .notebook, .editNotebook: "snippets saved commands bookmarks workflows runbooks"
+        case .watchOutput: "monitor poll notify change cron every minutes"
+        case .watchAndRerun: "watch files save rerun nodemon entr"
+        case .whenDone: "notify after finish then chain"
+        case .runOnServers: "ssh many hosts parallel fleet"
+        case .forwardRemotePort: "tunnel port forward localhost ssh"
+        case .addTunnel: "port forward ssh -L"
+        case .uploadToServer: "scp copy send file"
+        case .downloadFromServer: "scp copy get file"
+        case .logViewer: "logs tail errors levels json"
+        case .recordTab: "record screencast replay asciinema demo"
+        case .openRecording: "replay asciinema"
+        case .failedTests: "tests failing rerun pytest jest"
+        case .projectEnvironment: "env dotenv venv virtualenv nvm node python"
+        case .aiTask: "agent automate steps"
+        case .explainError: "why failed error help"
+        case .askClaude: "generate how do i"
+        case .killPort: "port in use address already"
+        case .deepClean: "reset forget wipe"
+        case .filterOutput: "grep search errors only"
+        case .compareLastRun: "diff previous"
+        case .viewOutputAsData: "table csv json"
+        case .manageSecrets: "password token keychain"
+        case .runbooks, .newRunbook: "checklist steps markdown playbook"
+        case .runWorkflow, .saveWorkflow: "macro steps script workflows notebook"
+        case .searchSaved: "find notebook workflows runbooks snippets"
+        case .searchAllTabs, .blockNavigator: "find search tabs commands"
+        case .broadcastInput: "all panes sync type everywhere"
+        case .quickTerminal: "dropdown hotkey visor"
+        case .tour: "help introduction learn getting started"
+        default: ""
         }
     }
 }

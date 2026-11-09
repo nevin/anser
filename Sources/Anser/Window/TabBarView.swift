@@ -15,6 +15,8 @@ final class TabBarView: NSView {
     /// Lists every tab when there are too many to read their names.
     private let overflow = NSButton()
     private(set) var editingIndex: Int?
+    private var visibleTabs = 0..<0
+    private var tabStep: CGFloat = 0
 
     static let colors: [(name: String, title: String)] = [
         ("red", "Red"), ("orange", "Orange"), ("yellow", "Yellow"), ("green", "Green"),
@@ -49,6 +51,7 @@ final class TabBarView: NSView {
         overflow.isBordered = false
         overflow.imageScaling = .scaleProportionallyDown
         overflow.toolTip = "All tabs"
+        overflow.setAccessibilityLabel("All tabs")
         overflow.target = self
         overflow.action = #selector(showAllTabs)
         overflow.isHidden = true
@@ -61,13 +64,13 @@ final class TabBarView: NSView {
         sidebarButton.target = self
         sidebarButton.action = #selector(toggleSidebar)
         addSubview(sidebarButton)
-        notebookButton.image = NSImage(systemSymbolName: "book.closed", accessibilityDescription: "Command Notebook")
+        notebookButton.image = NSImage(systemSymbolName: "book.closed", accessibilityDescription: "Saved commands")
         notebookButton.isBordered = false
         notebookButton.imageScaling = .scaleProportionallyDown
         notebookButton.target = self
         notebookButton.action = #selector(openNotebook)
-        notebookButton.toolTip = "Command Notebook: your saved commands (⌥⌘N)"
-        notebookButton.setAccessibilityLabel("Command Notebook")
+        notebookButton.toolTip = "Saved: your Notebook (workflows included) and runbooks (⌥⌘N)"
+        notebookButton.setAccessibilityLabel("Saved commands")
         addSubview(notebookButton)
         updateSidebarButton()
     }
@@ -85,7 +88,7 @@ final class TabBarView: NSView {
         sidebarButton.contentTintColor = fg.withAlphaComponent(open ? 0.9 : 0.5)
         let nbOpen = controller?.notebookPanelVisible ?? false
         notebookButton.contentTintColor = fg.withAlphaComponent(nbOpen ? 0.9 : 0.5)
-        notebookButton.image = NSImage(systemSymbolName: nbOpen ? "book.fill" : "book.closed", accessibilityDescription: "Command Notebook")
+        notebookButton.image = NSImage(systemSymbolName: nbOpen ? "book.fill" : "book.closed", accessibilityDescription: "Saved commands")
         sidebarButton.toolTip = (open ? "Hide sidebar" : "Show sidebar") + " (⌃⌘S)"
         sidebarButton.setAccessibilityLabel(open ? "Hide sidebar" : "Show sidebar")
     }
@@ -93,18 +96,40 @@ final class TabBarView: NSView {
     func clickSidebarButton() { sidebarButton.performClick(nil) }
 
     @objc private func showAllTabs() {
-        guard let c = controller else { return }
+        allTabsMenu().popUp(positioning: nil, at: NSPoint(x: overflow.frame.minX, y: overflow.frame.minY), in: self)
+    }
+
+    func allTabsMenu() -> NSMenu {
         let m = NSMenu()
+        guard let c = controller else { return m }
+        m.addItem(ClosureMenuItem(title: "Switch to Tab…") { [weak c] in
+            guard let c, let pane = c.focusedPane else { return }
+            c.showTabSwitcher(for: pane)
+        })
+        m.addItem(.separator())
         for (i, tab) in c.tabs.enumerated() {
-            let item = ClosureMenuItem(title: c.title(of: tab)) { [weak c] in c?.selectTab(i) }
+            var title = "\(i + 1). " + c.title(of: tab)
+            if let pane = tab.focusedPane ?? c.panes(inTab: i).first {
+                title += "  ·  " + pane.tabLocation
+            }
+            switch c.activity(of: tab) {
+            case .running: title += "  ·  Running"
+            case .waiting: title += "  ·  Waiting for you"
+            case .failed: title += "  ·  Command failed"
+            case .done: title += "  ·  Finished"
+            case .idle: break
+            }
+            let item = ClosureMenuItem(title: title) { [weak c, weak tab] in
+                guard let c, let tab, let index = c.tabs.firstIndex(where: { $0 === tab }) else { return }
+                c.selectTab(index)
+            }
             item.state = i == c.selectedIndex ? .on : .off
             if let color = Self.color(tab.color ?? tab.profileColor) { item.image = Self.swatch(color) }
             m.addItem(item)
         }
-        m.popUp(positioning: nil, at: NSPoint(x: overflow.frame.minX, y: overflow.frame.minY), in: self)
+        return m
     }
 
-    /// Tabs are getting too narrow to read.
     var isCrowded: Bool { !overflow.isHidden }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -145,12 +170,15 @@ final class TabBarView: NSView {
     /// Room at the right end for the notebook button.
     private let trailingInset: CGFloat = 34
 
-    /// Where tab `i` sits.
-    func frameForTab(_ i: Int, count: Int) -> NSRect {
-        let crowded = (bounds.width - leadingInset - trailingInset - 40) / CGFloat(max(count, 1)) < 90
-        let available = bounds.width - leadingInset - trailingInset - (crowded ? 66 : 40)
-        let w = max(44, min(200, available / CGFloat(max(count, 1))))
-        return NSRect(x: leadingInset + CGFloat(i) * w, y: 3, width: w - 2, height: bounds.height - 6)
+    private func frameForTab(_ index: Int) -> NSRect {
+        let slot = index - visibleTabs.lowerBound
+        return NSRect(x: leadingInset + CGFloat(slot) * tabStep, y: 3,
+                      width: max(0, tabStep - 2), height: bounds.height - 6)
+    }
+
+    func dragOrigin(for x: CGFloat, tabWidth: CGFloat) -> CGFloat {
+        guard let last = visibleTabs.last else { return leadingInset }
+        return min(max(x, leadingInset), max(leadingInset, frameForTab(last).maxX - tabWidth))
     }
 
     /// Slide tabs into place (used while dragging) instead of jumping.
@@ -160,10 +188,25 @@ final class TabBarView: NSView {
         super.layout()
         let animate = animateNextLayout
         animateNextLayout = false
+        let minTabStep: CGFloat = 122
+        let available = max(0, bounds.width - leadingInset - trailingInset - 40)
+        let crowded = CGFloat(items.count) * minTabStep > available
+        let tabSpace = max(0, available - (crowded ? 26 : 0))
+        let count = min(items.count, max(1, Int(tabSpace / minTabStep)))
+        let anchor = editingIndex ?? controller?.selectedIndex ?? 0
+        // Scroll only as far as needed to keep the active tab in view.
+        let startKeepingAnchor = min(anchor, max(visibleTabs.lowerBound, anchor - count + 1))
+        let start = max(0, min(items.count - count, startKeepingAnchor))
+        visibleTabs = start..<(start + count)
+        tabStep = min(200, tabSpace / CGFloat(max(count, 1)))
+
         for (i, v) in items.enumerated() where !v.isDragging {
-            let target = frameForTab(i, count: items.count)
+            let wasHidden = v.isHidden
+            v.isHidden = !visibleTabs.contains(i)
+            guard !v.isHidden else { continue }
+            let target = frameForTab(i)
             guard v.frame != target else { continue }
-            if animate {
+            if animate && !wasHidden {
                 NSAnimationContext.runAnimationGroup { ctx in
                     ctx.duration = 0.15
                     ctx.allowsImplicitAnimation = true
@@ -175,9 +218,8 @@ final class TabBarView: NSView {
         }
         sidebarButton.frame = NSRect(x: buttonsInset, y: (bounds.height - 18) / 2, width: 20, height: 18)
         notebookButton.frame = NSRect(x: bounds.width - 30, y: (bounds.height - 18) / 2, width: 20, height: 18)
-        let last = items.isEmpty ? leadingInset : frameForTab(items.count - 1, count: items.count).maxX
+        let last = visibleTabs.last.map { frameForTab($0).maxX } ?? leadingInset
         plus.frame = NSRect(x: last + 6, y: (bounds.height - 18) / 2, width: 18, height: 18)
-        let crowded = !items.isEmpty && (bounds.width - leadingInset - trailingInset - 40) / CGFloat(items.count) < 90
         overflow.isHidden = !crowded
         overflow.frame = NSRect(x: plus.frame.maxX + 6, y: (bounds.height - 16) / 2, width: 16, height: 16)
         overflow.contentTintColor = plus.contentTintColor
@@ -196,19 +238,13 @@ final class TabBarView: NSView {
     func select(_ i: Int) { controller?.selectTab(i) }
     func close(_ i: Int) { controller?.closeTabAsking(i) }
 
-    /// Drop index for a tab dragged to x.
-    func dropIndex(forX x: CGFloat) -> Int {
-        let n = items.count
-        guard n > 0 else { return 0 }
-        let w = frameForTab(0, count: n).width + 2
-        return min(n - 1, max(0, Int((x - leadingInset) / w)))
-    }
-
     /// Called as a tab is dragged: when it crosses another tab's middle,
     /// the tabs swap places right away (the others slide aside).
     func dragMoved(_ item: TabItemView) {
-        guard let from = items.firstIndex(where: { $0 === item }) else { return }
-        let to = dropIndex(forX: item.frame.midX)
+        guard let from = items.firstIndex(where: { $0 === item }),
+              let last = visibleTabs.last, tabStep > 0 else { return }
+        let slot = max(0, Int((item.frame.midX - leadingInset) / tabStep))
+        let to = min(last, visibleTabs.lowerBound + slot)
         guard to != from else { return }
         items.remove(at: from)
         items.insert(item, at: to)
@@ -219,7 +255,7 @@ final class TabBarView: NSView {
     /// Drag finished: snap the tab into its slot.
     func dragEnded(_ item: TabItemView) {
         guard let i = items.firstIndex(where: { $0 === item }) else { return }
-        let target = frameForTab(i, count: items.count)
+        let target = frameForTab(i)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.15
             ctx.allowsImplicitAnimation = true
@@ -362,6 +398,7 @@ final class TabItemView: NSView, NSTextFieldDelegate {
         let state: String
         switch activity {
         case .running: state = ", running"
+        case .waiting: state = ", waiting for your answer"
         case .failed: state = ", a command failed"
         case .done: state = ", finished"
         case .idle: state = ""
@@ -411,7 +448,7 @@ final class TabItemView: NSView, NSTextFieldDelegate {
         let lh = label.frame.height
         let showsClose = !closeButton.isHidden
         let left: CGFloat = compact ? (showsClose ? 20 : 6) : 24
-        let right: CGFloat = compact ? (activity == .idle ? 6 : 18) : 24
+        let right: CGFloat = activity == .idle && (selected || compact) ? 8 : (compact ? 18 : 24)
         label.frame = NSRect(x: left + dot, y: (bounds.height - lh) / 2, width: max(10, bounds.width - left - right - dot), height: lh)
         editor?.frame = NSRect(x: 22, y: (bounds.height - 20) / 2, width: bounds.width - 30, height: 20)
         spinner.frame = NSRect(x: bounds.width - 20, y: (bounds.height - 12) / 2, width: 12, height: 12)
@@ -422,8 +459,8 @@ final class TabItemView: NSView, NSTextFieldDelegate {
         let r = bounds.insetBy(dx: 1, dy: 0)
         defer {
             // Finished / failed while you were in another tab.
-            if activity == .failed || activity == .done {
-                (activity == .failed ? t.red : t.blue).setFill()
+            if activity == .failed || activity == .done || activity == .waiting {
+                (activity == .failed ? t.red : activity == .waiting ? NSColor.systemOrange : t.blue).setFill()
                 NSBezierPath(ovalIn: NSRect(x: bounds.width - 17, y: bounds.midY - 3.5, width: 7, height: 7)).fill()
             }
         }
@@ -470,9 +507,7 @@ final class TabItemView: NSView, NSTextFieldDelegate {
             NSCursor.closedHand.push()
         }
         // Follow the mouse, but stay inside the tab strip.
-        let minX = bar.frameForTab(0, count: 1).minX
-        let maxX = bar.bounds.width - 44 - frame.width
-        frame.origin.x = min(max(dragOrigin + dx, minX), max(minX, maxX))
+        frame.origin.x = bar.dragOrigin(for: dragOrigin + dx, tabWidth: frame.width)
         bar.dragMoved(self)
     }
 

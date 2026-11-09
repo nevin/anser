@@ -12,6 +12,8 @@ _ar_emit() { builtin print -rn -- $'\e]2;'"${_ar_mark}anser:${_ar_tok}${_ar_sep}
 
 _ar_precmd() {
     local ec=$?
+    # Anser's self-test runs this locally: keep its commands out of the user's shell history.
+    [[ -n "${ANSER_PRIVATE_HISTFILE:-}" ]] && HISTFILE=$ANSER_PRIVATE_HISTFILE
     builtin print -rn -- $'\e]133;D;'"$ec"$'\a'
     _ar_emit "prompt${_ar_sep}${ec}${_ar_sep}${HOST}${_ar_sep}${PWD}"
 }

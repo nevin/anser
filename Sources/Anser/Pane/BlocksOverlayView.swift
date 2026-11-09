@@ -41,13 +41,13 @@ final class BlocksOverlayView: NSView {
         strip.isHidden = true
         stripLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .medium)
         strip.addSubview(stripLabel)
+        // Four everyday actions; "…" opens the same full menu as right-click.
         for (sym, tip, sel) in [("sparkles", "Explain with AI (why did this fail?)", #selector(explain)),
+                                ("arrow.clockwise", "Run again", #selector(rerun)),
                                 ("doc.on.doc", "Copy output", #selector(copyOutput)),
                                 ("terminal", "Copy command", #selector(copyCommand)),
-                                ("arrow.clockwise", "Run again", #selector(rerun)),
-                                ("macwindow", "Open the output in its own window (find, copy, export)", #selector(openViewer)),
-                                ("square.and.arrow.up", "Export output (Markdown, JSON, PDF…)", #selector(exportBlock)),
-                                ("book.closed", "Save command to notebook", #selector(saveToNotebook))] {
+                                ("book.closed", "Save command to notebook", #selector(saveToNotebook)),
+                                ("ellipsis.circle", "More: open in a window, compare, view as table, share, export…", #selector(moreActions))] {
             let b = NSButton(image: NSImage(systemSymbolName: sym, accessibilityDescription: tip)!, target: self, action: sel)
             b.isBordered = false
             b.imageScaling = .scaleProportionallyDown
@@ -242,6 +242,81 @@ final class BlocksOverlayView: NSView {
         s.draw(at: NSPoint(x: pill.minX + 6, y: pill.minY + 1), withAttributes: attrs)
     }
 
+    // MARK: Right-click menu
+
+    /// The finished command at `point` (this view's coordinates), if any.
+    func block(at point: NSPoint) -> Block? {
+        blocks.first { point.y >= $0.top && point.y < $0.bottom && !$0.running && $0.info != nil }
+    }
+
+    /// Every action for the command under the mouse, grouped, for the terminal's right-click menu.
+    func commandMenuItems(at point: NSPoint) -> [NSMenuItem]? {
+        guard let pane, let b = block(at: point), let info = b.info, !info.command.isEmpty else { return nil }
+        return Self.commandMenuItems(for: info, blockIndex: b.blockIndex, markIndex: b.markIndex, pane: pane)
+    }
+
+    static func commandMenuItems(for info: ShellSession.Block, blockIndex: Int?, markIndex: Int?, pane: PaneView) -> [NSMenuItem] {
+        let cmd = info.command
+        var items: [NSMenuItem] = []
+        func item(_ title: String, _ symbol: String, enabled: Bool = true, _ action: @escaping () -> Void) {
+            let i = ClosureMenuItem(title: title, action: action)
+            i.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            i.isEnabled = enabled
+            items.append(i)
+        }
+        func sep() { items.append(.separator()) }
+        // Header: the command and how it went.
+        let ok = (info.exitCode ?? 0) == 0
+        let head = NSMenuItem(title: (ok ? "✓ " : "✗ ") + String(cmd.replacingOccurrences(of: "\n", with: " ⏎ ").prefix(60))
+                              + (info.duration.map { "  ·  " + Services.formatDuration($0) } ?? "") + (ok ? "" : "  ·  exit \(info.exitCode ?? 0)"),
+                              action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        items.append(head)
+        let atPrompt = pane.session.atPrompt
+        // Run
+        item("Run Again", "arrow.clockwise", enabled: atPrompt) { pane.run(cmd) }
+        item("Edit and Run…", "pencil") { pane.insertIntoEditor(cmd) }
+        if !ok, Services.shared.aiEnabled, let i = blockIndex { item("Explain with \(Services.shared.aiName)", "sparkles") { pane.explainBlock(at: i) } }
+        if !ok, let (r, c, _) = pane.testReport, c == cmd, !r.failures.isEmpty {
+            item("Failed Tests (\(r.failures.count))…", "xmark.octagon") { pane.showFailedTestsMenu(from: pane.testsChip) }
+        }
+        sep()
+        // Output
+        item("Copy Output", "doc.on.doc") {
+            let live = (markIndex ?? 0) >= 1 ? pane.surfaceView.commandOutput(index: (markIndex ?? 1) - 1) : nil
+            let text = (live?.isEmpty == false ? live : nil) ?? blockIndex.flatMap { pane.output(ofBlock: $0) }
+            if let out = text, !out.isEmpty { TerminalWindowController.copy(out); pane.flash("Copied output (\(out.components(separatedBy: "\n").count) lines)") }
+            else { pane.flash("This command printed nothing") }
+        }
+        item("Copy Command", "terminal") { TerminalWindowController.copy(cmd); pane.flash("Copied command") }
+        if let i = blockIndex {
+            item("Open Output in a Window", "macwindow") { pane.windowController?.showOutputViewer(for: pane, block: i) }
+            item("View as Table or JSON", "tablecells") { pane.viewOutputAsData(block: i) }
+            item("Compare with Previous Run", "arrow.left.arrow.right") { pane.compareWithPreviousRun(block: i) }
+            item("Open in Log Viewer", "list.bullet.rectangle") { pane.openLogViewer() }
+        }
+        sep()
+        // Keep it
+        item("Save to Notebook…", "book.closed") { NotebookSaver.save([cmd], over: pane.window) { n in pane.flash(n == 0 ? "Already in the Notebook" : "Saved to the Notebook") } }
+        item("Make an Alias…", "text.badge.plus") {
+            let env = pane.session.env
+            let taken = Set(pane.session.env.aliases.keys).union(AliasManager.load().aliases.map(\.name))
+            let name = HabitSuggestions.name(for: cmd) { taken.contains($0) || CommandIndex.shared.contains($0, env: env) }
+            AliasManager.edit(nil, suggestedName: name, command: cmd, over: pane.window, pane: pane)
+        }
+        item("Watch Its Output…", "eye") { pane.promptOutputWatch(command: cmd) }
+        item("Re-run When Files Change", "eye.circle", enabled: !pane.session.isRemote) { pane.startWatching(command: cmd, cwd: info.cwd) }
+        item("Show in History Editor", "clock.arrow.circlepath") { HistoryEditorWindowController.shared.show(for: pane, select: cmd) }
+        sep()
+        // Share
+        if let i = blockIndex {
+            item("Share…", "link") { pane.shareCommand(block: i) }
+            item("Export Output…", "square.and.arrow.up") { pane.windowController?.exportOutput(for: pane, block: i) }
+        }
+        while items.last?.isSeparatorItem == true { items.removeLast() }
+        return items
+    }
+
     // MARK: Actions
 
     @objc private func copyOutput() {
@@ -263,10 +338,6 @@ final class BlocksOverlayView: NSView {
         pane.flash("Copied command")
     }
 
-    @objc private func exportBlock() {
-        guard let pane, let i = hoveredBlock?.blockIndex else { NSSound.beep(); return }
-        pane.windowController?.exportOutput(for: pane, block: i)
-    }
 
     @objc private func saveToNotebook() {
         guard let cmd = hoveredBlock?.info?.command, !cmd.isEmpty else { NSSound.beep(); return }
@@ -278,9 +349,21 @@ final class BlocksOverlayView: NSView {
         pane.explainBlock(at: i)
     }
 
-    @objc private func openViewer() {
-        guard let pane, let i = hoveredBlock?.blockIndex else { NSSound.beep(); return }
-        pane.windowController?.showOutputViewer(for: pane, block: i)
+
+
+
+
+    @objc private func moreActions(_ sender: NSButton) {
+        guard let pane, let b = hoveredBlock, let info = b.info else { NSSound.beep(); return }
+        let menu = NSMenu()
+        Self.commandMenuItems(for: info, blockIndex: b.blockIndex, markIndex: b.markIndex, pane: pane).forEach { menu.addItem($0) }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
+    }
+
+    /// The "…" menu's titles for the hovered command (tests).
+    var moreMenuTitles: [String] {
+        guard let pane, let b = hoveredBlock, let info = b.info else { return [] }
+        return Self.commandMenuItems(for: info, blockIndex: b.blockIndex, markIndex: b.markIndex, pane: pane).map(\.title)
     }
 
     @objc private func rerun() {

@@ -20,6 +20,10 @@ public struct Profile: Codable, Sendable, Equatable {
     public var env: [String: String]?
     /// Ask before running commands matching these patterns here ("*" = every command).
     public var confirm: [String]?
+    /// Kubernetes context name pattern ("prod-*"): the badge and color show while it's the current context.
+    public var kubeContext: String?
+    /// AWS profile pattern ("prod*"): the same, for AWS_PROFILE.
+    public var awsProfile: String?
 
     public init(name: String? = nil, host: String? = nil, folder: String? = nil, tabColor: String? = nil,
                 badge: String? = nil, env: [String: String]? = nil, confirm: [String]? = nil) {
@@ -55,6 +59,19 @@ public struct Profile: Codable, Sendable, Equatable {
             if let c = p.confirm { out.confirm = (out.confirm ?? []) + c }
         }
         return out
+    }
+
+    /// Whether this profile is about a cloud context that is current now.
+    public func matches(context c: CloudContext) -> Bool {
+        guard kubeContext != nil || awsProfile != nil else { return false }
+        if let k = kubeContext { guard let cur = c.kube, AnserConfig.glob(k.lowercased(), cur.lowercased()) else { return false } }
+        if let a = awsProfile { guard let cur = c.aws, AnserConfig.glob(a.lowercased(), cur.lowercased()) else { return false } }
+        return true
+    }
+
+    /// The first profile matching the current cloud context.
+    public static func resolve(_ profiles: [Profile], context: CloudContext) -> Profile? {
+        profiles.first { $0.matches(context: context) }
     }
 
     /// Whether running `command` here needs a confirmation first.

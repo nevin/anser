@@ -2,7 +2,7 @@ import AppKit
 import Carbon.HIToolbox
 import AnserCore
 
-/// More cursors (⌥-click, ⌥-drag for a column, ⌥⌘D next match, ⌃⌘G all
+/// More cursors (⌥-click, ⌥-drag for a column, ⌥⌘G next match, ⌃⌘G all
 /// matches) and line editing (⌘/ comment, ⇧⌥↑↓ duplicate, ⌃⌘↑↓ move).
 extension CommandEditor {
     // MARK: More cursors
@@ -112,7 +112,7 @@ extension CommandEditor {
         extraSelections = Array(unique.dropFirst())
     }
 
-    /// ⌥⌘D: the word at the caret, then each next match as another selection.
+    /// ⌥⌘G: the word at the caret, then each next match as another selection.
     func selectNextOccurrence() {
         let ns = string as NSString
         let base = selectedRange()
@@ -302,7 +302,8 @@ extension CommandEditor {
             default: break
             }
         }
-        if flags == [.command, .option], ch == "d" { selectNextOccurrence(); return true }
+        // ⌥⌘G is the main shortcut: macOS takes ⌥⌘D for hiding the Dock. ⌥⌘D still works where that's turned off.
+        if flags == [.command, .option], ch == "g" || ch == "d" { selectNextOccurrence(); return true }
         if flags == [.control, .command], ch == "g" { selectAllOccurrences(); return true }
         if flags == [.shift, .option], key == kVK_UpArrow || key == kVK_DownArrow, !popup.isVisible {
             duplicateLines(up: key == kVK_UpArrow); return true

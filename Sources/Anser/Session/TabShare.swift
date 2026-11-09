@@ -14,6 +14,11 @@ final class TabShare {
     static let maxDuration: TimeInterval = 2 * 3600
 
     let token: String
+    /// A 4-digit code viewers must type (nil = the link alone is enough).
+    let code: String?
+    /// Wrong codes so far; sharing stops after too many (someone is guessing).
+    private(set) var wrongCodes = 0
+    static let maxWrongCodes = 10
     private weak var pane: PaneView?
     private let sessionID: String
     private var listener: NWListener?
@@ -27,8 +32,9 @@ final class TabShare {
 
     static func share(for pane: PaneView) -> TabShare? { active[pane.session.id] }
 
-    private init(pane: PaneView) {
+    private init(pane: PaneView, requireCode: Bool) {
         self.pane = pane
+        code = requireCode ? String(format: "%04d", Int.random(in: 0...9999)) : nil
         sessionID = pane.session.id
         var bytes = [UInt8](repeating: 0, count: 18)
         _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
@@ -36,9 +42,9 @@ final class TabShare {
     }
 
     /// Starts sharing; `ready` gets the share once its port is known (nil if it couldn't start).
-    static func start(for pane: PaneView, ready: @escaping (TabShare?) -> Void) {
+    static func start(for pane: PaneView, requireCode: Bool = false, ready: @escaping (TabShare?) -> Void) {
         if let s = active[pane.session.id] { ready(s); return }
-        let share = TabShare(pane: pane)
+        let share = TabShare(pane: pane, requireCode: requireCode)
         starting[share.sessionID] = share
         do {
             let l = try NWListener(using: .tcp, on: .any)
@@ -52,6 +58,7 @@ final class TabShare {
                     starting[share.sessionID] = nil
                     active[share.sessionID] = share
                     share.timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak share] _ in share?.tick() }
+                    share.timer?.tolerance = 0.15
                     Services.shared.record("share.start")
                     ready(share)
                     pane.refreshChrome()
@@ -91,10 +98,20 @@ final class TabShare {
                   let first = req.split(separator: "\r\n").first else { c.cancel(); return }
             let parts = first.split(separator: " ")
             guard parts.count >= 2, parts[0] == "GET" else { self.send(c, status: "405 Method Not Allowed", body: "read-only"); return }
-            let path = String(parts[1].split(separator: "?").first ?? "")
+            let target = String(parts[1])
+            let path = String(target.split(separator: "?").first ?? "")
+            let given = URLComponents(string: target)?.queryItems?.first { $0.name == "code" }?.value
+            let codeOK = self.code == nil || given == self.code
             switch path {
             case "/s/\(self.token)":
-                self.send(c, status: "200 OK", type: "text/html; charset=utf-8", body: Self.page)
+                self.send(c, status: "200 OK", type: "text/html; charset=utf-8", body: Self.page.replacingOccurrences(of: "@@NEEDCODE@@", with: self.code == nil ? "false" : "true"))
+            case "/s/\(self.token)/check":
+                if codeOK { self.send(c, status: "200 OK", body: "ok"); return }
+                self.wrongCode()
+                self.send(c, status: "403 Forbidden", body: "wrong code")
+            case "/s/\(self.token)/events" where !codeOK:
+                self.wrongCode()
+                self.send(c, status: "403 Forbidden", body: "wrong code")
             case "/s/\(self.token)/events":
                 guard self.viewers.count < Self.maxViewers else { self.send(c, status: "503 Service Unavailable", body: "Too many viewers"); return }
                 let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n"
@@ -109,6 +126,14 @@ final class TabShare {
             default:
                 self.send(c, status: "404 Not Found", body: "Not found")
             }
+        }
+    }
+
+    private func wrongCode() {
+        wrongCodes += 1
+        if wrongCodes >= Self.maxWrongCodes {
+            pane?.flash("Stopped sharing: too many wrong codes")
+            stop()
         }
     }
 
@@ -180,14 +205,29 @@ final class TabShare {
     header { padding: 10px 16px; display: flex; gap: 10px; align-items: center; border-bottom: 1px solid #333; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #4caf50; }
     .off .dot { background: #888; }
+    form { padding: 16px; } input { font: 16px ui-monospace, Menlo, monospace; padding: 4px 6px; }
     pre { margin: 0; padding: 12px 16px; font: 13px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; overflow: auto; }
     </style></head>
     <body><header><span class="dot"></span><span id="s">Live · read-only · shared from Anser</span></header><pre id="t">Connecting…</pre>
+    <form id="f" hidden><label>Code from the person sharing: <input id="c" inputmode="numeric" maxlength="4" size="5" autofocus></label> <button>Watch</button> <span id="m"></span></form>
     <script>
-    const t = document.getElementById('t'), s = document.getElementById('s');
-    const es = new EventSource(location.pathname + '/events');
-    es.onmessage = e => { t.textContent = JSON.parse(e.data); s.textContent = 'Live · read-only · shared from Anser'; document.body.className = ''; };
-    es.onerror = () => { s.textContent = 'Not connected: sharing may have stopped'; document.body.className = 'off'; };
+    const t = document.getElementById('t'), s = document.getElementById('s'), f = document.getElementById('f');
+    function watch(code) {
+      const q = code ? '?code=' + encodeURIComponent(code) : '';
+      const es = new EventSource(location.pathname + '/events' + q);
+      es.onmessage = e => { t.textContent = JSON.parse(e.data); s.textContent = 'Live · read-only · shared from Anser'; document.body.className = ''; };
+      es.onerror = () => { s.textContent = 'Not connected: sharing may have stopped'; document.body.className = 'off'; };
+    }
+    if (@@NEEDCODE@@) {
+      f.hidden = false; t.textContent = '';
+      f.onsubmit = async ev => {
+        ev.preventDefault();
+        const code = document.getElementById('c').value.trim();
+        const r = await fetch(location.pathname + '/check?code=' + encodeURIComponent(code)).catch(() => null);
+        if (r && r.ok) { f.hidden = true; t.textContent = 'Connecting…'; watch(code); }
+        else { document.getElementById('m').textContent = 'That code is not right.'; }
+      };
+    } else { watch(''); }
     </script></body></html>
     """
 }
@@ -202,23 +242,31 @@ extension PaneView {
             + "The link has a long secret, works only on your network (not encrypted), and stops when you stop sharing, close the tab, quit, or after 2 hours."
         a.addButton(withTitle: "Share and Copy Link")
         a.addButton(withTitle: "Cancel")
+        let codeBox = NSButton(checkboxWithTitle: "Viewers must also type a 4-digit code I tell them", target: nil, action: nil)
+        codeBox.state = .on
+        a.accessoryView = codeBox
         guard let w = window else { return }
         a.beginSheetModal(for: w) { [weak self] r in
             guard r == .alertFirstButtonReturn, let self else { return }
-            TabShare.start(for: self) { [weak self] share in
+            TabShare.start(for: self, requireCode: codeBox.state == .on) { [weak self] share in
                 guard let share else { self?.flash("Couldn't start sharing"); return }
                 TerminalWindowController.copy(share.link)
-                self?.flash("Link copied: \(share.link)")
+                self?.flash("Link copied: \(share.link)" + (share.code.map { " · code \($0)" } ?? ""))
             }
         }
     }
 
     func showShareMenu(_ s: TabShare) {
+        shareMenu(s).popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
+
+    func shareMenu(_ s: TabShare) -> NSMenu {
         let m = NSMenu()
         m.addItem(ClosureMenuItem(title: "Copy Link") { TerminalWindowController.copy(s.link) })
+        if let code = s.code { m.addItem(ClosureMenuItem(title: "Copy Code (\(code))") { TerminalWindowController.copy(code) }) }
         m.addItem(ClosureMenuItem(title: "Open in Browser") { if let u = URL(string: s.link) { NSWorkspace.shared.open(u) } })
         m.addItem(.separator())
         m.addItem(ClosureMenuItem(title: "Stop Sharing") { [weak self] in s.stop(); self?.flash("Stopped sharing") })
-        m.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        return m
     }
 }

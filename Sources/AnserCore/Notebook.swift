@@ -90,6 +90,26 @@ public struct Notebook: Codable, Sendable, Equatable {
 
     public var entryCount: Int { groups.reduce(0) { $0 + $1.entries.count } }
 
+    /// Whether some entry already holds exactly this command.
+    public func contains(command: String) -> Bool {
+        let c = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        return groups.contains { $0.entries.contains { $0.command.trimmingCharacters(in: .whitespacesAndNewlines) == c } }
+    }
+
+    /// Adds commands from history to a group (by name, made if missing), skipping ones already saved.
+    /// Returns how many were added.
+    @discardableResult
+    public mutating func addFromHistory(_ commands: [(command: String, title: String)], toGroupNamed name: String) -> Int {
+        let gname = name.trimmingCharacters(in: .whitespaces).isEmpty ? "General" : name.trimmingCharacters(in: .whitespaces)
+        let gid = groups.first { $0.name == gname }?.id ?? addGroup(named: gname)
+        var n = 0
+        for (cmd, title) in commands where !contains(command: cmd) {
+            add(Entry(title: title, command: cmd.trimmingCharacters(in: .whitespacesAndNewlines)), to: gid)
+            n += 1
+        }
+        return n
+    }
+
     // MARK: Storage
 
     public static var defaultURL: URL { AnserConfig.directory.appendingPathComponent("notebook.json") }
