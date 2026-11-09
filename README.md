@@ -47,3 +47,12 @@ open build/Anser.app
 - `patches/ghostty-anser.patch`: two small additions to libghostty, `ghostty_surface_read_command_output` (exact output copying) and `ghostty_surface_prompt_marks` (command block positions).
 
 Shell support: zsh and bash get the full editor, in emacs or vi mode, locally and over ssh. fish has hooks too (not yet tested). Other shells (fish, nushell) still work as a normal Ghostty terminal; the bar says integration isn't active.
+
+## License
+
+Anser is released under the [MIT License](LICENSE). Copyright (c) 2026 Nevin Paul.
+
+It builds on other MIT-licensed projects, whose copyright notices apply to their parts:
+[Ghostty](https://github.com/ghostty-org/ghostty) (the terminal engine),
+[Sparkle](https://github.com/sparkle-project/Sparkle) (updates) and
+[Fig's autocomplete specs](https://github.com/withfig/autocomplete) (completions, when imported).
