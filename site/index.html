@@ -98,6 +98,25 @@
   .install .btn-primary:hover { background: var(--navy-light); }
   .install .fine { color: #6A6C88; }
 
+  .uninstall { padding-top: 0; }
+  .uninstall details { max-width: 900px; margin: 0 auto; background: #fff; border: 1px solid #ECE3D2; border-radius: 14px; padding: 0 22px; }
+  .uninstall summary { cursor: pointer; padding: 18px 0; font: 700 19px var(--serif); list-style: none; display: flex; justify-content: space-between; align-items: center; }
+  .uninstall summary::-webkit-details-marker { display: none; }
+  .uninstall summary::after { content: "+"; font: 400 24px var(--sans); color: #6A6C88; }
+  .uninstall details[open] summary::after { content: "–"; }
+  .uninstall ol { margin: 0 0 14px; padding-left: 22px; font-size: 15.5px; }
+  .uninstall ol li { margin-bottom: 6px; }
+  .uninstall p { font-size: 15.5px; color: #3F4268; margin: 0 0 12px; }
+  .code { position: relative; background: var(--navy); color: var(--cream); border-radius: 10px; margin: 0 0 14px; }
+  .code pre { margin: 0; padding: 16px 18px; overflow-x: auto; font: 13px/1.6 var(--mono); }
+  .code .c { color: rgba(251, 240, 219, .45); }
+  .copy { position: absolute; top: 8px; right: 8px; background: rgba(251, 240, 219, .12); color: var(--cream); border: 0; border-radius: 6px; padding: 4px 10px; font: 12px var(--sans); cursor: pointer; }
+  .copy:hover { background: rgba(251, 240, 219, .22); }
+  .where { width: 100%; border-collapse: collapse; font-size: 14.5px; margin: 0 0 16px; }
+  .where td { padding: 8px 10px 8px 0; border-top: 1px solid #ECE3D2; vertical-align: top; }
+  .where td:first-child { font: 13px var(--mono); white-space: nowrap; padding-right: 18px; }
+  @media (max-width: 640px) { .where td:first-child { white-space: normal; word-break: break-all; } .uninstall details { padding: 0 16px; } }
+
   footer { border-top: 1px solid #ECE3D2; padding: 30px 0 40px; font-size: 14px; color: #6A6C88; }
   footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   footer a { text-decoration: none; } footer a:hover { text-decoration: underline; }
@@ -201,16 +220,55 @@
       <p class="fine"><span class="version-note">Free</span> · macOS 14 Sonoma or later</p>
     </div>
   </section>
+  <section id="uninstall" class="uninstall">
+    <div class="wrap">
+      <details>
+        <summary>Uninstalling Anser</summary>
+        <ol>
+          <li><b>Quit Anser with ⌥ Quit</b>: hold Option in the Anser menu. A plain Quit keeps your shells running in the background; ⌥ Quit ends them too.</li>
+          <li><b>Drag Anser from Applications to the Trash.</b></li>
+        </ol>
+        <p>That removes the app. Your settings and history stay on your Mac in case you come back. To remove those too, run this in any terminal:</p>
+        <div class="code"><button class="copy" type="button">Copy</button><pre id="cleanup"><span class="c"># Shells still running in the background</span>
+pkill -x anser-session
+<span class="c"># Settings, notebook, history, saved windows, caches and logs</span>
+rm -rf ~/.config/anser \
+  ~/Library/"Application Support"/Anser \
+  ~/Library/Caches/Anser ~/Library/Caches/app.anser.terminal \
+  ~/Library/HTTPStorages/app.anser.terminal \
+  ~/Library/Logs/Anser \
+  ~/Library/"Saved Application State"/app.anser.terminal.savedState
+<span class="c"># Preferences: window sizes, panels, tips</span>
+defaults delete app.anser.terminal 2&gt;/dev/null
+<span class="c"># Your AI key and saved secrets in the Keychain</span>
+while security delete-generic-password -s Anser &gt;/dev/null 2&gt;&amp;1; do :; done
+while security delete-generic-password -s app.anser.terminal.secret &gt;/dev/null 2&gt;&amp;1; do :; done</pre></div>
+        <table class="where">
+          <tr><td>~/.config/anser</td><td>Settings, Command Notebook, aliases, plugins, runbooks</td></tr>
+          <tr><td>~/Library/Application Support/Anser</td><td>Command history and saved output, saved windows and tabs, background shells</td></tr>
+          <tr><td>Caches, HTTPStorages, Logs</td><td>Caches and logs, safe to delete any time</td></tr>
+          <tr><td>Keychain</td><td>Your AI API key and any secrets you saved</td></tr>
+        </table>
+        <p>If you turned on sync, Anser also wrote to the folder you picked, for example <code>iCloud Drive/Anser</code>. Anser never edits your <code>.zshrc</code>, <code>.bashrc</code> or shell history, so there's nothing to undo there.</p>
+      </details>
+    </div>
+  </section>
 </main>
 
 <footer>
   <div class="wrap">
     <span>Anser · <i>anser</i> is Latin for goose, whose feathers made the first quills.</span>
-    <span><a href="https://github.com/nevin/anser/blob/main/LICENSE">MIT License</a> · <a href="https://github.com/nevin/anser">GitHub</a> · <a href="https://github.com/nevin/anser/releases">Releases</a> · <a href="https://github.com/nevin/anser/blob/main/docs/FEATURES.md">All features</a></span>
+    <span><a href="https://github.com/nevin/anser/blob/main/LICENSE">MIT License</a> · <a href="https://github.com/nevin/anser">GitHub</a> · <a href="https://github.com/nevin/anser/releases">Releases</a> · <a href="https://github.com/nevin/anser/blob/main/docs/FEATURES.md">All features</a> · <a href="#uninstall">Uninstall</a></span>
   </div>
 </footer>
 
 <script>
+  // Copy the cleanup commands without the comment lines.
+  document.querySelectorAll(".copy").forEach(b => b.addEventListener("click", () => {
+    const text = b.nextElementSibling.textContent.split("\n").filter(l => !l.startsWith("#")).join("\n");
+    navigator.clipboard.writeText(text).then(() => { b.textContent = "Copied"; setTimeout(() => b.textContent = "Copy", 1500); });
+  }));
+
   // Point the download buttons straight at the newest DMG. If GitHub can't be reached,
   // they keep linking to the releases page.
   fetch("https://api.github.com/repos/nevin/anser/releases/latest")

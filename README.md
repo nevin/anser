@@ -27,6 +27,38 @@ Download the DMG, drag Anser to Applications, and open it. It updates itself (An
 
 Coming from iTerm2 or Warp? App menu → **Import from iTerm2 or Warp…** brings over themes, font and workflows.
 
+## Uninstall
+
+1. **Quit Anser with ⌥ Quit** (hold Option in the Anser menu). A plain Quit keeps your shells running in the background; ⌥ Quit ends them too.
+2. **Drag Anser from Applications to the Trash.**
+
+That removes the app. Your settings and history stay on your Mac in case you come back. To remove those too, run this in any terminal:
+
+```bash
+pkill -x anser-session                                         # any shells still running in the background
+rm -rf ~/.config/anser \
+  ~/Library/"Application Support"/Anser \
+  ~/Library/Caches/Anser ~/Library/Caches/app.anser.terminal \
+  ~/Library/HTTPStorages/app.anser.terminal \
+  ~/Library/Logs/Anser \
+  ~/Library/"Saved Application State"/app.anser.terminal.savedState
+defaults delete app.anser.terminal 2>/dev/null                 # preferences: window sizes, panels, tips
+while security delete-generic-password -s Anser >/dev/null 2>&1; do :; done                     # AI keys
+while security delete-generic-password -s app.anser.terminal.secret >/dev/null 2>&1; do :; done # saved secrets
+```
+
+What each one held:
+
+| Location | What's there |
+|---|---|
+| `~/.config/anser` | Settings, Command Notebook, aliases, plugins, runbooks |
+| `~/Library/Application Support/Anser` | Command history and saved output, saved windows and tabs, background shells |
+| `~/Library/Caches/…`, `HTTPStorages/…`, `Logs/Anser` | Caches and logs, safe to delete any time |
+| Preferences (`app.anser.terminal`) | Window sizes, panels, tips you've seen |
+| Keychain (`Anser`, `app.anser.terminal.secret`) | Your AI API key and any secrets you saved |
+
+If you turned on sync, Anser also wrote to the folder you picked (for example `iCloud Drive/Anser`). Delete it there if you don't need it on your other Macs. Anser never edits your `.zshrc`, `.bashrc` or shell history, so there's nothing to undo there.
+
 ## Build from source
 
 ```sh
