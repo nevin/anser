@@ -332,6 +332,20 @@ final class DevHelperTests: XCTestCase {
         XCTAssertEqual(c.map(\.summary), ["modified", "modified, staged", "new file", "renamed, staged"])
     }
 
+    func testCommandSeparatorStripped() {
+        let out = "a\nb\n── sneha@Mac-Pro · 22:09:15 ──────────\n"
+        XCTAssertEqual(CommandSeparator.strip(out), "a\nb\n")
+        XCTAssertEqual(CommandSeparator.strip("x\n┄┄ me@host · 01:02:03 ┄┄┄┄\n\n"), "x\n")
+        XCTAssertEqual(CommandSeparator.strip("── not a separator\n"), "── not a separator\n")
+        XCTAssertEqual(CommandSeparator.strip("── sneha@Mac · 22:09:15 ────\n"), "")
+    }
+
+    /// git's warnings land in the same output; they must not show up as files.
+    func testGitStatusParseSkipsWarnings() {
+        let out = "warning: could not open directory 'Pictures/Photos Library/': Operation not permitted\n M a.swift\nfatal: oops\n"
+        XCTAssertEqual(GitChange.parse(out).map(\.path), ["a.swift"])
+    }
+
     func testRecentDirectories() {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent("qdirs-\(UUID().uuidString).sqlite").path
         let h = HistoryStore(path: path)

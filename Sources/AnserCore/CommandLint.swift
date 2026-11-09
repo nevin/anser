@@ -121,7 +121,7 @@ public enum CommandLint {
         }
     }
 
-    nonisolated(unsafe) static let rules: [Rule] = [
+    static let rules: [Rule] = [
         Rule(#"\brm\s+(?:-[a-z]*\s+)*-[a-z]*[rR][a-z]*\s+(?:-[a-z]+\s+)*(?:"?(?:/|/\*|~/?|~/\*|\$HOME/?|/Users/?|/System|/Library|/Applications)"?)(?=\s|$|;|&|\|)"#,
              .danger, "This deletes everything in a top-level folder (or your whole home folder)."),
         Rule(#":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"#, .danger, "This is a fork bomb: it freezes the Mac until it restarts."),

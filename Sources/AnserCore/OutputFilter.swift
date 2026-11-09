@@ -38,11 +38,11 @@ public enum OutputFilter {
         return .normal
     }
 
-    nonisolated(unsafe) static let errorRE = try! NSRegularExpression(
+    static let errorRE = try! NSRegularExpression(
         pattern: #"\b(error|errors|err!|fatal|failed|failure|panic|exception|traceback|segmentation fault|denied|refused|cannot|can't|could not|not found|undefined|uncaught)\b|✗|✘|❌"#)
-    nonisolated(unsafe) static let okRE = try! NSRegularExpression(
+    static let okRE = try! NSRegularExpression(
         pattern: #"\b0 (errors?|failures?|failed)\b|\bno errors?\b|\berror(s)?: 0\b"#)
-    nonisolated(unsafe) static let warnRE = try! NSRegularExpression(
+    static let warnRE = try! NSRegularExpression(
         pattern: #"\b(warn|warning|warnings|deprecated|deprecation)\b|⚠"#)
 
     /// The shape of a line with numbers, hex and times taken out, for folding.

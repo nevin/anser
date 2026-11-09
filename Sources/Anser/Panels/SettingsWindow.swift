@@ -71,6 +71,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let padding = NSTextField()
     private let paddingStepper = NSStepper()
     private let promptPopup = NSPopUpButton()
+    private let separatorPopup = NSPopUpButton()
     private let notifyField = NSTextField()
     private let aiPopup = NSPopUpButton()
     static let aiChoices = [("off", "Off"), ("claude", "Claude (Anthropic API key)"), ("copilot", "GitHub Copilot (your GitHub sign-in)"),
@@ -111,6 +112,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private var themes: [String] = []
 
     private static let cursorStyles: [(String?, String)] = [(nil, "Default"), ("block", "Block"), ("bar", "Bar"), ("underline", "Underline"), ("block_hollow", "Hollow block")]
+    private static let separatorStyles: [(String, String)] = [("line", "Line  ── you@mac · 14:02 ──"), ("dotted", "Dotted  ┄┄ you@mac · 14:02 ┄┄"), ("none", "None")]
     private static let promptModes: [(String, String)] = [("hidden", "Hidden (the editor is the only input)"), ("compact", "Short ❯ prompt"), ("full", "My shell's own prompt")]
 
     private init() {
@@ -233,6 +235,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         for (_, title) in Self.promptModes { promptPopup.addItem(withTitle: title) }
         promptPopup.target = self
         promptPopup.action = #selector(promptChanged)
+        for (_, title) in Self.separatorStyles { separatorPopup.addItem(withTitle: title) }
+        separatorPopup.target = self
+        separatorPopup.action = #selector(separatorChanged)
 
         func grid(_ rows: [[NSView]]) -> NSGridView {
             let g = NSGridView(views: rows)
@@ -308,9 +313,10 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             grid([
                 [label("Editor text size:"), stepperRow(editorSize, editorSizeStepper, min: 9, max: 28, action: #selector(editorSizeChanged), unit: "pt")],
                 [label("Shell prompt:"), promptPopup],
+                [label("After each command:"), separatorPopup],
                 [label("Keyboard tips:"), tipsPopup],
             ]),
-            note("Shell prompt changes apply to new tabs."),
+            note("The line after each command shows who ran it, on which Mac, and when it started. Shell prompt and line changes apply to new tabs."),
             editorToggles,
         ])
 
@@ -789,6 +795,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         padding.doubleValue = pad; paddingStepper.doubleValue = pad
         let pm = (value(json, ["shellPrompt"]) as? String) ?? "hidden"
         promptPopup.selectItem(at: Self.promptModes.firstIndex { $0.0 == pm } ?? 0)
+        let sepValue = value(json, ["commandSeparator"])
+        let sep = (sepValue as? Bool).map { $0 ? "line" : "none" } ?? (sepValue as? String) ?? "line"
+        separatorPopup.selectItem(at: Self.separatorStyles.firstIndex { $0.0 == sep } ?? 0)
         let notify = (value(json, ["notifyAfterSeconds"]) as? Double) ?? 10
         notifyToggle.state = notify > 0 ? .on : .off
         notifyField.doubleValue = notify > 0 ? notify : 10
@@ -910,6 +919,10 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         let v = (sender as? NSStepper) != nil ? paddingStepper.doubleValue : padding.doubleValue
         padding.doubleValue = v; paddingStepper.doubleValue = v
         set(["appearance", "padding"], v)
+    }
+
+    @objc private func separatorChanged() {
+        set(["commandSeparator"], Self.separatorStyles[max(0, separatorPopup.indexOfSelectedItem)].0)
     }
 
     @objc private func promptChanged() {

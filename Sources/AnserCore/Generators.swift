@@ -333,8 +333,12 @@ public struct GitChange: Sendable, Equatable {
 
     /// Parses `git status --porcelain=v1` output.
     public static func parse(_ text: String) -> [GitChange] {
-        text.split(separator: "\n").compactMap { line in
-            guard line.count > 3 else { return nil }
+        // Two status letters, then a space. Anything else (like git's "warning: …" lines) isn't a file.
+        let codes = Set(" MTADRCU?!")
+        return text.split(separator: "\n").compactMap { line in
+            let chars = Array(line.prefix(3))
+            guard line.count > 3, chars[2] == " ", codes.contains(chars[0]), codes.contains(chars[1]),
+                  chars[0] != " " || chars[1] != " " else { return nil }
             let code = String(line.prefix(2))
             var path = String(line.dropFirst(3))
             if let arrow = path.range(of: " -> ") { path = String(path[arrow.upperBound...]) }
@@ -346,9 +350,9 @@ public struct GitChange: Sendable, Equatable {
 
 extension Generators {
     /// Changed files in the repo containing `cwd`, with paths relative to `cwd`.
-    public static func gitChanges(cwd: String, env: ShellEnvironment) async -> [GitChange] {
+    public static func gitChanges(cwd: String, env: ShellEnvironment, timeout: TimeInterval = 3) async -> [GitChange] {
         if GitSafety.isRisky(cwd: cwd) { return [] }
-        let out = await ScriptRunner.shared.run("git status --porcelain=v1 -uall", cwd: cwd, env: env, timeout: 3)
+        let out = await ScriptRunner.shared.run("git status --porcelain=v1 -uall", cwd: cwd, env: env, timeout: timeout)
         return GitChange.parse(out ?? "").map { c in
             var c = c
             c.path = relativize(c.path, repoCwd: cwd)

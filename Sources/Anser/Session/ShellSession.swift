@@ -257,6 +257,7 @@ final class ShellSession {
         // Gives the shell an `imgcat` (when it has none) that shows pictures.
         if let helper = SessionHost.shared.helperPath { env["ANSER_HELPER"] = helper }
         if !Services.shared.config.showLoginMessage { env["ANSER_HIDE_LOGIN"] = "1" }
+        env["ANSER_SEPARATOR"] = Services.shared.config.commandSeparator
         if let gh = GhosttyRuntime.shared.resourcesDir {
             env["GHOSTTY_RESOURCES_DIR"] = gh
             env["ANSER_GHOSTTY_INTEGRATION"] = gh + "/shell-integration"

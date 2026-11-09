@@ -60,6 +60,6 @@ public enum ForegroundJob {
     static func name(_ pid: pid_t) -> String? {
         var b = [CChar](repeating: 0, count: 256)
         let n = proc_name(pid, &b, UInt32(b.count))
-        return n > 0 ? String(cString: b) : nil
+        return n > 0 ? String(decoding: b.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self) : nil
     }
 }

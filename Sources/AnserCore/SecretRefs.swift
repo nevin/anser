@@ -10,7 +10,7 @@ public enum SecretRefs {
         case onePassword(String)
     }
 
-    nonisolated(unsafe) static let re = try! NSRegularExpression(
+    static let re = try! NSRegularExpression(
         pattern: #"\{\{\s*(?:secret:([A-Za-z0-9_.\-]{1,64})|(op://[^}\s'"]{3,300}))\s*\}\}"#)
 
     public static func find(_ s: String) -> [(range: NSRange, ref: Ref)] {

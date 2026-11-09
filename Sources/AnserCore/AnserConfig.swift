@@ -182,6 +182,9 @@ public struct AnserConfig: Codable, Sendable {
     public var editorFollowsOutput: Bool = false
     /// Show macOS's "Last login: …" line when a tab opens.
     public var showLoginMessage: Bool = false
+    /// A dim line after each command in the scrollback with who ran it, on which Mac, and when:
+    /// "line" (─), "dotted" (┄) or "none".
+    public var commandSeparator: String = "line"
     /// Keyboard tips under an empty editor. "auto" shows them while you're new
     /// (your first few hundred commands), then hides them.
     public var keyTips: String = "auto"
@@ -287,6 +290,11 @@ public struct AnserConfig: Codable, Sendable {
         fullscreenApps = try c.decodeIfPresent([String].self, forKey: .fullscreenApps) ?? d.fullscreenApps
         editorFollowsOutput = try c.decodeIfPresent(Bool.self, forKey: .editorFollowsOutput) ?? d.editorFollowsOutput
         showLoginMessage = try c.decodeIfPresent(Bool.self, forKey: .showLoginMessage) ?? d.showLoginMessage
+        if let on = try? c.decodeIfPresent(Bool.self, forKey: .commandSeparator) { commandSeparator = on ? "line" : "none" }
+        else {
+            let v = (try? c.decodeIfPresent(String.self, forKey: .commandSeparator)) ?? nil
+            commandSeparator = ["line", "dotted", "none"].contains(v ?? "") ? v! : d.commandSeparator
+        }
         keyTips = try c.decodeIfPresent(String.self, forKey: .keyTips) ?? d.keyTips
         waitAlerts = try c.decodeIfPresent(Bool.self, forKey: .waitAlerts) ?? d.waitAlerts
         serverChips = try c.decodeIfPresent(Bool.self, forKey: .serverChips) ?? d.serverChips
@@ -372,6 +380,7 @@ public struct AnserConfig: Codable, Sendable {
       "shellPrompt": "hidden",
       "editorFollowsOutput": false,
       "showLoginMessage": false,
+      "commandSeparator": "line",
       "keyTips": "auto",
       "appearance": {
         "fontFamily": null,

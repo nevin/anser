@@ -570,7 +570,7 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
         guard ghostty_surface_read_command_output(surface, UInt32(index), &t) else { return nil }
         defer { ghostty_surface_free_text(surface, &t) }
         guard let p = t.text else { return nil }
-        return String(data: Data(bytes: p, count: Int(t.text_len)), encoding: .utf8)
+        return String(data: Data(bytes: p, count: Int(t.text_len)), encoding: .utf8).map(CommandSeparator.strip)
     }
 
     // MARK: NSTextInputClient (IME)

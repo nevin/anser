@@ -81,7 +81,21 @@ typeset -gi _anser_bound=0
 typeset -g _anser_default_mode=${ANSER_PROMPT_MODE:-full}
 typeset -g _anser_prompt_mode=$_anser_default_mode
 typeset -g _anser_user_ps1="" _anser_user_rps1="" _anser_set_ps1="" _anser_transient_ps1=""
-builtin unset ANSER_PROMPT_MODE ANSER_COMPACT_PROMPT
+# After each command: "── user@mac · 14:02:11 ─────" (line), the same in ┄ (dotted), or nothing.
+typeset -g _anser_separator=${ANSER_SEPARATOR:-none} _anser_sep_at=""
+
+# Runs after Ghostty's hook has closed the command's output, so the line is
+# neither output (Copy Output skips it) nor prompt.
+_anser_sep_print() {
+    [[ -n $_anser_sep_at && $_anser_separator != none ]] || { _anser_sep_at=""; return 0 }
+    local ch='─'; [[ $_anser_separator == dotted ]] && ch='┄'
+    local label=" ${(%):-%n@%m} · $_anser_sep_at "
+    local fill=$(( ${COLUMNS:-80} - 3 - ${#label} - 1 ))
+    (( fill < 2 )) && fill=2
+    builtin print -rn -- $'\e[2m'"${(pl:2::$ch:)}$label${(pl:$fill::$ch:)}"$'\e[0m\n'
+    _anser_sep_at=""
+}
+builtin unset ANSER_PROMPT_MODE ANSER_COMPACT_PROMPT ANSER_SEPARATOR
 
 # Runs after prompt themes and just before Ghostty's hook, which adds the
 # prompt marks that "copy last output" relies on.
@@ -144,12 +158,13 @@ _anser_precmd() {
         builtin autoload -Uz add-zle-hook-widget && add-zle-hook-widget line-finish _anser_line_finish
     fi
     # Keep _anser_prompt after prompt themes (p10k, starship…) and before Ghostty's hook.
-    local -a rest=(${precmd_functions:#_anser_prompt})
+    # The separator goes right after Ghostty's hook (once the command's output is closed).
+    local -a rest=(${${precmd_functions:#_anser_prompt}:#_anser_sep_print})
     local i=${rest[(I)_ghostty_precmd]}
     if (( i )); then
-        precmd_functions=(${rest[1,i-1]} _anser_prompt ${rest[i,-1]})
+        precmd_functions=(${rest[1,i-1]} _anser_prompt _ghostty_precmd _anser_sep_print ${rest[i+1,-1]})
     else
-        precmd_functions=($rest _anser_prompt)
+        precmd_functions=($rest _anser_prompt _anser_sep_print)
     fi
     # Apply now too: on the very first prompt the reorder above only takes effect next time.
     [[ ${precmd_functions[(I)_anser_prompt]} -gt 0 && "${_anser_first_done:-}" == "" ]] && { _anser_first_done=1; _anser_prompt; }
@@ -159,6 +174,7 @@ _anser_precmd() {
 }
 
 _anser_preexec() {
+    _anser_sep_at=${(%):-%D{%H:%M:%S}}
     # Show the terminal cursor again for the running program.
     [[ $_anser_prompt_mode == hidden ]] && builtin print -n $'\e[?25h'
     local cmd=$1

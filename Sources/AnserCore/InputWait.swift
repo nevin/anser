@@ -65,12 +65,12 @@ public enum InputWait {
         return nil
     }
 
-    nonisolated(unsafe) static let passwordRE = try! NSRegularExpression(
+    static let passwordRE = try! NSRegularExpression(
         pattern: #"(password|passphrase|passcode|pin|verification code|one-time code|otp)( for [^:]+)?( \([^)]*\))?\s*:\s*$|\[sudo\] password"#)
-    nonisolated(unsafe) static let confirmRE = try! NSRegularExpression(
+    static let confirmRE = try! NSRegularExpression(
         pattern: #"(\[y/n\]|\(y/n\)|\[yes/no\]|\(yes/no\)|\[y/n/[a-z?/]+\]|\(y/n/[a-z?/]+\)|\byes/no\b|\[y\]|\[n\]|\(y\)|\(n\))[\s:?]*(\[[^\]]*\])?[\s:?]*$|continue\?\s*$|proceed\?\s*$|are you sure.*\?\s*$|overwrite.*\?\s*$"#)
-    nonisolated(unsafe) static let keyRE = try! NSRegularExpression(
+    static let keyRE = try! NSRegularExpression(
         pattern: #"press (any key|enter|return|a key)|hit (enter|return|any key)|press <?(enter|return)>? to"#)
-    nonisolated(unsafe) static let askRE = try! NSRegularExpression(
+    static let askRE = try! NSRegularExpression(
         pattern: #"^(enter|type|choose|select|pick|name|email|username|user name|login|token|value|which|what|please)\b"#)
 }

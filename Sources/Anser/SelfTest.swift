@@ -1060,7 +1060,10 @@ enum SelfTest {
         let vp = pane.surfaceView.viewportText() ?? ""
         check("commands show as ❯ lines in scrollback", vp.contains("❯ cd ") && vp.contains("anser-ok-42"),
               vp.split(separator: "\n").suffix(4).joined(separator: " ⏎ "))
-        let lastLine = vp.split(separator: "\n", omittingEmptySubsequences: false).last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
+        let lastLine = vp.split(separator: "\n", omittingEmptySubsequences: false)
+            .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !CommandSeparator.isSeparator(String($0)) }) ?? ""
+        check("a separator with user, Mac and time follows the command",
+              vp.split(separator: "\n").contains { CommandSeparator.isSeparator(String($0)) && $0.contains(NSUserName() + "@") }, String(vp.suffix(200)))
         check("no duplicate prompt waiting in the terminal", lastLine.contains("line3"), String(lastLine))
         pane.layoutSubtreeIfNeeded()
         check("input bar stays at the bottom by default",
@@ -1424,7 +1427,8 @@ enum SelfTest {
 
         // Hover strip: Explain only on failed commands; output opens in its own window.
         if let failed = pane.blocksOverlay.blocks.first(where: { !$0.running && ($0.info?.exitCode ?? 0) != 0 }),
-           let good = pane.blocksOverlay.blocks.first(where: { !$0.running && $0.info?.exitCode == 0 && $0.blockIndex != nil }) {
+           let good = pane.blocksOverlay.blocks.first(where: { !$0.running && $0.info?.exitCode == 0 && $0.blockIndex != nil
+               && !(pane.surfaceView.commandOutput(index: $0.markIndex - 1) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
             pane.blocksOverlay.hover(at: NSPoint(x: 40, y: failed.top + 4))
             let onFailed = pane.blocksOverlay.visibleStripActions
             pane.blocksOverlay.hover(at: NSPoint(x: 40, y: good.top + 4))

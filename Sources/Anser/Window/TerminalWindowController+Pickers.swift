@@ -278,11 +278,13 @@ extension TerminalWindowController {
     }
 
     func showChanges(for pane: PaneView) {
-        guard pane.session.gitBranch != nil else { NSSound.beep(); return }
+        guard pane.session.gitBranch != nil else { pane.flash("This folder isn't in a git repository"); return }
+        if pane.session.gitRisky { pane.flash("Git checks are off in this repo (its config can run programs)"); return }
         Task { @MainActor [weak self, weak pane] in
             guard let pane else { return }
-            let changes = await Generators.gitChanges(cwd: pane.session.cwd, env: pane.session.env)
-            guard !changes.isEmpty else { NSSound.beep(); return }
+            // Asked for on purpose, so wait longer than the background checks do.
+            let changes = await Generators.gitChanges(cwd: pane.session.cwd, env: pane.session.env, timeout: 10)
+            guard !changes.isEmpty else { pane.flash("No changed files: everything is committed"); return }
             self?.presentPicker(PickerPanel.Config(
                 title: "Changed files  ·  \(changes.count)",
                 placeholder: "Filter changed files…",
@@ -300,14 +302,16 @@ extension TerminalWindowController {
                 },
                 onAccept: { [weak pane] item, mods in
                     guard let pane, let c = item.payload as? GitChange else { return }
-                    guard pane.session.atPrompt else { NSSound.beep(); return }
+                    guard pane.session.atPrompt else { pane.flash("Wait for the running command to finish"); return }
                     let f = ShellLexer.escape(c.path)
+                    var isDir: ObjCBool = false
+                    let folder = FileManager.default.fileExists(atPath: (pane.session.cwd as NSString).appendingPathComponent(c.path), isDirectory: &isDir) && isDir.boolValue
                     if mods.contains(.command) {
                         pane.run(c.staged ? "git restore --staged -- \(f)" : "git add -- \(f)")
                     } else if mods.contains(.option) {
                         pane.run("${VISUAL:-${EDITOR:-vi}} \(f)")
                     } else if c.untracked {
-                        pane.run("cat -- \(f)")
+                        pane.run(folder ? "ls -la -- \(f)" : "cat -- \(f)")
                     } else {
                         pane.run(c.staged ? "git diff --cached -- \(f)" : "git diff -- \(f)")
                     }

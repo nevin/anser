@@ -76,9 +76,9 @@ public enum ServerPorts {
         return out
     }
 
-    nonisolated(unsafe) static let urlRE = try! NSRegularExpression(
+    static let urlRE = try! NSRegularExpression(
         pattern: #"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]|\[::\]):(\d{2,5})"#, options: [.caseInsensitive])
-    nonisolated(unsafe) static let phraseRE = try! NSRegularExpression(
+    static let phraseRE = try! NSRegularExpression(
         pattern: #"(?:listening|running|serving|started|server)\b[^\n]{0,30}?\bport\s+(\d{2,5})\b"#, options: [.caseInsensitive])
 
     /// Port from what the user typed ("3000", ":3000", "localhost:3000").
