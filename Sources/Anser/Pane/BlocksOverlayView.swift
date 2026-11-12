@@ -23,6 +23,18 @@ final class BlocksOverlayView: NSView {
     }
 
     private(set) var blocks: [Block] = []
+
+    /// The rule that finishes each "── you@mac · 14:02:11" separator: the shell prints
+    /// only the label, and the line is drawn to the edge so it fits any width.
+    struct SeparatorRule: Equatable {
+        var y: CGFloat
+        /// The short lead-in before the label ends here (nil for older separators that draw their own).
+        var leadEnd: CGFloat?
+        /// The line after the label starts here and runs to the edge.
+        var startX: CGFloat
+        var dotted: Bool
+    }
+    private(set) var separatorRules: [SeparatorRule] = []
     private var hovered: Int?
     private let strip = NSView()
     private let stripLabel = NSTextField(labelWithString: "")
@@ -129,7 +141,20 @@ final class BlocksOverlayView: NSView {
             out.append(Block(top: CGFloat(m.y), bottom: bottom, markIndex: idx, info: bi.map { cmds[$0] } ?? (running ? session.running : nil),
                              blockIndex: bi, running: running, rowHeight: CGFloat(m.height)))
         }
+        // A command whose prompt has scrolled off the top still owns the output above the first visible prompt.
+        if let first = marks.first, first.y > first.height * 0.5 {
+            let idx = Int(first.index) + 1
+            let j = cmds.count - idx - offset
+            if cmds.indices.contains(j) {
+                out.insert(Block(top: 0, bottom: CGFloat(first.y), markIndex: idx, info: cmds[j], blockIndex: j,
+                                 running: false, rowHeight: CGFloat(first.height)), at: 0)
+            }
+        } else if marks.isEmpty, let running = session.running {
+            // Long output from a running command fills the screen: its prompt is above.
+            out.append(Block(top: 0, bottom: bounds.height, markIndex: 0, info: running, blockIndex: nil, running: true))
+        }
         blocks = out
+        separatorRules = findSeparatorRules(marks)
         if let h = hovered, !blocks.contains(where: { $0.markIndex == h }) { hovered = nil }
         updateStrip()
         needsDisplay = true
@@ -174,8 +199,68 @@ final class BlocksOverlayView: NSView {
         strip.isHidden = false
     }
 
+    /// Separator labels sit on the row or two above each prompt.
+    private func findSeparatorRules(_ marks: [ghostty_prompt_mark_s]) -> [SeparatorRule] {
+        guard Services.shared.config.commandSeparator != "none", let pane, let surface = pane.surfaceView.surface else { return [] }
+        let size = ghostty_surface_size(surface)
+        let scale = pane.window?.backingScaleFactor ?? 2
+        let cellW = CGFloat(size.cell_width_px) / scale
+        guard cellW > 0 else { return [] }
+        let padX = Self.paddingX()
+        var rules: [SeparatorRule] = []
+        for m in marks where m.height > 0 {
+            let row = Int((m.y / m.height).rounded(.down))
+            let padTop = CGFloat(m.y) - CGFloat(row) * CGFloat(m.height)
+            for r in [row - 1, row - 2] where r >= 0 {
+                guard let text = pane.surfaceView.rowText(r), CommandSeparator.isSeparator(text) else { continue }
+                let label = text.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+                let lead = label.prefix { $0 == " " }.count
+                let y = padTop + (CGFloat(r) + 0.5) * CGFloat(m.height)
+                rules.append(SeparatorRule(y: y.rounded() + 0.5,
+                                           leadEnd: lead >= 2 ? padX + (CGFloat(lead) - 0.6) * cellW : nil,
+                                           startX: padX + (CGFloat(label.count) + (lead >= 2 ? 0.6 : 0)) * cellW,
+                                           dotted: Services.shared.config.commandSeparator == "dotted"))
+                break
+            }
+        }
+        return rules
+    }
+
+    /// The terminal's left padding in points (window-padding-x; Ghostty's default is 2).
+    static func paddingX() -> CGFloat {
+        let lines = GhosttyRuntime.shared.configText.split(separator: "\n")
+        guard let line = lines.last(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("window-padding-x") }),
+              let value = line.split(separator: "=").last?.split(separator: ",").first,
+              let n = Double(value.trimmingCharacters(in: .whitespaces)) else { return 2 }
+        return CGFloat(n)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         let t = GhosttyRuntime.shared.theme
+        let padX = Self.paddingX()
+        let scale = window?.backingScaleFactor ?? 2
+        for r in separatorRules {
+            let path = NSBezierPath()
+            if let lead = r.leadEnd, lead > padX {
+                path.move(to: NSPoint(x: padX, y: r.y))
+                path.line(to: NSPoint(x: lead, y: r.y))
+            }
+            if r.startX < bounds.width - padX {
+                path.move(to: NSPoint(x: r.startX, y: r.y))
+                path.line(to: NSPoint(x: bounds.width - padX, y: r.y))
+            }
+            if r.dotted {
+                // Small round dots, 3 points apart.
+                path.lineWidth = 1.2
+                path.lineCapStyle = .round
+                path.setLineDash([0.01, 3], count: 2, phase: 0)
+                t.foreground.withAlphaComponent(0.4).setStroke()
+            } else {
+                path.lineWidth = 1 / scale
+                t.foreground.withAlphaComponent(0.3).setStroke()
+            }
+            path.stroke()
+        }
         for b in blocks {
             let color: NSColor
             if b.running { color = t.yellow }

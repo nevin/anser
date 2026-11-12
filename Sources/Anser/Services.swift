@@ -292,15 +292,15 @@ final class ClipboardHistory {
 
     func start(limit: Int) {
         self.limit = limit
-        schedule(every: 0.6)
+        schedule(every: Self.foregroundInterval)
         // Check less often while Anser is in the background (fewer wake-ups, less battery);
         // check right away when you come back.
         NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.schedule(every: 1.5)
+            self?.schedule(every: Self.backgroundInterval)
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.poll()
-            self?.schedule(every: 0.6)
+            self?.schedule(every: Self.foregroundInterval)
         }
     }
 
@@ -328,6 +328,10 @@ final class ClipboardHistory {
         trim(to: limit)
     }
 
+    /// How often the clipboard is checked: copies made in other apps are caught
+    /// within a few seconds, and one made in Anser is seen when you come back anyway.
+    static let foregroundInterval: TimeInterval = 1
+    static let backgroundInterval: TimeInterval = 3
     static let maxItemBytes = 1 << 20
     static let maxTotalBytes = 16 << 20
 

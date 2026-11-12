@@ -8,15 +8,20 @@ import AnserCore
 // MARK: Servers
 
 /// Finds servers your tabs started: anything listening on a TCP port whose
-/// process runs under a tab's shell. Checks every few seconds while a command
-/// is running somewhere, and stops checking when nothing is.
+/// process runs under a tab's shell. Checks while a command is running somewhere,
+/// every 4 seconds at first and less often while nothing changes or Anser is in
+/// the background, and stops checking when nothing is running.
 final class ServerMonitor {
     static let shared = ServerMonitor()
     /// Shell session id → its servers.
     private(set) var bySession: [String: [ServerPorts.Listener]] = [:]
     private var timer: Timer?
     private var checking = false
+    /// Seconds until the next check; grows while results stay the same.
+    private var interval: TimeInterval = 4
     static let changed = Notification.Name("AnserServersChanged")
+    static let fastest: TimeInterval = 4
+    static let slowest: TimeInterval = 30
 
     var all: [(pane: PaneView, server: ServerPorts.Listener)] {
         AppDelegate.shared.allPanes.flatMap { p in (bySession[p.session.id] ?? []).map { (p, $0) } }
@@ -24,14 +29,26 @@ final class ServerMonitor {
 
     func servers(for pane: PaneView) -> [ServerPorts.Listener] { bySession[pane.session.id] ?? [] }
 
+    private init() {
+        // Coming back to Anser: show fresh chips right away.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.timer != nil else { return }
+            self.interval = Self.fastest
+            self.check()
+        }
+    }
+
     /// Called when commands start or finish.
     func wake() {
         guard Services.shared.config.serverChips else { stop(); return }
-        if timer == nil {
-            timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.check() }
-            timer?.tolerance = 1
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.check() }
+        interval = Self.fastest
+        schedule(after: 1.5)
+    }
+
+    private func schedule(after seconds: TimeInterval) {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in self?.check() }
+        timer?.tolerance = seconds * 0.25
     }
 
     private func stop() {
@@ -46,28 +63,25 @@ final class ServerMonitor {
         // Nothing running anywhere: servers have stopped too (their shell is at a prompt).
         let busy = panes.filter { $0.session.running != nil }
         if busy.isEmpty && bySession.isEmpty { timer?.invalidate(); timer = nil; return }
-        let shells = Dictionary(panes.map { ($0.session.id, $0.session.shellPID) }, uniquingKeysWith: { a, _ in a })
+        var sessionForShell: [pid_t: String] = [:]
+        for p in panes where sessionForShell[p.session.shellPID] == nil { sessionForShell[p.session.shellPID] = p.session.id }
+        let shells = Array(sessionForShell.keys)
         checking = true
         Task.detached(priority: .utility) { [weak self] in
-            let env = ShellEnvironment()
-            let lsof = await ScriptRunner.shared.run(argv: ["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"], cwd: "/", env: env, timeout: 3) ?? ""
-            let ps = await ScriptRunner.shared.run(argv: ["/bin/ps", "-axo", "pid=,ppid="], cwd: "/", env: env, timeout: 3) ?? ""
-            let listeners = ServerPorts.parseLsof(lsof)
-            let parents = ServerPorts.parseParents(ps)
-            var found: [String: [ServerPorts.Listener]] = [:]
-            for l in listeners {
-                if let (sid, _) = shells.first(where: { ServerPorts.descends(l.pid, from: $0.value, parents: parents) }) {
-                    found[sid, default: []].append(l)
-                }
-            }
+            let byShell = ServerPorts.listeners(under: shells)
+            let found = Dictionary(byShell.compactMap { shell, l in sessionForShell[shell].map { ($0, l) } }, uniquingKeysWith: { a, _ in a })
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.checking = false
                 if found != self.bySession {
                     self.bySession = found
+                    self.interval = Self.fastest
                     NotificationCenter.default.post(name: Self.changed, object: nil)
+                } else {
+                    self.interval = min(Self.slowest, self.interval * 1.5)
                 }
-                if busy.isEmpty, found.isEmpty { self.timer?.invalidate(); self.timer = nil }
+                if busy.isEmpty, found.isEmpty { self.timer?.invalidate(); self.timer = nil; return }
+                self.schedule(after: NSApp.isActive ? self.interval : Self.slowest)
             }
         }
     }

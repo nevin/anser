@@ -357,7 +357,7 @@ final class TabItemView: NSView, NSTextFieldDelegate {
     private var selected = false
     private var color: NSColor?
     private var activity: TerminalWindowController.Activity = .idle
-    private let spinner = NSProgressIndicator()
+    private let spinner = ActivityIndicator(controlSize: .mini)
     private var hovering = false { didSet { updateClose(); needsDisplay = true } }
     private(set) var isDragging = false
     private var dragStartX: CGFloat = 0
@@ -376,9 +376,6 @@ final class TabItemView: NSView, NSTextFieldDelegate {
         closeButton.action = #selector(closeTab)
         closeButton.toolTip = "Close tab"
         addSubview(closeButton)
-        spinner.style = .spinning
-        spinner.controlSize = .mini
-        spinner.isDisplayedWhenStopped = false
         addSubview(spinner)
         setAccessibilityRole(.radioButton)
     }
@@ -394,7 +391,7 @@ final class TabItemView: NSView, NSTextFieldDelegate {
         self.selected = selected
         self.color = color
         self.activity = activity
-        if activity == .running { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        spinner.running = activity == .running
         let state: String
         switch activity {
         case .running: state = ", running"

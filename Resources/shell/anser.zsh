@@ -81,18 +81,17 @@ typeset -gi _anser_bound=0
 typeset -g _anser_default_mode=${ANSER_PROMPT_MODE:-full}
 typeset -g _anser_prompt_mode=$_anser_default_mode
 typeset -g _anser_user_ps1="" _anser_user_rps1="" _anser_set_ps1="" _anser_transient_ps1=""
-# After each command: "── user@mac · 14:02:11 ─────" (line), the same in ┄ (dotted), or nothing.
+# After each command: a dim "   user@mac · 14:02:11" line. Anser draws the thin
+# line or dots around it (so it always fits the window), or there's nothing.
 typeset -g _anser_separator=${ANSER_SEPARATOR:-none} _anser_sep_at=""
 
 # Runs after Ghostty's hook has closed the command's output, so the line is
 # neither output (Copy Output skips it) nor prompt.
 _anser_sep_print() {
     [[ -n $_anser_sep_at && $_anser_separator != none ]] || { _anser_sep_at=""; return 0 }
-    local ch='─'; [[ $_anser_separator == dotted ]] && ch='┄'
-    local label=" ${(%):-%n@%m} · $_anser_sep_at "
-    local fill=$(( ${COLUMNS:-80} - 3 - ${#label} - 1 ))
-    (( fill < 2 )) && fill=2
-    builtin print -rn -- $'\e[2m'"${(pl:2::$ch:)}$label${(pl:$fill::$ch:)}"$'\e[0m\n'
+    # \e[K: zsh has already filled this line with spaces (its PROMPT_SP check); clear
+    # them, or they'd wrap onto extra blank rows when the window gets narrower.
+    builtin print -rn -- $'\e[2m'"   ${(%):-%n@%m} · $_anser_sep_at"$'\e[0m\e[K\n'
     _anser_sep_at=""
 }
 builtin unset ANSER_PROMPT_MODE ANSER_COMPACT_PROMPT ANSER_SEPARATOR

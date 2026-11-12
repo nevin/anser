@@ -19,10 +19,10 @@ index eec6550..97c9176 100644
  
  #ifdef __APPLE__
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index 4c4249e..0c1b950 100644
+index 4c4249e..95db031 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
-@@ -1942,6 +1942,94 @@ pub const CAPI = struct {
+@@ -1942,6 +1942,104 @@ pub const CAPI = struct {
          return true;
      }
  
@@ -60,7 +60,11 @@ index 4c4249e..0c1b950 100644
 +        var n: usize = 0;
 +        var index: u32 = 0;
 +        var seen = false;
-+        while (it.next()) |pin| : (index += 1) {
++        while (it.next()) |pin| {
++            // A soft-wrapped piece of the line above (a long command after the
++            // window got narrower) is never the start of a prompt.
++            if (pin.rowAndCell().row.wrap_continuation) continue;
++            defer index += 1;
 +            if (n >= cap or index > 10000) break;
 +            if (screen.pages.pointFromPin(.viewport, pin)) |pt| {
 +                seen = true;
@@ -90,11 +94,17 @@ index 4c4249e..0c1b950 100644
 +        const screen = surface.core_surface.renderer_state.terminal.screens.active;
 +        var it = screen.cursor.page_pin.promptIterator(.left_up, null);
 +
-+        // The first prompt found is the one the cursor is on.
-+        _ = it.next() orelse return false;
++        // The first prompt found is the one the cursor is on. Soft-wrapped
++        // pieces of a long command line are not prompts of their own.
++        while (true) {
++            const first = it.next() orelse return false;
++            if (!first.rowAndCell().row.wrap_continuation) break;
++        }
 +
 +        var i: u32 = 0;
-+        while (it.next()) |prompt_pin| : (i += 1) {
++        while (it.next()) |prompt_pin| {
++            if (prompt_pin.rowAndCell().row.wrap_continuation) continue;
++            defer i += 1;
 +            if (i != index) continue;
 +            var hl = screen.pages.highlightSemanticContent(
 +                prompt_pin,

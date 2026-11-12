@@ -49,6 +49,30 @@ final class ServerPortsTests: XCTestCase {
         XCTAssertFalse(ServerPorts.descends(501, from: 1, parents: parents))
     }
 
+    /// The kernel scan finds a socket this test process listens on, under its parent.
+    func testKernelScanFindsListener() throws {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_port = 0
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, len) } }
+        XCTAssertEqual(bound, 0)
+        XCTAssertEqual(listen(fd, 1), 0)
+        _ = withUnsafeMutablePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) } }
+        let port = Int(UInt16(addr.sin_port).byteSwapped)
+
+        let mine = ServerPorts.listeningPorts(getpid())
+        XCTAssertTrue(mine.contains { $0.port == port && $0.address == "127.0.0.1" })
+        let found = ServerPorts.listeners(under: [getppid()])[getppid()] ?? []
+        XCTAssertTrue(found.contains { $0.pid == getpid() && $0.port == port })
+        // A shell with nothing under it has no servers.
+        XCTAssertTrue(ServerPorts.listeners(under: [999_999]).isEmpty)
+    }
+
     func testAnnouncedPortsAndParsing() {
         XCTAssertEqual(ServerPorts.announcedPorts(in: "  ➜  Local:   http://localhost:5173/\n  ➜  Network: use --host"), [5173])
         XCTAssertEqual(ServerPorts.announcedPorts(in: "Server listening on port 8080"), [8080])

@@ -182,12 +182,12 @@ public struct AnserConfig: Codable, Sendable {
     public var editorFollowsOutput: Bool = false
     /// Show macOS's "Last login: …" line when a tab opens.
     public var showLoginMessage: Bool = false
-    /// A dim line after each command in the scrollback with who ran it, on which Mac, and when:
-    /// "line" (─), "dotted" (┄) or "none".
-    public var commandSeparator: String = "line"
-    /// Keyboard tips under an empty editor. "auto" shows them while you're new
+    /// A thin line after each command in the scrollback with who ran it, on which Mac, and when:
+    /// "dotted", "line" or "none".
+    public var commandSeparator: String = "dotted"
+    /// Keyboard tips in the hints row under the editor. "auto" shows them while you're new
     /// (your first few hundred commands), then hides them.
-    public var keyTips: String = "auto"
+    public var keyTips: String = "always"
     /// Mark the tab and notify when a running program waits for an answer (y/n, password, an AI agent's approval).
     public var waitAlerts: Bool = true
     /// Show servers a tab started (anything listening on a port) as a chip.
@@ -380,8 +380,8 @@ public struct AnserConfig: Codable, Sendable {
       "shellPrompt": "hidden",
       "editorFollowsOutput": false,
       "showLoginMessage": false,
-      "commandSeparator": "line",
-      "keyTips": "auto",
+      "commandSeparator": "dotted",
+      "keyTips": "always",
       "appearance": {
         "fontFamily": null,
         "fontSize": null,

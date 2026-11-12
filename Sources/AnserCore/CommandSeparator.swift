@@ -1,11 +1,12 @@
 import Foundation
 
-/// The dim "── you@mac · 14:02:11 ────" line the shell prints after each command.
+/// The dim "   you@mac · 14:02:11" line the shell prints after each command (Anser
+/// draws the line or dots around it). Older ones look like "── you@mac · 14:02:11 ──".
 /// It sits between a command's output and the next prompt, so Ghostty counts it as
 /// output; this takes it back off.
 public enum CommandSeparator {
     static let pattern = try! NSRegularExpression(
-        pattern: #"^\s*(─{2}|┄{2}) \S+ · \d{2}:\d{2}:\d{2} [─┄]+\s*$"#)
+        pattern: #"^(\s*(─{2}|┄{2}) \S+ · \d{2}:\d{2}:\d{2} [─┄]+|   \S+@\S+ · \d{2}:\d{2}:\d{2})\s*$"#)
 
     public static func isSeparator(_ line: String) -> Bool {
         pattern.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil

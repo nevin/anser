@@ -1,20 +1,26 @@
 import AppKit
 
-/// The command bar background with a hairline on top.
+/// The command bar background: a hairline on top, and another above the hints row.
 final class BarView: NSView {
     var fill: NSColor = .windowBackgroundColor
     var separator: NSColor = .separatorColor
     /// Sitting right under the output (no band; the line still marks where input starts).
     var floating = false { didSet { if floating != oldValue { needsDisplay = true } } }
+    /// Where the hints row starts (its top edge), or nil for no second line.
+    var hintsLineY: CGFloat? { didSet { if hintsLineY != oldValue { needsDisplay = true } } }
 
     override func draw(_ dirtyRect: NSRect) {
         if !floating {
             fill.setFill()
             bounds.fill()
         }
-        // A line across the top sets the input apart from the output above it.
+        // One device pixel, so the lines stay thin on any screen.
+        let px = 1 / (window?.backingScaleFactor ?? 2)
         separator.setFill()
-        NSRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1).fill()
+        NSRect(x: 0, y: bounds.height - px, width: bounds.width, height: px).fill()
+        if let y = hintsLineY {
+            NSRect(x: 0, y: y - px, width: bounds.width, height: px).fill()
+        }
     }
 
     // Clicking anywhere in the bar focuses the editor.
@@ -23,22 +29,10 @@ final class BarView: NSView {
     }
 }
 
-/// The rounded input well the editor sits in. Its border lights up when focused.
+/// Holds the editor on the input line. Flat: the lines above and below mark the
+/// input area, so there's no box around it.
 final class CardView: NSView {
-    var fill: NSColor = .textBackgroundColor { didSet { needsDisplay = true } }
-    var border: NSColor = .separatorColor { didSet { needsDisplay = true } }
-    var focusBorder: NSColor = .controlAccentColor { didSet { needsDisplay = true } }
-    var focused = false { didSet { if focused != oldValue { needsDisplay = true } } }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let path = NSBezierPath(roundedRect: r, xRadius: 8, yRadius: 8)
-        fill.setFill()
-        path.fill()
-        (focused ? focusBorder : border).setStroke()
-        path.lineWidth = focused ? 1.5 : 1
-        path.stroke()
-    }
+    var focused = false
 
     override func mouseDown(with event: NSEvent) {
         (superview?.superview as? PaneView)?.focus()
@@ -53,6 +47,8 @@ final class GutterView: NSView {
     var numberColor: NSColor = .secondaryLabelColor
     var currentColor: NSColor = .labelColor
     var running = false { didSet { needsDisplay = true } }
+    /// The input isn't focused: the ❯ fades (there's no box to light up).
+    var dimmed = false { didSet { if dimmed != oldValue { needsDisplay = true } } }
     /// Show line numbers even for a single line (expanded editor).
     var alwaysNumbers = false { didSet { needsDisplay = true } }
 
@@ -70,7 +66,7 @@ final class GutterView: NSView {
         let top = editor.textContainerInset.height - (scroll?.contentView.bounds.origin.y ?? 0)
         if running || (editor.lineCount <= 1 && !alwaysNumbers) {
             let glyph = running ? "" : "❯"
-            (glyph as NSString).draw(at: NSPoint(x: 5, y: top), withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .bold), .foregroundColor: promptColor])
+            (glyph as NSString).draw(at: NSPoint(x: 5, y: top), withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .bold), .foregroundColor: dimmed ? promptColor.withAlphaComponent(0.45) : promptColor])
             return
         }
         // Line numbers for the lines that are actually visible.

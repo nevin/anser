@@ -86,11 +86,15 @@ extension PaneView {
         if screen != waitScreen {
             waitScreen = screen
             waitScreenChangedAt = Date()
+            waitScreenChecked = false
             if waitState != nil, InputWait.detect(screen: screen) == nil { clearWaiting() }
             return
         }
         let quiet = Date().timeIntervalSince(waitScreenChangedAt)
-        guard waitState == nil, quiet >= 1.5, let w = InputWait.detect(screen: screen) else { return }
+        guard waitState == nil, quiet >= 1.5, !waitScreenChecked else { return }
+        // After 4 quiet seconds the answer for this screen can't change: don't look again until it does.
+        if quiet >= 4 { waitScreenChecked = true }
+        guard let w = InputWait.detect(screen: screen) else { return }
         // Plain questions need a longer pause; full-screen programs only count for clear prompts.
         if w.kind == .question, quiet < 4 || fullscreenProgram { return }
         if fullscreenProgram, w.kind == .keypress { return }

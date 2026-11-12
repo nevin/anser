@@ -1,0 +1,18 @@
+diff --git a/src/terminal/PageList.zig b/src/terminal/PageList.zig
+index ed1f417..02f1e7b 100644
+--- a/src/terminal/PageList.zig
++++ b/src/terminal/PageList.zig
+@@ -2902,7 +2902,12 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
+                 const pull = pull: {
+                     if (!opts.pull_scrollback) break :pull false;
+                     const cursor = opts.cursor orelse break :pull true;
+-                    break :pull cursor.y >= self.rows - 1;
++                    // Anser: near the bottom counts too. Anser keeps a row or
++                    // two free under the cursor (hidden prompt, input area), and
++                    // lines a smaller window pushed into scrollback should come
++                    // back when it grows again. A cursor near the top (after
++                    // `clear`) still never pulls old output back.
++                    break :pull cursor.y + 3 >= self.rows;
+                 };
+                 if (!pull) {
+                     // We just grow our rows and we're done. Cursor does

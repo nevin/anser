@@ -13,18 +13,22 @@ Releases are built by `scripts/release.sh`. It signs Sparkle's parts and the app
 2. **Notary credentials.** Make an app-specific password at account.apple.com (Sign-In and Security → App-Specific Passwords), then store it once in your Keychain. You type the password yourself; it is never put in a file:
 
    ```sh
-   xcrun notarytool store-credentials anser-notary --apple-id you@example.com --team-id 3HLDG7WVBY
+   xcrun notarytool store-credentials anser --apple-id you@example.com --team-id 3HLDG7WVBY
    ```
 
-3. **Automatic updates.** Pick an https address where you'll host the update feed. Any static host works, for example GitHub Pages or S3. Then run:
+3. **Automatic updates.** Run once:
 
    ```sh
-   bash scripts/setup-updates.sh https://example.com/anser/appcast.xml
+   bash scripts/setup-updates.sh
    ```
 
-   This downloads Sparkle's tools into `build/sparkle-tools`. It also creates your update signing key in your login Keychain, and writes `scripts/updates.conf` with the address and the public key, which `build-app.sh` puts into the app.
+   - **Feed address.** By default the feed is `appcast.xml` attached to the newest GitHub release: `https://github.com/nevin/anser/releases/latest/download/appcast.xml`. Publishing a release is then all it takes to ship an update. To host the feed elsewhere, pass an https address instead.
+   - **Signing key.** It creates your update signing key in your login Keychain, or reuses the one already there. Every update must be signed with it.
+   - **Config file.** It writes `scripts/updates.conf` with the feed address and the public key. `build-app.sh` puts both into every build after that.
 
-   **Back up the Keychain item "Private key for signing Sparkle updates".** If you lose it, people can't update automatically and will have to download a new version by hand.
+   **Back up the Keychain item "Private key for signing Sparkle updates"**, for example with `build/sparkle-tools/bin/generate_keys -x key.txt` stored somewhere safe. If you lose it, people can't update automatically and will have to download a new version by hand.
+
+   Copies of Anser built before this step can't update themselves. People with those copies need to download the next release by hand once; after that, updates arrive automatically.
 
 ## Each release
 
@@ -35,12 +39,28 @@ Releases are built by `scripts/release.sh`. It signs Sparkle's parts and the app
    - **The build number always goes up by one.** Sparkle compares it to decide what's newer.
 
    ```sh
-   SIGN_IDENTITY="Developer ID Application: nevin paul (3HLDG7WVBY)" NOTARY_PROFILE=anser-notary bash scripts/release.sh
+   SIGN_IDENTITY="Developer ID Application: nevin paul (3HLDG7WVBY)" NOTARY_PROFILE=anser bash scripts/release.sh
    ```
 
    **If a release fails partway** (say, notarization is rejected), the version has already moved on. The next run bumps it again, so one number is skipped. That's harmless. `scripts/bump-version.sh` does just the version step on its own.
 
-2. Upload everything in `build/updates/` (the DMG and `appcast.xml`) to the feed address. Copies of Anser with updates turned on find the new version within a day, or right away with Check for Updates.
+   **If only the last step fails** (the feed or the GitHub release), the DMG is already built. Fix the cause and finish without building again:
+
+   ```sh
+   NOTES=docs/release-notes/6.2.2.md PUBLISH=1 bash scripts/publish-update.sh 6.2.2
+   ```
+
+2. Publish. With the default GitHub feed, add `PUBLISH=1` and `release.sh` creates the GitHub release itself, with the DMG and `appcast.xml` attached. `NOTES=` gives the release notes, which appear in the update window and on GitHub:
+
+   ```sh
+   SIGN_IDENTITY="Developer ID Application: nevin paul (3HLDG7WVBY)" NOTARY_PROFILE=anser \
+     NOTES=docs/release-notes/VERSION.md PUBLISH=1 bash scripts/release.sh
+   ```
+
+   - **Without `PUBLISH=1`,** it prints the `gh release create` command to run after you've checked the build.
+   - **With a feed on another host,** upload everything in `build/updates/` to that address.
+
+   Once the release is the latest one, copies of Anser with updates turned on find it within a day, or right away with Help → Check for Updates. The release must include `appcast.xml`: a release without it hides every update until the next release that has one.
 
 ## Checking a build
 

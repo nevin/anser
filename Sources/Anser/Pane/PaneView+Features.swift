@@ -61,6 +61,13 @@ extension PaneView {
 
     /// For tests: the folder chip's right-click menu.
     var folderChipMenuTitles: [String] { cwdChip.menuProvider?()?.items.map(\.title) ?? [] }
+    /// Input-area layout, for the self-test: how far the command line reaches, and whether
+    /// the folder chip sits in the row under the divider.
+    var inputLineForTest: (editorMaxX: CGFloat, barWidth: CGFloat, folderInHintsRow: Bool) {
+        let editorMaxX = card.convert(editorScroll.frame, to: bar).maxX
+        let inRow = !cwdChip.isHidden && cwdChip.frame.maxY <= Self.statusHeight
+        return (editorMaxX, bar.bounds.width, inRow)
+    }
 
     /// For tests: where the input area's top edge is.
     var barTopForTest: CGFloat { bar.frame.maxY }

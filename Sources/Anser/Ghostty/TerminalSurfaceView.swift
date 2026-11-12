@@ -131,6 +131,7 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         sendSize()
+        pane?.surfaceDidResize()
     }
 
     private func sendSize() {

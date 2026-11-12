@@ -357,7 +357,8 @@ final class PluginExtrasTests: XCTestCase {
         XCTAssertEqual(p.count, 1)
         XCTAssertEqual(p[0].source, .project)
         XCTAssertTrue(p[0].key.hasPrefix("project:"))
-        let defaults = UserDefaults(suiteName: "anser-test-\(UUID().uuidString)")!
+        let defaults = ScratchDefaults.make("anser-test-plugin-trust")
+        defer { ScratchDefaults.discard("anser-test-plugin-trust") }
         let trust = FileTrust("t", defaults: defaults)
         XCTAssertFalse(trust.isTrusted(p[0]))
         trust.trust(p[0])

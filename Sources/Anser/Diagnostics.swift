@@ -21,8 +21,8 @@ final class Diagnostics: NSObject, MXMetricManagerSubscriber {
     private let queue = DispatchQueue(label: "anser.diagnostics", qos: .utility)
     private var breadcrumbs: [String] = []
     private let lock = NSLock()
-    private var lastMainPing = Date()
-    private var hangStart: Date?
+    private var lastMainPing = ProcessInfo.processInfo.systemUptime
+    private var hangStart: TimeInterval?
     /// A crash log from the previous run, if there was one.
     private(set) var previousCrash: URL?
 
@@ -108,26 +108,84 @@ final class Diagnostics: NSObject, MXMetricManagerSubscriber {
     // MARK: Hangs
 
     /// A background thread checks that the main thread answers at least once
-    /// every 3 seconds; long stalls are logged with how long they lasted.
+    /// every 3 seconds; long stalls are logged with how long they lasted and
+    /// what the main thread was doing. Time is measured on a clock that stops
+    /// while the Mac sleeps, so sleep is never counted as a hang.
     private func startHangWatchdog() {
+        HangSampler.recordMainThread()
+        observePower()
         let t = Thread { [weak self] in
+            var stacks: [[UInt]] = []
             while true {
                 Thread.sleep(forTimeInterval: 1)
                 guard let self else { return }
-                DispatchQueue.main.async { self.lock.withLock { self.lastMainPing = Date() } }
-                let since = Date().timeIntervalSince(self.lock.withLock { self.lastMainPing })
-                if since > 3, self.hangStart == nil {
-                    self.hangStart = Date().addingTimeInterval(-since)
-                    self.log("HANG: main thread unresponsive for \(Int(since))s")
+                let (asleep, last) = self.lock.withLock { (self.macAsleep, self.lastMainPing) }
+                DispatchQueue.main.async { self.lock.withLock { self.lastMainPing = ProcessInfo.processInfo.systemUptime } }
+                if asleep { self.hangStart = nil; stacks = []; continue }
+                let now = ProcessInfo.processInfo.systemUptime
+                let since = now - last
+                if since > 3 {
+                    if self.hangStart == nil {
+                        self.hangStart = now - since
+                        self.log("HANG: main thread unresponsive for \(Int(since))s\(self.afterWakeNote(now))")
+                    }
+                    // A few samples while it lasts; the stack seen most often is the culprit.
+                    if stacks.count < 6 { stacks.append(HangSampler.sample()) }
                 } else if since < 1.5, let start = self.hangStart {
                     self.hangStart = nil
-                    self.log(String(format: "HANG ended after %.1fs", Date().timeIntervalSince(start)))
+                    // Up to when the main thread answered, not when this thread noticed.
+                    self.log(String(format: "HANG ended after %.1fs", last - start))
+                    if let top = Self.mostCommon(stacks), !top.isEmpty {
+                        self.log("HANG main thread stack:\n    " + HangSampler.describe(top).joined(separator: "\n    "))
+                    }
+                    stacks = []
                 }
             }
         }
         t.name = "Anser hang watchdog"
         t.qualityOfService = .utility
         t.start()
+    }
+
+    private var macAsleep = false
+    private var wokeAt: TimeInterval?
+
+    private func afterWakeNote(_ now: TimeInterval) -> String {
+        guard let w = lock.withLock({ wokeAt }), now - w < 120 else { return "" }
+        return String(format: " (%.0fs after wake)", now - w)
+    }
+
+    /// Logs sleep, wake, screen lock and display sleep, so hangs can be read in context.
+    private func observePower() {
+        let nc = NSWorkspace.shared.notificationCenter
+        nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.lock.withLock { self.macAsleep = true }
+            self.log("Mac going to sleep")
+        }
+        nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            self.lock.withLock { self.macAsleep = false; self.wokeAt = now; self.lastMainPing = now }
+            self.log("Mac woke")
+        }
+        let events: [(Notification.Name, String)] = [
+            (NSWorkspace.screensDidSleepNotification, "displays off"),
+            (NSWorkspace.screensDidWakeNotification, "displays on"),
+            (NSWorkspace.sessionDidResignActiveNotification, "screen locked or user switched"),
+            (NSWorkspace.sessionDidBecomeActiveNotification, "screen unlocked"),
+        ]
+        for (name, text) in events {
+            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.log(text) }
+        }
+    }
+
+    private static func mostCommon(_ stacks: [[UInt]]) -> [UInt]? {
+        // Compare by the innermost few frames: deeper frames are the same run loop.
+        var counts: [[UInt]: Int] = [:]
+        for s in stacks where !s.isEmpty { counts[Array(s.prefix(6)), default: 0] += 1 }
+        guard let best = counts.max(by: { $0.value < $1.value })?.key else { return stacks.first }
+        return stacks.first { Array($0.prefix(6)) == best }
     }
 
     // MARK: MetricKit (system crash/hang reports with stacks, delivered later)

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-time setup for automatic updates (Sparkle).
 #
-#   scripts/setup-updates.sh https://example.com/anser/appcast.xml
+#   scripts/setup-updates.sh                     feed on this repo's GitHub Releases
+#   scripts/setup-updates.sh https://host/appcast.xml   or any other https address
 #
 # 1. Downloads Sparkle's tools (same version the app uses) into build/sparkle-tools.
 # 2. Creates your update signing key in your login Keychain (or reuses it) and
@@ -10,8 +11,9 @@
 # 3. Writes scripts/updates.conf (feed address + public key). build-app.sh puts
 #    both into the app; release.sh signs each release and writes appcast.xml.
 #
-# The feed address is where you'll upload build/updates/ (any static web host:
-# GitHub Pages, S3, your own site). It must be https.
+# By default the feed is appcast.xml attached to the newest GitHub release
+# (releases/latest/download/appcast.xml), so publishing a release is all it takes.
+# Any other https static host works too: upload build/updates/ there.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
@@ -28,8 +30,13 @@ fi
 [[ "${1:-}" == "--tools-only" ]] && exit 0
 
 feed="${1:-}"
+if [[ -z "$feed" ]]; then
+  # https://github.com/OWNER/REPO from the git remote (https or ssh form).
+  repo="$(git remote get-url origin 2>/dev/null | sed -E 's#^git@github.com:#https://github.com/#; s#\.git$##')"
+  [[ "$repo" == https://github.com/*/* ]] && feed="$repo/releases/latest/download/appcast.xml"
+fi
 if [[ -z "$feed" || "$feed" != https://* ]]; then
-  echo "Usage: scripts/setup-updates.sh https://your.host/path/appcast.xml" >&2
+  echo "Usage: scripts/setup-updates.sh [https://your.host/path/appcast.xml]" >&2
   exit 1
 fi
 
@@ -44,4 +51,5 @@ CONF
 echo "Updates set up."
 echo "  Feed:       $feed"
 echo "  Public key: $key"
-echo "Next: bash scripts/release.sh (with SIGN_IDENTITY and NOTARY_PROFILE), then upload build/updates/*."
+echo "Back up the Keychain item \"Private key for signing Sparkle updates\": without it, updates can't be signed."
+echo "Next: release with scripts/release.sh (see docs/RELEASING.md)."

@@ -12,12 +12,12 @@ final class PaneView: NSView, ShellSessionDelegate {
     weak var windowController: TerminalWindowController?
 
     let bar = BarView()
-    private let card = CardView()
+    let card = CardView()
     let gutter = GutterView()
     let editorScroll = NSScrollView()
     private let runningLabel = NSTextField(labelWithString: "")
     private let runningHint = NSTextField(labelWithString: "")
-    private let spinner = NSProgressIndicator()
+    private let spinner = ActivityIndicator(controlSize: .small)
     let cwdChip = ChipView()
     private let branchChip = ChipView()
     var branchChipTooltip: String? { branchChip.toolTip }
@@ -81,6 +81,8 @@ final class PaneView: NSView, ShellSessionDelegate {
     var waitState: InputWait.Wait?
     var waitScreen = ""
     var waitScreenChangedAt = Date()
+    /// The current screen was already checked for a question: skip it until it changes.
+    var waitScreenChecked = false
     /// A dropped ssh session being reconnected (or offered).
     var reconnect: ReconnectState?
     /// Filter Output (⌃⌘O), over the terminal.
@@ -106,6 +108,9 @@ final class PaneView: NSView, ShellSessionDelegate {
     /// A corrected command after "command not found" (e.g. gti → git).
     private(set) var fixCommand: String?
     private let hintLabel = NSTextField(labelWithString: "")
+    /// The whole hint; the label shows as much of it as fits.
+    private var hintFull = NSAttributedString()
+    private let helpButton = NSButton()
     var buttons: [NSButton] = []
     private let moreButton = NSButton()
     private var overflowChips: [ChipView] = []
@@ -149,6 +154,8 @@ final class PaneView: NSView, ShellSessionDelegate {
     private(set) var viewportAtBottom = true
     private var followCheckScheduled = false
     private var followTimer: Timer?
+    private var resizeSettle: DispatchWorkItem?
+    private var followStillTicks = 0
 
     /// The status row under the editor box (chips centered, even space above and below).
     static let statusHeight: CGFloat = 30
@@ -208,11 +215,8 @@ final class PaneView: NSView, ShellSessionDelegate {
     private func applyTheme() {
         let t = theme
         bar.fill = t.barBackground
-        bar.separator = t.foreground.withAlphaComponent(0.16)
+        bar.separator = t.foreground.withAlphaComponent(0.2)
         bar.needsDisplay = true
-        card.fill = t.background.blended(withFraction: t.isDark ? 0.035 : 0.0, of: .white) ?? t.background
-        card.border = t.foreground.withAlphaComponent(0.12)
-        card.focusBorder = t.blue.withAlphaComponent(0.75)
         gutter.numberColor = t.foreground.withAlphaComponent(0.3)
         gutter.currentColor = t.foreground.withAlphaComponent(0.75)
         editor.applyFont()
@@ -249,9 +253,6 @@ final class PaneView: NSView, ShellSessionDelegate {
         runningHint.font = .systemFont(ofSize: 11)
         runningHint.alignment = .right
         runningHint.stringValue = "keys go to the program"
-        spinner.style = .spinning
-        spinner.controlSize = .small
-        spinner.isDisplayedWhenStopped = false
         for v in [runningLabel, runningHint, spinner] as [NSView] { v.isHidden = true; card.addSubview(v) }
 
         hintLabel.font = .systemFont(ofSize: 11)
@@ -333,6 +334,12 @@ final class PaneView: NSView, ShellSessionDelegate {
         moreButton.action = #selector(showMoreMenu)
         moreButton.isHidden = true
         bar.addSubview(moreButton)
+        helpButton.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: "Keyboard shortcuts")
+        helpButton.isBordered = false
+        helpButton.imageScaling = .scaleProportionallyDown
+        helpButton.toolTip = "Keyboard shortcuts (⌘/)"
+        helpButton.action = #selector(AppDelegate.showShortcuts(_:))
+        bar.addSubview(helpButton)
     }
 
     /// Expanded mode opens a tall editing area (about 45% of the pane),
@@ -393,11 +400,15 @@ final class PaneView: NSView, ShellSessionDelegate {
         let pad: CGFloat = 10
 
         card.isHidden = !editorEnabled
-        card.frame = NSRect(x: pad, y: Self.statusHeight, width: max(40, w - 2 * pad), height: cardHeight)
+        // A little more room above the input line than below it.
+        card.frame = NSRect(x: pad, y: Self.statusHeight + 4, width: max(40, w - 2 * pad), height: cardHeight)
+        bar.hintsLineY = editorEnabled ? Self.statusHeight : nil
         let textH = editorTextHeight
         let gw = showRunning ? 26 : gutter.preferredWidth
         gutter.frame = NSRect(x: 4, y: 4, width: gw, height: textH)
         let ex = gutter.frame.maxX
+
+        // The command gets the whole line: commands can be long.
         editorScroll.frame = NSRect(x: ex, y: 4, width: max(10, card.bounds.width - ex - 8), height: textH)
         editor.frame.size.width = editorScroll.contentSize.width
         editor.minSize = NSSize(width: 0, height: textH)
@@ -419,19 +430,28 @@ final class PaneView: NSView, ShellSessionDelegate {
 
         // Reserve room for the actions menu before placing any chips.
         let y = ((Self.statusHeight - Self.chipHeight) / 2).rounded()
-        let chips = [recChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, badgeChip, contextChip, envChip, broadcastChip, shareChip, cwdChip, branchChip, prChip, conflictChip, changesChip,
-                     serverChip, statusChip, testsChip, fixChip, hintChip, explainChip, aliasChip] + pluginChipViews
+        let onInputLine: [ChipView] = []
+        let chips = ([recChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, badgeChip, contextChip, envChip, broadcastChip, shareChip, cwdChip, branchChip, prChip, conflictChip, changesChip,
+                     serverChip, statusChip, testsChip, fixChip, hintChip, explainChip, aliasChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
         let moreX = w - pad - 18
         buttons.forEach { $0.isHidden = true }
         moreButton.isHidden = false
         moreButton.frame = NSRect(x: moreX, y: ((Self.statusHeight - 18) / 2).rounded(), width: 18, height: 18)
+        let helpX = moreX - 22
+        helpButton.isHidden = !editorEnabled
+        helpButton.frame = NSRect(x: helpX, y: ((Self.statusHeight - 16) / 2).rounded(), width: 16, height: 16)
+        helpButton.contentTintColor = theme.foreground.withAlphaComponent(0.4)
+        moreButton.contentTintColor = theme.foreground.withAlphaComponent(0.5)
 
+        // The hints row lines up with the command you type, not the window edge.
+        let rowStart = editorEnabled ? card.frame.minX + ex + editor.textContainerInset.width + (editor.textContainer?.lineFragmentPadding ?? 0) : pad
+        let rowEnd = editorEnabled ? helpX : moreX
         let spacing: CGFloat = 8
-        let room = moreX - spacing - pad
+        let room = rowEnd - spacing - rowStart
         // Recording, sharing and typing in all panes affect privacy or where input goes: they come first and never fold into +N.
         let mustShow: [ChipView] = [recChip, shareChip, broadcastChip]
-        let priorities = mustShow + [waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, hintChip, badgeChip, contextChip, conflictChip, statusChip, testsChip, cwdChip, serverChip,
-                          envChip, fixChip, aliasChip, branchChip, changesChip, prChip, explainChip] + pluginChipViews
+        let priorities = (mustShow + [waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, hintChip, badgeChip, contextChip, conflictChip, statusChip, testsChip, cwdChip, serverChip,
+                          envChip, fixChip, aliasChip, branchChip, changesChip, prChip, explainChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
         var active = priorities.filter { !$0.text.isEmpty }.map { ($0, $0.preferredWidth) }
         // Keep the row calm: the folder and branch, plus the most important few.
         var extras = 0
@@ -453,7 +473,7 @@ final class PaneView: NSView, ShellSessionDelegate {
             remaining -= width + spacing
         }
 
-        var x = pad
+        var x = rowStart
         overflowChips = []
         for chip in chips {
             let width = widths[ObjectIdentifier(chip)]
@@ -480,8 +500,14 @@ final class PaneView: NSView, ShellSessionDelegate {
             let ww = min(560, w - 40)
             welcome.frame = NSRect(x: (w - ww) / 2, y: bounds.height - welcome.frame.height - 24, width: ww, height: welcome.frame.height)
         }
-        let hintW = moreX - x - 10
-        hintLabel.isHidden = hintW < 150 || hintLabel.stringValue.isEmpty
+        let hintW = rowEnd - x - 10
+        // Too narrow for the whole hint: drop tips from the right ("⇥ complete   ↑ history   …").
+        var shown = hintFull
+        while shown.size().width > hintW, let cut = shown.string.range(of: "   ", options: .backwards) {
+            shown = shown.attributedSubstring(from: NSRange(location: 0, length: NSRange(cut, in: shown.string).location))
+        }
+        if !hintLabel.attributedStringValue.isEqual(to: shown) { hintLabel.attributedStringValue = shown }
+        hintLabel.isHidden = hintW < 60 || shown.length == 0
         hintLabel.frame = NSRect(x: x, y: y + (Self.chipHeight - 15) / 2, width: max(0, hintW), height: 15)
     }
 
@@ -528,13 +554,41 @@ final class PaneView: NSView, ShellSessionDelegate {
         }
     }
 
+    /// The terminal re-wraps its text a moment after a resize: redraw the command
+    /// blocks and re-place the input area once it has, not just before.
+    func surfaceDidResize() {
+        resizeSettle?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.blocksOverlay.refresh()
+            self.needsLayout = true
+        }
+        resizeSettle = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: w)
+    }
+
     /// While a command runs, its output moves the cursor without other signals.
-    private func setFollowTimer(_ on: Bool) {
+    /// Checks often while the cursor moves, and once a second when it has stopped
+    /// (output reached the bottom, or the program is waiting) or the pane is hidden.
+    private func setFollowTimer(_ on: Bool, interval: TimeInterval = 0.12) {
         followTimer?.invalidate()
         followTimer = nil
+        followStillTicks = 0
         guard on, Services.shared.config.editorFollowsOutput else { return }
-        followTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in self?.scheduleFollowCheck() }
-        followTimer?.tolerance = 0.04
+        followTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.followTick() }
+        followTimer?.tolerance = interval / 3
+    }
+
+    private func followTick() {
+        let slow = (followTimer?.timeInterval ?? 0) >= 1
+        guard sessionIsVisible else { if !slow { setFollowTimer(true, interval: 1) }; return }
+        if computeFollowTop() != followTop {
+            needsLayout = true
+            if slow { setFollowTimer(true) }
+            return
+        }
+        followStillTicks += 1
+        if !slow, followStillTicks >= 16 { setFollowTimer(true, interval: 1) }
     }
 
     @objc private func showMoreMenu() {
@@ -679,7 +733,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         editor.scrollRangeToVisible(editor.selectedRange())
     }
 
-    func editorFocusChanged(_ focused: Bool) { card.focused = focused }
+    func editorFocusChanged(_ focused: Bool) { card.focused = focused; gutter.dimmed = !focused }
 
     /// Explains the word under the cursor, or shows key tips when empty.
     func updateHint() {
@@ -720,7 +774,7 @@ final class PaneView: NSView, ShellSessionDelegate {
             let s = NSMutableAttributedString(string: "💡 ", attributes: [.font: NSFont.systemFont(ofSize: 11)])
             s.append(NSAttributedString(string: tip.replacingOccurrences(of: "Tip: ", with: ""),
                                         attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: theme.yellow]))
-            hintLabel.attributedStringValue = s
+            setHintText(s)
             hintLabel.toolTip = tip + "\nTips show once. Turn them off in Settings → Editor → Keyboard tips."
             needsLayout = true
             if tipShownAt == nil {
@@ -747,7 +801,13 @@ final class PaneView: NSView, ShellSessionDelegate {
         setHint(h?.title, h?.detail)
     }
 
-    var hintText: String { hintLabel.stringValue }
+    var hintText: String { hintFull.string }
+
+    private func setHintText(_ s: NSAttributedString) {
+        hintFull = s
+        hintLabel.attributedStringValue = s
+        needsLayout = true
+    }
 
     /// Key tips under the editor: while you're new ("auto"), always, or never.
     var showKeyTips: Bool {
@@ -770,6 +830,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         ("⌥⌘R runs anything from your Notebook", []),
         ("⌘B lists the commands in this tab", []),
     ]
+    static let runningTipsRow = "⌃C stop   ⌘K clear   ⌘B commands in this tab"
     static let keyTipsRow = "⇥ complete   ↑ history   ⌘R search   ⇧⏎ new line   ⌥⌘E open in $EDITOR"
     private var placeholderIndex = 0
 
@@ -792,7 +853,7 @@ final class PaneView: NSView, ShellSessionDelegate {
     private func setNote(_ label: String, _ text: String, _ color: NSColor) {
         let s = NSMutableAttributedString(string: label + "  ", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: color])
         s.append(NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: color.withAlphaComponent(0.85)]))
-        hintLabel.attributedStringValue = s
+        setHintText(s)
         hintLabel.toolTip = text
         needsLayout = true
     }
@@ -803,11 +864,21 @@ final class PaneView: NSView, ShellSessionDelegate {
         if let title, !title.isEmpty {
             s.append(NSAttributedString(string: title, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium), .foregroundColor: t.foreground.withAlphaComponent(0.7)]))
         }
-        if let detail, !detail.isEmpty {
+        if let detail, detail == Self.keyTipsRow || detail == Self.runningTipsRow {
+            // "⇥ complete   ↑ history …": each key a little brighter than what it does.
+            for (i, tip) in detail.components(separatedBy: "   ").enumerated() {
+                if i > 0 { s.append(NSAttributedString(string: "   ", attributes: [.font: NSFont.systemFont(ofSize: 11)])) }
+                let parts = tip.split(separator: " ", maxSplits: 1).map(String.init)
+                s.append(NSAttributedString(string: parts[0], attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: t.foreground.withAlphaComponent(0.7)]))
+                if parts.count > 1 {
+                    s.append(NSAttributedString(string: " " + parts[1], attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: t.foreground.withAlphaComponent(0.45)]))
+                }
+            }
+        } else if let detail, !detail.isEmpty {
             if s.length > 0 { s.append(NSAttributedString(string: "  ", attributes: [.font: NSFont.systemFont(ofSize: 11)])) }
             s.append(NSAttributedString(string: detail, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: t.foreground.withAlphaComponent(0.45)]))
         }
-        hintLabel.attributedStringValue = s
+        setHintText(s)
         needsLayout = true
     }
 
@@ -918,9 +989,10 @@ final class PaneView: NSView, ShellSessionDelegate {
             runningLabel.stringValue = "Waiting for the shell…"
             runningLabel.textColor = t.dim
         }
-        if showRunning { spinner.isHidden = false; spinner.startAnimation(nil) } else { spinner.stopAnimation(nil); spinner.isHidden = true }
+        spinner.isHidden = !showRunning
+        spinner.running = showRunning
         runningHint.isHidden = !showRunning
-        if showRunning { hintLabel.stringValue = "" } else { updateHint() }
+        if showRunning { setHint(nil, showKeyTips ? Self.runningTipsRow : nil) } else { updateHint() }
         refreshLiveChips()
         updateRunningLabel()
         needsLayout = true
@@ -951,7 +1023,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         } else {
             progressBar.isHidden = true
         }
-        runningLabel.attributedStringValue = s
+        if !runningLabel.attributedStringValue.isEqual(to: s) { runningLabel.attributedStringValue = s }
     }
 
     /// For tests: the running command's line ("make   12s · usually 40s").
@@ -1080,7 +1152,9 @@ final class PaneView: NSView, ShellSessionDelegate {
                 // Hidden panes (other tabs, Anser in the background) update less often.
                 let visible = self.sessionIsVisible
                 if visible { self.updateRunningLabel() }
-                if visible || tick % 3 == 0 { self.checkWaiting() }
+                // A screen that has been still for a while is read every 3 seconds instead of every second.
+                let quietLong = Date().timeIntervalSince(self.waitScreenChangedAt) > 10
+                if (visible && !quietLong) || tick % 3 == 0 { self.checkWaiting() }
                 if visible { self.checkForegroundProgram() }
                 if self.session.isRemote, tick % 2 == 0 { self.checkRemotePorts() }
             }

@@ -338,6 +338,13 @@ final class DevHelperTests: XCTestCase {
         XCTAssertEqual(CommandSeparator.strip("x\n┄┄ me@host · 01:02:03 ┄┄┄┄\n\n"), "x\n")
         XCTAssertEqual(CommandSeparator.strip("── not a separator\n"), "── not a separator\n")
         XCTAssertEqual(CommandSeparator.strip("── sneha@Mac · 22:09:15 ────\n"), "")
+        // The shell prints just the label now; Anser draws the rest of the line.
+        XCTAssertEqual(CommandSeparator.strip("out\n── sneha@Mac · 22:09:15 ──\n"), "out\n")
+        XCTAssertTrue(CommandSeparator.isSeparator("┄┄ me@host · 01:02:03 ┄┄"))
+        // Current form: just the indented label.
+        XCTAssertEqual(CommandSeparator.strip("out\n   sneha@Mac · 22:09:15\n"), "out\n")
+        XCTAssertFalse(CommandSeparator.isSeparator("   no time here"))
+        XCTAssertFalse(CommandSeparator.isSeparator("sneha@Mac · 22:09:15"))
     }
 
     /// git's warnings land in the same output; they must not show up as files.
@@ -520,8 +527,9 @@ final class SafetyTests: XCTestCase {
     func testProjectWorkflowTrustFollowsContents() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("wf-\(UUID().uuidString)/.anser/workflows")
         try WorkflowStore.save(Workflow(name: "Deploy", steps: ["echo deploy"]), to: dir)
-        let suite = "anser-trust-\(UUID().uuidString)"
-        let trust = WorkflowTrust(defaults: UserDefaults(suiteName: suite)!)
+        let suite = "anser-test-workflow-trust"
+        let trust = WorkflowTrust(defaults: ScratchDefaults.make(suite))
+        defer { ScratchDefaults.discard(suite) }
         var w = try XCTUnwrap(WorkflowStore.load(directory: dir, source: .project).first { $0.name == "Deploy" })
         XCTAssertEqual(w.source, .project)
         XCTAssertFalse(trust.isTrusted(w))
@@ -531,7 +539,6 @@ final class SafetyTests: XCTestCase {
         XCTAssertFalse(trust.isTrusted(w), "a changed file must be trusted again")
         w.source = .personal
         XCTAssertTrue(trust.isTrusted(w), "personal workflows are yours")
-        UserDefaults.standard.removePersistentDomain(forName: suite)
     }
 
     func sh(_ cmd: String, in dir: URL) {

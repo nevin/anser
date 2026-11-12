@@ -7,16 +7,24 @@
 #
 # Optional, for sharing with other Macs:
 #   SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"   signs with hardened runtime
-#   NOTARY_PROFILE=anser-notary                                     notarizes + staples the app and the DMG
-#     (create once with: xcrun notarytool store-credentials anser-notary)
+#   NOTARY_PROFILE=anser                                     notarizes + staples the app and the DMG
+#     (create once with: xcrun notarytool store-credentials anser)
 # Without them you get an ad-hoc signed build that runs on this Mac.
 #
 # Automatic updates: after scripts/setup-updates.sh has run once, this also
-# writes build/updates/ (the DMG + a signed appcast.xml). Upload that folder's
-# contents to the address you gave setup-updates.sh. See docs/RELEASING.md.
+# writes build/updates/ (the DMG + a signed appcast.xml). See docs/RELEASING.md.
+#   NOTES=notes.md     release notes for the update window and the GitHub release
+#   PUBLISH=1          also create the GitHub release (needs gh), which ships the update
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+
+# Check the inputs first: a mistake found after the build costs a version number.
+if [[ -n "${NOTES:-}" && ! -f "$NOTES" ]]; then echo "NOTES file not found: $NOTES" >&2; exit 1; fi
+if [[ "${PUBLISH:-}" == 1 ]]; then
+  [[ -f scripts/updates.conf ]] || { echo "PUBLISH=1 needs updates set up (scripts/setup-updates.sh)" >&2; exit 1; }
+  gh auth status >/dev/null 2>&1 || { echo "PUBLISH=1 needs gh signed in (gh auth login)" >&2; exit 1; }
+fi
 
 # Every release gets a new version (see scripts/bump-version.sh).
 bash scripts/bump-version.sh "${1:-patch}"
@@ -121,15 +129,7 @@ if [[ -n "${SIGN_IDENTITY:-}" && -n "${NOTARY_PROFILE:-}" ]]; then
   spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg" || true
 fi
 
-# The update feed: the DMG plus appcast.xml, signed with your update key.
-if [[ -f scripts/updates.conf ]]; then
-  # shellcheck disable=SC1091
-  source scripts/updates.conf
-  tools="build/sparkle-tools/bin"
-  [[ -x "$tools/generate_appcast" ]] || bash scripts/setup-updates.sh --tools-only
-  mkdir -p build/updates
-  cp "$dmg" build/updates/
-  "$tools/generate_appcast" --download-url-prefix "${FEED_URL%/*}/" build/updates
-  echo "Update feed ready in build/updates/: upload its files next to ${FEED_URL}"
-fi
+# The update feed (and the GitHub release with PUBLISH=1). If this step fails,
+# fix the cause and rerun just this: scripts/publish-update.sh VERSION
+[[ -f scripts/updates.conf ]] && bash scripts/publish-update.sh "$version"
 echo "Release ready: $dmg"

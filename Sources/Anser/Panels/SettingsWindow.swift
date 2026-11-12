@@ -49,7 +49,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let preview = ThemePreviewView()
     private let notifyToggle = NSButton(checkboxWithTitle: "Notify when a command in a background tab takes longer than", target: nil, action: nil)
     private let tipsPopup = NSPopUpButton()
-    private static let tipModes: [(String, String)] = [("auto", "While I'm new (first 300 commands)"), ("always", "Always"), ("never", "Never")]
+    private static let tipModes: [(String, String)] = [("always", "Always"), ("auto", "While I'm new (first 300 commands)"), ("never", "Never")]
 
     private var checkboxes: [NSButton] = []
     private let fontPopup = NSPopUpButton()
@@ -112,7 +112,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private var themes: [String] = []
 
     private static let cursorStyles: [(String?, String)] = [(nil, "Default"), ("block", "Block"), ("bar", "Bar"), ("underline", "Underline"), ("block_hollow", "Hollow block")]
-    private static let separatorStyles: [(String, String)] = [("line", "Line  ── you@mac · 14:02 ──"), ("dotted", "Dotted  ┄┄ you@mac · 14:02 ┄┄"), ("none", "None")]
+    private static let separatorStyles: [(String, String)] = [("dotted", "Dotted  ⋯ you@mac · 14:02 ⋯⋯⋯"), ("line", "Line  ─ you@mac · 14:02 ───"), ("none", "None")]
     private static let promptModes: [(String, String)] = [("hidden", "Hidden (the editor is the only input)"), ("compact", "Short ❯ prompt"), ("full", "My shell's own prompt")]
 
     private init() {
@@ -796,7 +796,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         let pm = (value(json, ["shellPrompt"]) as? String) ?? "hidden"
         promptPopup.selectItem(at: Self.promptModes.firstIndex { $0.0 == pm } ?? 0)
         let sepValue = value(json, ["commandSeparator"])
-        let sep = (sepValue as? Bool).map { $0 ? "line" : "none" } ?? (sepValue as? String) ?? "line"
+        let sep = (sepValue as? Bool).map { $0 ? "line" : "none" } ?? (sepValue as? String) ?? "dotted"
         separatorPopup.selectItem(at: Self.separatorStyles.firstIndex { $0.0 == sep } ?? 0)
         let notify = (value(json, ["notifyAfterSeconds"]) as? Double) ?? 10
         notifyToggle.state = notify > 0 ? .on : .off
@@ -809,7 +809,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         let qh = (value(json, ["quickTerminalHeight"]) as? Double) ?? 0.45
         quickHeight.doubleValue = qh
         quickHeightLabel.stringValue = "\(Int((qh * 100).rounded()))%"
-        let tips = (value(json, ["keyTips"]) as? String) ?? "auto"
+        let tips = (value(json, ["keyTips"]) as? String) ?? "always"
         tipsPopup.selectItem(at: Self.tipModes.firstIndex { $0.0 == tips } ?? 0)
         updatePreview()
         let aiOn = (value(json, ["aiEnabled"]) as? Bool) ?? false

@@ -20,7 +20,157 @@ enum SelfTest {
             Task { @MainActor in await historyShots(pane); finish() }
             return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "input" {
+            Task { @MainActor in await inputShots(pane, wc); finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "resize" {
+            Task { @MainActor in await resizeChecks(pane, wc); finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "hang" {
+            Task { @MainActor in await hangChecks(); finish() }
+            return
+        }
         Task { @MainActor in await run(pane, wc); finish() }
+    }
+
+    /// The hang watchdog names what the main thread was stuck in.
+    @MainActor
+    static func hangChecks() async {
+        await sleep(2)
+        selfTestBlockMainThread(seconds: 4.5)
+        let logged = await wait(6) { Diagnostics.shared.recentBreadcrumbs.contains { $0.contains("HANG main thread stack") } }
+        let stack = Diagnostics.shared.recentBreadcrumbs.last { $0.contains("HANG main thread stack") } ?? ""
+        check("a hang is logged with the main thread's stack", logged, String(stack.prefix(120)))
+        check("the stack names the function that blocked", stack.contains("selfTestBlockMainThread"),
+              stack.split(separator: "\n").prefix(6).joined(separator: " | "))
+    }
+
+    @inline(never)
+    static func selfTestBlockMainThread(seconds: Double) {
+        let end = Date().addingTimeInterval(seconds)
+        var x = 0
+        while Date() < end { x &+= 1 }
+        if x == -1 { print(x) }
+    }
+
+    /// The input area in each state, as screenshots: prompt, typing, several lines, running, narrow, light.
+    @MainActor
+    static func inputShots(_ pane: PaneView, _ wc: TerminalWindowController) async {
+        let s = pane.session
+        guard let w = wc.window else { return }
+        _ = await wait(20) { s.atPrompt }
+        // A throwaway repo, so the branch chip shows.
+        let repo = NSTemporaryDirectory() + "anser-selftest-input"
+        pane.run("mkdir -p \(repo) && cd \(repo) && git init -q -b main 2>/dev/null; ls -la # anser-selftest")
+        _ = await wait(10) { s.atPrompt && s.blocks.last?.command.hasPrefix("mkdir") == true }
+        pane.run("echo 'second command' # anser-selftest")
+        _ = await wait(10) { s.atPrompt && s.blocks.last?.command.hasPrefix("echo") == true }
+        await sleep(2.5)
+        pane.layoutSubtreeIfNeeded()
+        let line = pane.inputLineForTest
+        check("input: folder and branch sit in the row under the divider", line.folderInHintsRow)
+        check("input: the command line uses the full width", line.editorMaxX > line.barWidth - 40,
+              "editor ends \(Int(line.editorMaxX)) of \(Int(line.barWidth))")
+        check("input: the hints row shows the key tips", pane.hintText.contains("complete"), pane.hintText)
+        check("input: separators are drawn as dots", pane.blocksOverlay.separatorRules.contains { $0.dotted }, "\(pane.blocksOverlay.separatorRules)")
+        await windowShot(w, "input-1-prompt")
+        type(pane, "git sta")
+        await sleep(0.8)
+        await windowShot(w, "input-2-typing")
+        pane.editor.string = ""
+        type(pane, "for f in *.log; do")
+        pane.editor.insertNewlineIgnoringFieldEditor(nil)
+        type(pane, "  gzip \"$f\"")
+        pane.editor.insertNewlineIgnoringFieldEditor(nil)
+        type(pane, "done")
+        await sleep(0.8)
+        await windowShot(w, "input-3-multiline")
+        pane.editor.string = ""
+        pane.run("sleep 4 # anser-selftest")
+        await sleep(1.5)
+        check("input: running hints", pane.hintText.contains("stop"), pane.hintText)
+        await windowShot(w, "input-4-running")
+        _ = await wait(8) { s.atPrompt }
+        let f0 = w.frame
+        w.setFrame(NSRect(x: f0.minX, y: f0.minY, width: 460, height: f0.height), display: true)
+        await sleep(1.5)
+        pane.layoutSubtreeIfNeeded()
+        let narrow = pane.inputLineForTest
+        check("input: narrow window keeps the full command line", narrow.editorMaxX > narrow.barWidth - 40)
+        let lines = (pane.surfaceView.viewportText() ?? "").components(separatedBy: "\n")
+        let rows = (0..<14).map { r in (pane.surfaceView.rowText(r) ?? "nil").count }
+        check("input: narrow separators keep their dots", pane.blocksOverlay.separatorRules.count >= 2,
+              "lines: " + lines.prefix(14).map { "\($0.count):\($0.prefix(12))" }.joined(separator: " | ") + " rows: \(rows)")
+        await windowShot(w, "input-5-narrow")
+        await sleep(3)
+        await windowShot(w, "input-5b-narrow-later")
+        w.setFrame(f0, display: true)
+        try? #"{"appearance":{"theme":"GitHub Light Default"}}"#.write(to: AnserConfig.fileURL, atomically: true, encoding: .utf8)
+        _ = await wait(5) { !GhosttyRuntime.shared.theme.isDark }
+        await sleep(1.5)
+        await windowShot(w, "input-6-light")
+        pane.run("cd ~ && rm -rf \(repo) # anser-selftest")
+        _ = await wait(8) { s.atPrompt }
+    }
+
+    /// Resizing the window: the output re-wraps and the input area stays right under it.
+    @MainActor
+    static func resizeChecks(_ pane: PaneView, _ wc: TerminalWindowController) async {
+        let s = pane.session
+        guard let w = wc.window else { return }
+        _ = await wait(20) { s.atPrompt }
+        pane.run("printf 'first line\\n'; seq 1 8; printf '%.0s=' {1..140}; echo; echo 'last line' # anser-selftest")
+        _ = await wait(10) { s.atPrompt && s.blocks.last?.command.hasPrefix("printf") == true }
+        await sleep(1)
+        let f0 = w.frame
+        func report(_ name: String) async {
+            pane.layoutSubtreeIfNeeded()
+            let text = (pane.surfaceView.viewportText() ?? "").split(separator: "\n", omittingEmptySubsequences: false)
+            let ob = pane.outputBottomForTest
+            let clear: Bool
+            if let ob { clear = pane.followTop != nil ? pane.barTopForTest <= ob + 0.5 : pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5 } else { clear = true }
+            check("resize \(name): input area clear of output", clear,
+                  "w=\(Int(w.frame.width)) follow=\(pane.followTop.map { "\(Int($0))" } ?? "bottom") bar top \(Int(pane.barTopForTest)) out bottom \(ob.map { "\(Int($0))" } ?? "nil") term \(Int(pane.surfaceView.frame.minY))-\(Int(pane.surfaceView.frame.maxY)) lines=\(text.count) tail=\(text.suffix(4).joined(separator: " ⏎ "))")
+            let marks = pane.surfaceView.promptMarks()
+            check("resize \(name): one prompt mark per command", marks.count <= 2,
+                  "marks at rows " + marks.map { "\(Int(($0.y / max($0.height, 1)).rounded(.down)))#\($0.index)" }.joined(separator: ","))
+            if Services.shared.config.commandSeparator != "none" {
+                let rules = pane.blocksOverlay.separatorRules
+                // Very narrow windows have no room left after the label, so no line is drawn.
+                let narrow = pane.blocksOverlay.bounds.width < 500
+                check("resize \(name): separator drawn to the edge", narrow ? rules.count <= 1 : rules.count == 1 && (rules.first?.startX ?? .infinity) < pane.blocksOverlay.bounds.width,
+                      "rules=\(rules.map { "y\(Int($0.y)) x\(Int($0.startX))" }) width=\(Int(pane.blocksOverlay.bounds.width))")
+            }
+            await windowShot(w, "resize-\(name)")
+        }
+        await report("0-start")
+        for (i, width) in [560.0, 400, 1200].enumerated() {
+            w.setFrame(NSRect(x: f0.minX, y: f0.minY, width: width, height: f0.height), display: true)
+            await sleep(1.5)
+            await report("\(i + 1)-w\(Int(width))")
+        }
+        // Like dragging the corner: many small steps, then look right away and again once it settles.
+        for k in 0..<30 {
+            w.setFrame(NSRect(x: f0.minX, y: f0.minY, width: 450 + CGFloat(k) * 20, height: f0.height - CGFloat(k) * 4), display: true)
+            await sleep(0.02)
+        }
+        await report("4-drag-now")
+        await sleep(1.5)
+        await report("5-drag-settled")
+        // Taller and shorter.
+        w.setFrame(NSRect(x: f0.minX, y: f0.minY, width: f0.width, height: 300), display: true)
+        await sleep(1.5)
+        await report("6-short")
+        w.setFrame(f0, display: true)
+        await sleep(1.5)
+        await report("7-back")
+        let back = pane.surfaceView.viewportText() ?? ""
+        check("growing the window brings back lines a smaller one pushed up", back.contains("first line") && back.contains("printf"),
+              String(back.prefix(160)).replacingOccurrences(of: "\n", with: " ⏎ "))
+        // The command's block bar covers its output again.
+        check("the command's block is drawn after resizing", pane.blocksOverlay.blocks.contains { $0.info?.command.hasPrefix("printf") == true })
     }
 
     /// A real screenshot of a window (what people see, unlike cacheDisplay).
@@ -159,7 +309,7 @@ enum SelfTest {
         let s = pane.session
         var ok = false
         // Work tools: failed tests, "when done", file watching, project env, runbooks, containers, AI tasks, project plugins.
-        FileTrust.testDefaults = UserDefaults(suiteName: "anser-selftest-trust-\(UUID().uuidString)")
+        FileTrust.testDefaults = ScratchDefaults.make("anser-selftest-trust")
         ProjectEnvPrefs.file = URL(fileURLWithPath: live + "/project-env.json")
         let wt = live + "/work"
         let fm = FileManager.default
@@ -369,6 +519,7 @@ enum SelfTest {
         PluginHost.directory = PluginRegistry.defaultDirectory
         PluginHost.shared.reload()
         FileTrust.testDefaults = nil
+        ScratchDefaults.discard("anser-selftest-trust")
         pane.run("cd \(ShellLexer.escape(tmp)) # anser-selftest")
         _ = await wait(5) { s.atPrompt }
 
@@ -642,7 +793,7 @@ enum SelfTest {
         try? fm.createDirectory(atPath: dir + "/.git", withIntermediateDirectories: true)
         try? fm.createDirectory(atPath: dir + "/.anser/runbooks", withIntermediateDirectories: true)
         try? "# Ed\n\n```sh\necho one # anser-selftest\n```\n".write(toFile: dir + "/.anser/runbooks/ed.md", atomically: true, encoding: .utf8)
-        FileTrust.testDefaults = UserDefaults(suiteName: "anser-selftest-trust2-\(UUID().uuidString)")
+        FileTrust.testDefaults = ScratchDefaults.make("anser-selftest-trust2")
         if let rb = Runbook.load(cwd: dir).first {
             FileTrust.runbooks.trust(rb)
             let rw = RunbookWindowController.show(rb, pane: pane)
@@ -653,6 +804,7 @@ enum SelfTest {
             rw?.close()
         }
         FileTrust.testDefaults = nil
+        ScratchDefaults.discard("anser-selftest-trust2")
 
         // Trimming a recording.
         pane.startRecording()
@@ -957,7 +1109,7 @@ enum SelfTest {
         lib.close()
 
         // A sidebar you can arrange.
-        SidebarPrefs.defaults = UserDefaults(suiteName: "anser-selftest-sidebar-\(UUID().uuidString)")!
+        SidebarPrefs.defaults = ScratchDefaults.make("anser-selftest-sidebar")
         wc.sidebar.refresh(for: pane)
         ok = await wait(4) { wc.sidebar.orderedSections.count >= 2 }
         // Let the background refresh finish, then work from a fresh build.
@@ -977,6 +1129,7 @@ enum SelfTest {
             check("a sidebar section can move to the top", false, "no sections")
         }
         SidebarPrefs.defaults = .standard
+        ScratchDefaults.discard("anser-selftest-sidebar")
         wc.sidebar.refresh(for: pane)
 
         // Polish: grouped menus with shortcuts, forms that check as you type, Settings sidebar, tour, empty states.
