@@ -220,7 +220,7 @@
         <div class="step"><b>3. Open it</b>Press <kbd>⌘/</kbd> any time to see every shortcut. New versions install themselves.</div>
       </div>
       <a class="btn btn-primary download" href="https://github.com/nevin/anser/releases/latest"><span class="download-label">Download for Mac</span></a>
-      <p class="fine"><span class="version-note">Free</span> · macOS 14 Sonoma or later</p>
+      <p class="fine"><span class="version-note">Free</span> · macOS 14 Sonoma or later · <a class="whats-new" href="https://github.com/nevin/anser/releases/latest">What’s new</a></p>
       <div class="brew">
         <p>Or install with <a href="https://brew.sh">Homebrew</a>:</p>
         <div class="code"><button class="copy" type="button">Copy</button><pre>brew install --cask nevin/tap/anser</pre></div>
@@ -287,6 +287,7 @@ while security delete-generic-password -s app.anser.terminal.secret &gt;/dev/nul
       const mb = Math.round(dmg.size / 1e6);
       document.querySelectorAll("a.download").forEach(a => { a.href = dmg.browser_download_url; });
       document.querySelectorAll(".version-note").forEach(s => { s.textContent = `Version ${v} · ${mb} MB · Free`; });
+      document.querySelectorAll("a.whats-new").forEach(a => { a.href = rel.html_url; a.textContent = `What’s new in ${v}`; });
     })
     .catch(() => {});
 </script>
