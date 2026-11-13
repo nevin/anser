@@ -66,6 +66,8 @@ if [[ "${PUBLISH:-}" == 1 && -n "$gh_repo" ]]; then
   [[ -n "${NOTES:-}" ]] && notes_args=(--notes-file "$NOTES")
   gh release create "v$version" "build/updates/Anser-$version.dmg" build/updates/appcast.xml \
     -R "${gh_repo#https://github.com/}" --title "Anser $version" "${notes_args[@]}"
+  # Homebrew: point the cask at this release.
+  bash scripts/update-cask.sh "$version"
 elif [[ -n "$gh_repo" ]]; then
   echo "Update feed ready in build/updates/. To publish it:"
   echo "  ${NOTES:+NOTES=$NOTES }PUBLISH=1 bash scripts/publish-update.sh $version"

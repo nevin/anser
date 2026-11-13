@@ -97,6 +97,9 @@
   .install .btn-primary { background: var(--navy); color: var(--cream); }
   .install .btn-primary:hover { background: var(--navy-light); }
   .install .fine { color: #6A6C88; }
+  .brew { max-width: 460px; margin: 28px auto 0; text-align: left; }
+  .brew p { font-size: 15px; color: #3F4268; margin: 0 0 8px; text-align: center; }
+  .brew pre { padding-right: 76px; }
 
   .uninstall { padding-top: 0; }
   .uninstall details { max-width: 900px; margin: 0 auto; background: #fff; border: 1px solid #ECE3D2; border-radius: 14px; padding: 0 22px; }
@@ -214,10 +217,14 @@
       <div class="steps">
         <div class="step"><b>1. Download</b>Get the DMG from the latest release.</div>
         <div class="step"><b>2. Drag to Applications</b>Open the DMG and drag Anser into your Applications folder.</div>
-        <div class="step"><b>3. Open it</b>Press <kbd>⌘/</kbd> any time to see every shortcut.</div>
+        <div class="step"><b>3. Open it</b>Press <kbd>⌘/</kbd> any time to see every shortcut. New versions install themselves.</div>
       </div>
       <a class="btn btn-primary download" href="https://github.com/nevin/anser/releases/latest"><span class="download-label">Download for Mac</span></a>
       <p class="fine"><span class="version-note">Free</span> · macOS 14 Sonoma or later</p>
+      <div class="brew">
+        <p>Or install with <a href="https://brew.sh">Homebrew</a>:</p>
+        <div class="code"><button class="copy" type="button">Copy</button><pre>brew install --cask nevin/tap/anser</pre></div>
+      </div>
     </div>
   </section>
   <section id="uninstall" class="uninstall">
@@ -263,7 +270,7 @@ while security delete-generic-password -s app.anser.terminal.secret &gt;/dev/nul
 </footer>
 
 <script>
-  // Copy the cleanup commands without the comment lines.
+  // Copy a code block without its comment lines.
   document.querySelectorAll(".copy").forEach(b => b.addEventListener("click", () => {
     const text = b.nextElementSibling.textContent.split("\n").filter(l => !l.startsWith("#")).join("\n");
     navigator.clipboard.writeText(text).then(() => { b.textContent = "Copied"; setTimeout(() => b.textContent = "Copy", 1500); });

@@ -23,7 +23,13 @@ See **[docs/FEATURES.md](docs/FEATURES.md)** for everything, with shortcuts. Pre
 
 ## Install
 
-Download the DMG, drag Anser to Applications, and open it. It updates itself (Anser menu → Check for Updates). Your zsh or bash history is imported on first launch, and your Ghostty theme and font are used automatically.
+Download the DMG, drag Anser to Applications, and open it. It updates itself (Anser menu → Check for Updates).
+
+Or with [Homebrew](https://brew.sh):
+
+```bash
+brew install --cask nevin/tap/anser
+``` Your zsh or bash history is imported on first launch, and your Ghostty theme and font are used automatically.
 
 Coming from iTerm2 or Warp? App menu → **Import from iTerm2 or Warp…** brings over themes, font and workflows.
 
