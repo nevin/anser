@@ -564,6 +564,14 @@ final class SafetyTests: XCTestCase {
         try FileManager.default.createDirectory(at: clean, withIntermediateDirectories: true)
         sh("git init -q", in: clean)
         XCTAssertFalse(GitSafety.isRisky(cwd: clean.path))
+        // husky's hooks folder: Anser forces hooks off, so git checks stay on.
+        let hooksMarker = clean.appendingPathComponent("HOOKED").path
+        sh("mkdir -p .husky/_ && printf '#!/bin/sh\\ntouch \(hooksMarker)\\n' > .husky/_/post-checkout && chmod +x .husky/_/post-checkout && git config core.hooksPath .husky/_ && git -c user.name=t -c user.email=t@t commit -q --allow-empty --no-verify -m init", in: clean)
+        XCTAssertFalse(GitSafety.isRisky(cwd: clean.path))
+        let cleanBranches = await Generators.run("git_local_branches", cwd: clean.path, env: ShellEnvironment())
+        XCTAssertFalse(cleanBranches.isEmpty, "branches listed in a repo with core.hooksPath")
+        _ = await ScriptRunner.shared.run("git checkout -q -b other", cwd: clean.path, env: ShellEnvironment())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: hooksMarker), "hooks must not run for Anser's own git commands")
         try? FileManager.default.removeItem(at: repo); try? FileManager.default.removeItem(at: clean)
     }
 

@@ -115,6 +115,7 @@ extension TerminalWindowController {
     /// Branches, most recent first. Enter switches; typing a new name offers to create it.
     func showBranchSwitcher(for pane: PaneView) {
         guard pane.session.gitBranch != nil else { pane.flash("This folder isn't in a git repository"); return }
+        if pane.session.gitRisky { pane.flash("Git checks are off in this repo (its config can run programs)"); return }
         let current = pane.session.gitBranch ?? ""
         let cwd = pane.session.cwd, env = pane.session.env, risky = pane.session.gitRisky
         Task { @MainActor [weak self, weak pane] in

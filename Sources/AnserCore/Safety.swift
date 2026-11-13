@@ -5,8 +5,10 @@ import os
 public enum GitSafety {
     /// Config that makes git run arbitrary programs. A repository folder that
     /// came from a download or archive (not a fresh clone) can carry these.
+    /// core.hooksPath isn't here: husky and similar tools set it in most Node
+    /// repos, and `environment` points it at /dev/null for Anser's own git runs.
     static let riskyKeyPatterns = [
-        #"^\s*fsmonitor\s*="#, #"^\s*hookspath\s*="#, #"^\s*(clean|smudge|process|textconv)\s*="#,
+        #"^\s*fsmonitor\s*="#, #"^\s*(clean|smudge|process|textconv)\s*="#,
         #"^\s*external\s*="#, #"^\s*sshcommand\s*="#, #"^\s*gitproxy\s*="#, #"^\s*askpass\s*="#,
         #"^\s*pager\s*="#, #"^\s*editor\s*="#, #"^\s*path\s*="#,   // include.path / includeIf
     ]
