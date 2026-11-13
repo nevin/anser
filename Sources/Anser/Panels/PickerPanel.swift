@@ -103,17 +103,11 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
     override var canBecomeKey: Bool { true }
 
     private func build() {
-        // Themed like the terminal rather than the system's gray panel.
+        // A see-through overlay tinted like the terminal.
         let t = GhosttyRuntime.shared.theme
-        let fx = NSView()
-        fx.wantsLayer = true
-        fx.layer?.backgroundColor = (t.background.blended(withFraction: t.isDark ? 0.05 : 0.02, of: t.isDark ? .white : .black) ?? t.background).cgColor
-        fx.layer?.cornerRadius = 12
-        fx.layer?.borderWidth = 1
-        fx.layer?.borderColor = t.foreground.withAlphaComponent(0.14).cgColor
+        let fx = OverlayBackground.make()
         contentView = fx
-        backgroundColor = .clear
-        isOpaque = false
+        OverlayBackground.prepare(self)
         appearance = NSAppearance(named: t.isDark ? .darkAqua : .aqua)
 
         previewText.isEditable = false
@@ -128,7 +122,7 @@ final class PickerPanel: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NS
         previewScroll.hasHorizontalScroller = true
         previewScroll.autohidesScrollers = true
         previewScroll.drawsBackground = true
-        previewScroll.backgroundColor = t.background
+        previewScroll.backgroundColor = t.background.withAlphaComponent(0.6)
         previewScroll.wantsLayer = true
         previewScroll.layer?.cornerRadius = 8
         previewScroll.isHidden = config.preview == nil

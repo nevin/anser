@@ -107,10 +107,16 @@ final class AIPanel: NSPanel, NSTextFieldDelegate {
             v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -36).isActive = true
         }
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
-        // Themed like the other panels.
-        stack.wantsLayer = true
-        stack.layer?.backgroundColor = (t.background.blended(withFraction: t.isDark ? 0.05 : 0.02, of: t.isDark ? .white : .black) ?? t.background).cgColor
-        contentView = stack
+        // The same see-through overlay as the other popups.
+        let fx = OverlayBackground.make(cornerRadius: 0)
+        OverlayBackground.prepare(self)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        fx.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: fx.leadingAnchor), stack.trailingAnchor.constraint(equalTo: fx.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: fx.topAnchor), stack.bottomAnchor.constraint(equalTo: fx.bottomAnchor),
+        ])
+        contentView = fx
     }
 
     func present(over parent: NSWindow) {

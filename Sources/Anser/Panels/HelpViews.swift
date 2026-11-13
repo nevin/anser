@@ -192,8 +192,18 @@ final class ShortcutsPanel: NSPanel {
         cols.alignment = .top
         cols.spacing = 40
         cols.edgeInsets = NSEdgeInsets(top: 40, left: 32, bottom: 28, right: 32)
-        contentView = cols
-        setContentSize(cols.fittingSize)
+        let size = cols.fittingSize
+        let fx = OverlayBackground.make(cornerRadius: 0)
+        OverlayBackground.prepare(self)
+        appearance = fx.appearance
+        cols.translatesAutoresizingMaskIntoConstraints = false
+        fx.addSubview(cols)
+        NSLayoutConstraint.activate([
+            cols.leadingAnchor.constraint(equalTo: fx.leadingAnchor), cols.trailingAnchor.constraint(equalTo: fx.trailingAnchor),
+            cols.topAnchor.constraint(equalTo: fx.topAnchor), cols.bottomAnchor.constraint(equalTo: fx.bottomAnchor),
+        ])
+        contentView = fx
+        setContentSize(size)
     }
 
     override func cancelOperation(_ sender: Any?) { close() }
