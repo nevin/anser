@@ -850,6 +850,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case .pauseHistory: pane.session.historyPaused.toggle(); pane.historyPausedChanged()
         case .openSettings: openSettings(nil)
         case .jumpToFolder: currentController?.showFolderJumper(for: pane)
+        case .openProjectInEditor: FileActions.openProject(for: pane)
         case .switchBranch: currentController?.showBranchSwitcher(for: pane)
         case .changedFiles: currentController?.showChanges(for: pane)
         case .showShortcuts: showShortcuts(nil)

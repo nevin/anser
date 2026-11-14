@@ -63,7 +63,7 @@ extension TerminalWindowController {
     private func presentBlame(_ lines: [GitBlame.Line], path: String, dir: String, pane: PaneView) -> PickerPanel? {
         let env = pane.session.env
         let name = (path as NSString).lastPathComponent
-        func open(_ l: GitBlame.Line) { pane.openFile("\(path):\(l.number)") }
+        func open(_ l: GitBlame.Line) { FileActions.openInEditor(PathLink(path: path, line: l.number), pane: pane) }
         func showCommit(_ l: GitBlame.Line) {
             guard !l.isUncommitted, pane.session.atPrompt else { NSSound.beep(); return }
             pane.run("git -C \(ShellLexer.escape(dir)) show \(l.commit)")
@@ -98,7 +98,10 @@ extension TerminalWindowController {
                 return PickerPanel.previewText(String(show.prefix(60_000)), diff: true)
             },
             actions: [
-                .init(title: "Open at This Line", symbol: "chevron.left.forwardslash.chevron.right", button: true) { i in if let l = line(i) { open(l) } },
+                .init(title: FileActions.editorTitle(for: pane), symbol: "chevron.left.forwardslash.chevron.right", button: true) { i in if let l = line(i) { open(l) } },
+                .init(title: "Open With…", symbol: "ellipsis.circle", run: { i in
+                    if let l = line(i) { FileActions.chooseEditor(for: PathLink(path: path, line: l.number), pane: pane) }
+                }),
                 .init(title: "Show Commit", symbol: "doc.text.magnifyingglass", button: true, applies: { line($0)?.isUncommitted == false }) { i in
                     if let l = line(i) { showCommit(l) }
                 },

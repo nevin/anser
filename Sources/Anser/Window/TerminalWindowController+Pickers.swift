@@ -217,7 +217,6 @@ extension TerminalWindowController {
     static func folderActions(pane: PaneView, controller: TerminalWindowController) -> [PickerPanel.Action] {
         func path(_ i: PickerItem) -> String? { (i.payload as? String).flatMap { $0.isEmpty ? nil : $0 } }
         let has: (PickerItem) -> Bool = { path($0) != nil }
-        let env = pane.session.env
         return [
             .init(title: "cd Here", symbol: "arrow.right.circle", applies: has) { [weak pane] i in
                 guard let pane, let p = path(i) else { return }
@@ -235,19 +234,22 @@ extension TerminalWindowController {
             .init(title: "Copy Path", symbol: "doc.on.clipboard", applies: has) { i in
                 if let p = path(i) { FileActions.copyPath(p) }
             },
-            .init(title: "Open in Editor", symbol: "chevron.left.forwardslash.chevron.right", button: FileActions.guiEditor(env: env) != nil,
-                  applies: { has($0) && FileActions.guiEditor(env: env) != nil }) { i in
-                if let p = path(i) { FileActions.openInEditor(p, env: env) }
-            },
+            .init(title: FileActions.editorTitle(for: pane), symbol: "chevron.left.forwardslash.chevron.right",
+                  button: true, applies: has, run: { [weak pane] i in
+                if let pane, let p = path(i) { FileActions.openInEditor(PathLink(path: p), pane: pane) }
+            }),
+            .init(title: "Open With…", symbol: "ellipsis.circle", applies: has, run: { [weak pane] i in
+                if let pane, let p = path(i) { FileActions.chooseEditor(for: PathLink(path: p), pane: pane) }
+            }),
             .init(title: "Quick Look", symbol: "eye", applies: has) { i in
                 if let p = path(i) { FileActions.quickLook(p) }
             },
-            .init(title: "Files", symbol: "doc.on.doc", applies: has, children: { i in
+            .init(title: "Files", symbol: "doc.on.doc", applies: has, children: { [weak pane] i in
                 // Open anything inside the folder straight from here.
                 FileActions.contents(of: path(i) ?? "").map { entry in
                     PickerPanel.Action(title: entry.name + (entry.folder ? "/" : ""), symbol: entry.folder ? "folder" : "doc") { _ in
                         if entry.folder { FileActions.reveal(entry.path) }
-                        else if !FileActions.openInEditor(entry.path, env: env) { FileActions.openDefault(entry.path) }
+                        else if let pane { FileActions.openInEditor(PathLink(path: entry.path), pane: pane) }
                     }
                 }
             }),
@@ -256,13 +258,15 @@ extension TerminalWindowController {
 
     /// Right-click actions (and buttons) for files in a picker.
     static func fileActions(pane: PaneView, path: @escaping (PickerItem) -> String?) -> [PickerPanel.Action] {
-        let env = pane.session.env
         let exists: (PickerItem) -> Bool = { path($0).map { FileManager.default.fileExists(atPath: $0) } ?? false }
         return [
-            .init(title: "Open in Editor", symbol: "chevron.left.forwardslash.chevron.right", button: FileActions.guiEditor(env: env) != nil,
-                  applies: { exists($0) && FileActions.guiEditor(env: env) != nil }) { i in
-                if let p = path(i) { FileActions.openInEditor(p, env: env) }
-            },
+            .init(title: FileActions.editorTitle(for: pane), symbol: "chevron.left.forwardslash.chevron.right",
+                  button: true, applies: exists, run: { [weak pane] i in
+                if let pane, let p = path(i) { FileActions.openInEditor(PathLink(path: p), pane: pane) }
+            }),
+            .init(title: "Open With…", symbol: "ellipsis.circle", applies: exists, run: { [weak pane] i in
+                if let pane, let p = path(i) { FileActions.chooseEditor(for: PathLink(path: p), pane: pane) }
+            }),
             .init(title: "Open with Default App", symbol: "arrow.up.forward.app", applies: exists) { i in
                 if let p = path(i) { FileActions.openDefault(p) }
             },

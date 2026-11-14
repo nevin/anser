@@ -25,6 +25,7 @@ extension PaneView {
     }
 
     private func open(_ link: PathLink) -> Bool {
+        guard !session.isRemote else { return false }
         let path = link.resolved(cwd: session.cwd)
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return false }
@@ -39,22 +40,11 @@ extension PaneView {
         }
         if isDir.boolValue { lastOpenAction = "finder"; NSWorkspace.shared.open(URL(fileURLWithPath: path)); return true }
 
-        let configured = Services.shared.config.openFilesWith?.trimmingCharacters(in: .whitespaces)
-        let editor = (configured?.isEmpty == false ? configured : nil)
-            ?? PathLink.guiEditors.first { CommandIndex.shared.contains($0, env: session.env) }
-        guard let editor else { lastOpenAction = "open"; NSWorkspace.shared.open(URL(fileURLWithPath: path)); return true }
-        lastOpenAction = "editor"
-        let argv = link.editorCommand(editor, absolutePath: path)
-        lastOpenedArgv = argv
-        if ProcessInfo.processInfo.environment["ANSER_SELFTEST"] != nil { return true }  // don't launch editors in tests
-        if PathLink.terminalEditors.contains((editor as NSString).lastPathComponent) {
-            // Terminal editors open right here.
-            if session.atPrompt { run(argv.map { ShellLexer.escape($0) }.joined(separator: " ")) } else { NSSound.beep() }
-            return true
-        }
-        let env = session.env
-        Task.detached {
-            _ = await ScriptRunner.shared.run(argv: ["/usr/bin/env"] + argv, cwd: (path as NSString).deletingLastPathComponent, env: env, timeout: 10)
+        if FileActions.preferredEditor(env: session.env) == nil {
+            lastOpenAction = "open"
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        } else {
+            FileActions.openInEditor(PathLink(path: path, line: link.line, column: link.column), pane: self)
         }
         return true
     }
@@ -156,6 +146,7 @@ extension PaneView {
     /// Stop: ⌃C first. A pager (which ignores ⌃C) is ended right away; anything else
     /// still running gets SIGTERM on the next click, then SIGKILL.
     @objc func stopRunning() {
+        guard stopButton.isEnabled else { return }
         if let wc = windowController, wc.isBroadcasting(self) {
             for p in wc.panes(inSameTabAs: self) where p !== self && !p.session.atPrompt { p.sendControl("c") }
         }
@@ -165,15 +156,21 @@ extension PaneView {
             Services.shared.record("stop.pager")
             return
         }
-        stopPresses += 1
+        stopPresses = job == nil ? 1 : stopPresses + 1
         switch stopPresses {
         case 1:
             sendControl("c")
+            stopButton.title = "Stopping…"
+            stopButton.toolTip = "Waiting for the program to respond to the interrupt"
+            stopButton.isEnabled = false
+            needsLayout = true
             let command = session.running?.command
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self, self.stopPresses == 1, !self.session.atPrompt, self.session.running?.command == command else { return }
                 self.updateStopButton()
-                self.flash("Still running: click Force Stop to end it")
+                if self.foregroundJob != nil {
+                    self.flash("Still running: click Force Stop to end it")
+                }
             }
         case 2:
             if let job { ForegroundJob.send(SIGTERM, to: job) } else { sendControl("c") }
@@ -187,9 +184,10 @@ extension PaneView {
 
     /// "Stop", then "Force Stop" once ⌃C didn't end it.
     func updateStopButton() {
-        let force = stopPresses >= 1 && !session.atPrompt
-        stopButton.title = force ? " Force Stop" : " Stop"
-        stopButton.toolTip = force ? "End the program now (it didn't stop on ⌃C)" : "Stop the running program (⌃C; click again to force it)"
+        let force = stopPresses >= 1 && !session.atPrompt && foregroundJob != nil
+        stopButton.title = force ? "Force Stop" : "Stop"
+        stopButton.toolTip = force ? "Send a termination signal to the running program" : "Interrupt the running program (⌃C)"
+        stopButton.isEnabled = true
         needsLayout = true
     }
 
@@ -334,10 +332,10 @@ extension PaneView {
 
 
     /// A path (with its line, if given) in `word` that exists on this Mac.
-    func pathLink(_ word: String, viewport: String? = nil) -> (path: String, line: Int?)? {
+    func pathLink(_ word: String, viewport: String? = nil) -> PathLink? {
         guard !session.isRemote, let link = PathLink.find(word: word, in: viewport ?? word) else { return nil }
         let path = link.resolved(cwd: session.cwd)
-        return FileManager.default.fileExists(atPath: path) ? (path, link.line) : nil
+        return FileManager.default.fileExists(atPath: path) ? PathLink(path: path, line: link.line, column: link.column) : nil
     }
 
     /// A file path in `word` (relative to this pane's folder) that exists on this Mac.

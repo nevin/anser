@@ -430,7 +430,7 @@ public enum AnserAction: String, CaseIterable, Sendable {
     case findInTerminal, blockNavigator, pauseHistory, openSettings
     case expandEditor, formatCommand, externalEditor
     case renameTab, nextTab, previousTab, closeTab, switchToTab
-    case jumpToFolder, switchBranch, changedFiles, showShortcuts
+    case jumpToFolder, openProjectInEditor, switchBranch, changedFiles, showShortcuts
     case moveTabLeft, moveTabRight, moveTabToNewWindow
     case saveWorkspace, openWorkspace
     case zoomPane, toggleSidebar
@@ -487,6 +487,7 @@ public enum AnserAction: String, CaseIterable, Sendable {
         case .closeTab: "Close Tab"
         case .switchToTab: "Switch to Tab"
         case .jumpToFolder: "Jump to Folder"
+        case .openProjectInEditor: "Open Project in Editor"
         case .switchBranch: "Git: Switch or Create Branch"
         case .changedFiles: "Git: Changed Files"
         case .showShortcuts: "Keyboard Shortcuts"
@@ -573,7 +574,7 @@ extension AnserAction {
              .filterOutput, .compareLastRun, .viewOutputAsData, .logViewer, .recordTab, .openRecording: "Output"
         case .toggleEditor, .expandEditor, .formatCommand, .externalEditor, .increaseFontSize, .decreaseFontSize, .resetFontSize: "Editor"
         case .rerunLastCommand, .whenDone, .watchAndRerun, .watchOutput, .failedTests, .killPort, .projectEnvironment: "Run"
-        case .jumpToFolder: "Folders"
+        case .jumpToFolder, .openProjectInEditor: "Folders"
         case .switchBranch, .changedFiles, .gitHistory, .gitStashes, .gitFetch, .gitPull, .gitPush, .resolveConflicts, .openPullRequest, .gitBlame: "Git"
         case .notebook, .editNotebook, .saveToNotebook, .runWorkflow, .saveWorkflow, .openWorkflowsFolder, .runbooks, .newRunbook, .aliases, .library: "Library"
         case .explainError, .askClaude, .aiTask: "AI"

@@ -438,10 +438,11 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
         }
         // Right-clicked a file path in the output: open, preview, blame, reveal, copy.
         if let pane, let word = wordUnderMouse(), let link = pane.pathLink(word, viewport: viewportText()) {
-            let name = (link.path as NSString).lastPathComponent
-            let env = pane.session.env
-            m.addItem(ClosureMenuItem(title: "Open “\(name)”") { [weak pane] in
-                if !FileActions.openInEditor(link.path, env: env) { _ = pane?.openFile(link.line.map { "\(link.path):\($0)" } ?? link.path) }
+            m.addItem(ClosureMenuItem(title: FileActions.editorTitle(for: pane)) { [weak pane] in
+                if let pane { FileActions.openInEditor(link, pane: pane) }
+            })
+            m.addItem(ClosureMenuItem(title: "Open With…") { [weak pane] in
+                if let pane { FileActions.chooseEditor(for: link, pane: pane) }
             })
             m.addItem(ClosureMenuItem(title: "Quick Look") { FileActions.quickLook(link.path) })
             if !FileActions.isFolder(link.path), GitInfo.gitDir(for: (link.path as NSString).deletingLastPathComponent) != nil {

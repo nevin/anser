@@ -209,69 +209,59 @@ final class ShortcutsPanel: NSPanel {
     override func cancelOperation(_ sender: Any?) { close() }
 }
 
-/// First-launch card that explains the basics, shown over the terminal.
+/// A short introduction in its own row above the editor.
 final class WelcomeView: NSView {
+    static let height: CGFloat = 72
+    private let hint = NSTextField(labelWithString: "Type a command below. Press Tab for completions.")
     private let onClose: () -> Void
+    private let onCommands: () -> Void
 
-    init(onClose: @escaping () -> Void) {
+    init(onClose: @escaping () -> Void, onCommands: @escaping () -> Void) {
         self.onClose = onClose
-        super.init(frame: NSRect(x: 0, y: 0, width: 540, height: 190))
+        self.onCommands = onCommands
+        super.init(frame: .zero)
         wantsLayer = true
-        let t = GhosttyRuntime.shared.theme
-        layer?.backgroundColor = (t.background.blended(withFraction: t.isDark ? 0.08 : 0.04, of: t.isDark ? .white : .black) ?? t.background).cgColor
-        layer?.cornerRadius = 12
+        layer?.cornerRadius = 8
         layer?.borderWidth = 1
-        layer?.borderColor = t.foreground.withAlphaComponent(0.12).cgColor
-        shadow = NSShadow()
-        layer?.shadowOpacity = 0.25
-        layer?.shadowRadius = 12
+        hint.font = .systemFont(ofSize: 12, weight: .medium)
+        hint.maximumNumberOfLines = 2
+        hint.lineBreakMode = .byWordWrapping
 
-        let title = NSTextField(labelWithString: "Welcome to Anser")
-        title.font = .systemFont(ofSize: 16, weight: .semibold)
-        title.textColor = t.foreground
-        let sub = NSTextField(labelWithString: "Type commands in the bar at the bottom. A few things worth knowing:")
-        sub.font = .systemFont(ofSize: 12)
-        sub.textColor = t.foreground.withAlphaComponent(0.65)
-
-        let tips: [Shortcuts.Row] = [
-            (["⇥"], "Complete commands, flags, files and git branches"),
-            (["↑"], "Bring back earlier commands; ⌘R searches all of them"),
-            (["⇧", "⌘", "C"], "Copy the last command's output"),
-            (["⌘", "/"], "See every shortcut"),
-        ]
-        let rows = NSStackView(views: tips.map { r in
-            let v = Shortcuts.row(r)
-            (v.subviews.last as? NSTextField)?.textColor = t.foreground.withAlphaComponent(0.85)
-            return v
-        })
-        rows.orientation = .vertical
-        rows.alignment = .leading
-        rows.spacing = 6
-
-        let close = NSButton(title: "Got it", target: self, action: #selector(closeTapped))
-        close.bezelStyle = .rounded
-        close.keyEquivalent = ""
+        let commands = NSButton(title: "Commands", target: self, action: #selector(commandsTapped))
+        commands.toolTip = "Open the command palette (⇧⌘P)"
         let tour = NSButton(title: "Take the Tour", target: self, action: #selector(tourTapped))
-        tour.bezelStyle = .rounded
-
-        let stack = NSStackView(views: [title, sub, rows])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        stack.setCustomSpacing(12, after: sub)
-        for v in [stack, close, tour] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
+        let close = NSButton(title: "Done", target: self, action: #selector(closeTapped))
+        for button in [commands, tour, close] {
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+        }
+        let actions = NSStackView(views: [commands, tour, close])
+        actions.spacing = 6
+        for view in [hint, actions] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
+        }
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: 18),
-            close.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            close.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -14),
-            tour.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -8),
-            tour.centerYAnchor.constraint(equalTo: close.centerYAnchor),
+            hint.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            hint.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            hint.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            hint.bottomAnchor.constraint(lessThanOrEqualTo: actions.topAnchor, constant: -4),
+            actions.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            actions.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7),
         ])
+        applyTheme()
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    func applyTheme() {
+        let theme = GhosttyRuntime.shared.theme
+        layer?.backgroundColor = theme.barBackground.cgColor
+        layer?.borderColor = theme.foreground.withAlphaComponent(0.18).cgColor
+        hint.textColor = theme.foreground
+    }
+
     @objc private func closeTapped() { onClose() }
+    @objc private func commandsTapped() { onClose(); onCommands() }
     @objc private func tourTapped() { onClose(); TourWindowController.shared.show() }
 }

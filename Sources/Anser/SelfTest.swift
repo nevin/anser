@@ -28,6 +28,14 @@ enum SelfTest {
             Task { @MainActor in await resizeChecks(pane, wc); finish() }
             return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "editor" {
+            Task { @MainActor in await fileEditorChecks(pane); finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "stop" {
+            Task { @MainActor in await stopChecks(pane); finish() }
+            return
+        }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "hang" {
             Task { @MainActor in await hangChecks(); finish() }
             return
@@ -913,6 +921,37 @@ enum SelfTest {
         try? FileManager.default.removeItem(atPath: dir)
     }
 
+    @MainActor
+    private static func fileEditorChecks(_ pane: PaneView) async {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("anser-editor-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("a file.swift")
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data().write(to: file)
+        } catch {
+            check("editor fixtures created", false, error.localizedDescription)
+            return
+        }
+
+        FileActions.openInEditor(PathLink(path: file.path, line: 7, column: 3), pane: pane, editor: "code")
+        check("editor launch preserves a file path, line and column",
+              pane.lastOpenedArgv == ["code", "-g", file.path + ":7:3"])
+        FileActions.openInEditor(PathLink(path: folder.path), pane: pane, editor: "code")
+        check("editor opens a folder without file navigation flags", pane.lastOpenedArgv == ["code", folder.path])
+        FileActions.openInEditor(PathLink(path: file.path, line: 7), pane: pane, editor: "nvim")
+        check("terminal editor receives the requested line", pane.lastOpenedArgv == ["nvim", "+7", file.path])
+        FileActions.openInEditor(PathLink(path: folder.appendingPathComponent("missing.swift").path), pane: pane, editor: "code")
+        let hasFailureSheet = await wait(2) { pane.window?.attachedSheet != nil }
+        check("missing item offers editor recovery", hasFailureSheet)
+        if let sheet = pane.window?.attachedSheet { pane.window?.endSheet(sheet, returnCode: .alertThirdButtonReturn) }
+        _ = await wait(2) { pane.window?.attachedSheet == nil }
+        FileActions.chooseEditor(for: PathLink(path: file.path, line: 7, column: 3), pane: pane)
+        let hasChooser = await wait(2) { pane.window?.attachedSheet != nil }
+        check("Open With presents an editor chooser", hasChooser)
+        if let sheet = pane.window?.attachedSheet { pane.window?.endSheet(sheet, returnCode: .alertSecondButtonReturn) }
+    }
+
     /// A command that opens a pager gets the window; Stop ends pagers and, on a second click, programs that ignore ⌃C.
     @MainActor
     private static func stopChecks(_ pane: PaneView) async {
@@ -927,12 +966,14 @@ enum SelfTest {
         pane.run("sh -c 'trap \"\" INT; sleep 40' # anser-selftest")
         _ = await wait(5) { !s.atPrompt && pane.foregroundJob != nil }
         pane.stopRunning()
+        check("Stop shows pending feedback and prevents a second click",
+              pane.stopButton.title == "Stopping…" && !pane.stopButton.isEnabled)
         await sleep(2.0)
         let stillRunning = !s.atPrompt
         check("a program ignoring ⌃C offers Force Stop", stillRunning && pane.stopButton.title.contains("Force Stop"), pane.stopButton.title)
         pane.stopRunning()
         ok = await wait(5) { s.atPrompt }
-        check("Force Stop ends it", ok && pane.stopButton.title == " Stop", pane.stopButton.title)
+        check("Force Stop ends it", ok && pane.stopButton.title == "Stop", pane.stopButton.title)
     }
 
     /// The product UX review: one search, Notebook + workflows, Library tabs, menus, settings pages.
@@ -980,6 +1021,8 @@ enum SelfTest {
         AliasesWindowController.shared.show(for: pane)
         ok = await wait(3) { LibraryTabs.isHosted(AliasesWindowController.shared.window) }
         check("Aliases opens as a tab of the Library", ok)
+        LibraryWindowController.shared.show(for: pane)
+        check("Library search sits below the native tabs", LibraryWindowController.shared.searchIsBelowWindowTabs)
         SecretsWindowController.shared.show()
         ok = await wait(3) { LibraryTabs.isHosted(SecretsWindowController.shared.window) }
         check("Secrets opens as a tab of the Library", ok)
@@ -1441,9 +1484,15 @@ enum SelfTest {
         if let v = ShortcutsPanel.shared?.contentView { snapView(v, "shortcuts") }
         ShortcutsPanel.shared?.close()
         pane.showWelcome()
-        check("welcome card shows", pane.welcomeVisible)
+        check("welcome tips sit between the terminal and the editor",
+              pane.welcome.map { !$0.isHidden && $0.frame.minY >= pane.bar.frame.maxY &&
+                  $0.frame.maxY <= pane.surfaceView.frame.minY } == true)
         snap(pane, "welcome", full: true)
+        let terminalHeightWithWelcome = pane.surfaceView.frame.height
         pane.dismissWelcome()
+        pane.layoutSubtreeIfNeeded()
+        check("dismissing welcome tips returns space to the terminal",
+              !pane.welcomeVisible && pane.surfaceView.frame.height > terminalHeightWithWelcome)
 
         // Find in scrollback.
         pane.showFind()
@@ -1649,7 +1698,8 @@ enum SelfTest {
               "width \(pane.bounds.width), folder hidden \(pane.cwdChip.isHidden), menu \(statusItems.map(\.title))")
         pane.frame = narrowFrame
         pane.layout()
-        check("widening the pane restores the folder chip", !pane.cwdChip.isHidden)
+        check("widening the pane restores the folder icon under the prompt",
+              !pane.cwdChip.isHidden && pane.cwdChip.frame.minX + pane.cwdChip.iconInset == 19)
 
         wc.window!.setFrame(savedFrame, display: true)
         pane.layoutSubtreeIfNeeded()

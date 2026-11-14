@@ -370,7 +370,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
             + [note("Watched commands (Shell → Run and Watch) notify when their output changes; stop one from the sidebar's Watching section. macOS can silence Anser in System Settings → Notifications.")])])
         let helpersPage = page([column(checks(.helpers) + [
             NSStackView(views: [NSTextField(labelWithString: "Show the cloud context chip:"), cloudPopup]),
-            NSStackView(views: [NSTextField(labelWithString: "Open ⌘-clicked files with:"), openWithBox]),
+            NSStackView(views: [NSTextField(labelWithString: "Open files and folders with:"), openWithBox]),
         ])])
         let privacyPage = page([column(checks(.privacy) + [
             NSStackView(views: [NSTextField(labelWithString: "Keep the Command Notebook in:"), notebookPopup]),
@@ -805,7 +805,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         let cloud = (value(json, ["showCloudContext"]) as? String) ?? "auto"
         cloudPopup.selectItem(at: Self.cloudModes.firstIndex { $0.0 == cloud } ?? 0)
         let openWith = (value(json, ["openFilesWith"]) as? String) ?? ""
-        openWithBox.stringValue = openWith.isEmpty ? "Automatic (first editor found)" : openWith
+        let env = AppDelegate.shared.currentPane?.session.env ?? ShellEnvironment()
+        let resolved = FileActions.automaticEditor(env: env).map(FileActions.editorName) ?? "No editor found"
+        openWithBox.stringValue = openWith.isEmpty ? "Automatic (\(resolved))" : openWith
         let qh = (value(json, ["quickTerminalHeight"]) as? Double) ?? 0.45
         quickHeight.doubleValue = qh
         quickHeightLabel.stringValue = "\(Int((qh * 100).rounded()))%"

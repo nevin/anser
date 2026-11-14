@@ -41,6 +41,7 @@ final class CardView: NSView {
 
 /// Left of the editor: a ❯ prompt for one line, line numbers for several.
 final class GutterView: NSView {
+    static let promptInset: CGFloat = 5
     weak var editor: CommandEditor?
     weak var scroll: NSScrollView?
     var promptColor: NSColor = .systemGreen { didSet { needsDisplay = true } }
@@ -66,7 +67,7 @@ final class GutterView: NSView {
         let top = editor.textContainerInset.height - (scroll?.contentView.bounds.origin.y ?? 0)
         if running || (editor.lineCount <= 1 && !alwaysNumbers) {
             let glyph = running ? "" : "❯"
-            (glyph as NSString).draw(at: NSPoint(x: 5, y: top), withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .bold), .foregroundColor: dimmed ? promptColor.withAlphaComponent(0.45) : promptColor])
+            (glyph as NSString).draw(at: NSPoint(x: Self.promptInset, y: top), withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .bold), .foregroundColor: dimmed ? promptColor.withAlphaComponent(0.45) : promptColor])
             return
         }
         // Line numbers for the lines that are actually visible.
@@ -193,19 +194,19 @@ final class ChipView: NSView {
     var textColorForTests: NSColor? { label.textColor }
     var image: NSImage? { icon.image }
 
-    private var inset: CGFloat { filled != nil ? 7 : 3 }
+    var iconInset: CGFloat { filled != nil ? 7 : 3 }
 
     var preferredWidth: CGFloat {
         label.sizeToFit()
-        return (icon.isHidden ? 0 : 15) + label.frame.width + 2 + inset * 2
+        return (icon.isHidden ? 0 : 15) + label.frame.width + 2 + iconInset * 2
     }
 
     override func layout() {
         super.layout()
-        let ix: CGFloat = (icon.isHidden ? 0 : 15) + inset
-        icon.frame = NSRect(x: inset, y: (bounds.height - 12) / 2, width: 12, height: 12)
+        let ix: CGFloat = (icon.isHidden ? 0 : 15) + iconInset
+        icon.frame = NSRect(x: iconInset, y: (bounds.height - 12) / 2, width: 12, height: 12)
         label.sizeToFit()
-        label.frame = NSRect(x: ix, y: (bounds.height - label.frame.height) / 2, width: bounds.width - ix - inset, height: label.frame.height)
+        label.frame = NSRect(x: ix, y: (bounds.height - label.frame.height) / 2, width: bounds.width - ix - iconInset, height: label.frame.height)
     }
 
     override func draw(_ dirtyRect: NSRect) {

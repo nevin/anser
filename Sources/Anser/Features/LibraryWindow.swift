@@ -70,7 +70,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     private var counts: [Section: Int] = [:]
 
     init() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: 560), styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: 560), styleMask: [.titled, .closable, .resizable, .miniaturizable],
                          backing: .buffered, defer: false)
         w.title = "Library"
         w.minSize = NSSize(width: 660, height: 440)
@@ -120,6 +120,8 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
 
         search.placeholderString = "Search everything you've saved"
         search.delegate = self
+        search.setAccessibilityLabel("Search Library")
+        search.setContentHuggingPriority(.defaultLow, for: .horizontal)
         primaryButton.bezelStyle = .rounded
         primaryButton.keyEquivalent = "\r"
         primaryButton.target = self
@@ -129,6 +131,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         manageButton.target = self
         manageButton.action = #selector(manageTapped)
         let top = NSStackView(views: [search, primaryButton, manageButton])
+        top.alignment = .centerY
         top.spacing = 8
         top.translatesAutoresizingMaskIntoConstraints = false
 
@@ -167,11 +170,11 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             side.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             side.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             side.widthAnchor.constraint(equalToConstant: 190),
-            sideScroll.topAnchor.constraint(equalTo: side.topAnchor, constant: 38),
+            sideScroll.topAnchor.constraint(equalTo: side.topAnchor, constant: 8),
             sideScroll.leadingAnchor.constraint(equalTo: side.leadingAnchor),
             sideScroll.trailingAnchor.constraint(equalTo: side.trailingAnchor),
             sideScroll.bottomAnchor.constraint(equalTo: side.bottomAnchor),
-            top.topAnchor.constraint(equalTo: content.topAnchor, constant: 36),
+            top.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
             top.leadingAnchor.constraint(equalTo: side.trailingAnchor, constant: 12),
             top.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
             scroll.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 8),
@@ -183,6 +186,8 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             emptyLabel.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: scroll.centerYAnchor, constant: -16),
             emptyLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
+            emptyLabel.leadingAnchor.constraint(greaterThanOrEqualTo: scroll.leadingAnchor, constant: 16),
+            emptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: scroll.trailingAnchor, constant: -16),
             emptyButton.topAnchor.constraint(equalTo: emptyLabel.bottomAnchor, constant: 10),
             emptyButton.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
         ])
@@ -195,6 +200,13 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         section = s
         sourceList.selectRowIndexes(IndexSet(integer: s.rawValue), byExtendingSelection: false)
         reload()
+    }
+
+    var searchIsBelowWindowTabs: Bool {
+        guard let window, let content = window.contentView else { return false }
+        content.layoutSubtreeIfNeeded()
+        let frame = search.convert(search.bounds, to: nil)
+        return frame.width > 100 && window.contentLayoutRect.contains(frame)
     }
 
     func setSearchForTests(_ q: String) { search.stringValue = q; reload() }

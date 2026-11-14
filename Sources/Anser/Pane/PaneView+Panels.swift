@@ -8,7 +8,13 @@ extension PaneView {
 
     func showWelcome() {
         guard welcome == nil else { return }
-        let w = WelcomeView { [weak self] in self?.dismissWelcome() }
+        let w = WelcomeView(onClose: { [weak self] in
+            self?.dismissWelcome()
+            self?.focus()
+        }, onCommands: { [weak self] in
+            guard let self else { return }
+            self.windowController?.showCommandPalette(for: self)
+        })
         welcome = w
         addSubview(w)
         needsLayout = true
@@ -19,6 +25,7 @@ extension PaneView {
         guard let w = welcome else { return }
         welcome = nil
         w.removeFromSuperview()
+        needsLayout = true
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST"] == nil {
             UserDefaults.standard.set(true, forKey: "AnserWelcomeShown")
         }

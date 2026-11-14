@@ -90,7 +90,7 @@ extension TerminalWindowController {
                     if mods.contains(.command) { pane.run("git add -- \(f)") }
                     else if mods.contains(.option) { pane.run("git checkout \(mine) -- \(f) && git add -- \(f)") }
                     else if mods.contains(.shift) { pane.run("git checkout \(theirs) -- \(f) && git add -- \(f)") }
-                    else if !pane.openFile(c.path) { NSSound.beep() }
+                    else { FileActions.openInEditor(PathLink(path: c.path), pane: pane) }
                 case .proceed(let op)?: pane.run("git \(op.command) --continue")
                 case .abort(let op)?: pane.run("git \(op.command) --abort")
                 case nil: break

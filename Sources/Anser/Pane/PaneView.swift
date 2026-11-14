@@ -215,6 +215,7 @@ final class PaneView: NSView, ShellSessionDelegate {
     private func applyTheme() {
         let t = theme
         bar.fill = t.barBackground
+        welcome?.applyTheme()
         bar.separator = t.foreground.withAlphaComponent(0.2)
         bar.needsDisplay = true
         gutter.numberColor = t.foreground.withAlphaComponent(0.3)
@@ -296,12 +297,12 @@ final class PaneView: NSView, ShellSessionDelegate {
         fixChip.onClick = { [weak self] in self?.applyFix() }
 
         stopButton.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Stop")
-        stopButton.title = " Stop"
+        stopButton.title = "Stop"
         stopButton.imagePosition = .imageLeading
         stopButton.bezelStyle = .rounded
-        stopButton.controlSize = .small
+        stopButton.controlSize = .regular
         stopButton.font = .systemFont(ofSize: 11, weight: .medium)
-        stopButton.toolTip = "Stop the running program (⌃C; click again to force it)"
+        stopButton.toolTip = "Interrupt the running program (⌃C)"
         stopButton.target = self
         stopButton.action = #selector(stopRunning)
         stopButton.isHidden = true
@@ -373,10 +374,19 @@ final class PaneView: NSView, ShellSessionDelegate {
     override func layout() {
         super.layout()
         let w = bounds.width
-        let reserved = reservedBarHeight
         let headerH = showsHeader && !fullscreenProgram ? Self.headerHeight : 0
         header.isHidden = headerH == 0
         header.frame = NSRect(x: 0, y: bounds.height - headerH, width: w, height: headerH)
+        let welcomeInset: CGFloat = 8
+        let welcomeY = barHeight + welcomeInset
+        let welcomeBottom = welcomeY + WelcomeView.height + welcomeInset
+        let showWelcome = welcome != nil && editorEnabled && !fullscreenProgram && !editorExpanded
+            && w >= 268 && bounds.height - headerH - welcomeBottom >= 80
+        welcome?.isHidden = !showWelcome
+        if showWelcome {
+            welcome?.frame = NSRect(x: 10, y: welcomeY, width: min(440, w - 20), height: WelcomeView.height)
+        }
+        let reserved = showWelcome ? welcomeBottom : reservedBarHeight
         let target = NSRect(x: 0, y: reserved, width: w, height: max(0, bounds.height - reserved - headerH))
         if surfaceView.frame != target { surfaceView.frame = target }
         dimView.frame = target
@@ -417,21 +427,29 @@ final class PaneView: NSView, ShellSessionDelegate {
         // Running state, inside the card.
         spinner.frame = NSRect(x: 9, y: (card.bounds.height - 16) / 2, width: 16, height: 16)
         stopButton.sizeToFit()
-        stopButton.frame = NSRect(x: card.bounds.width - stopButton.frame.width - 8, y: (card.bounds.height - stopButton.frame.height) / 2,
-                                  width: stopButton.frame.width, height: stopButton.frame.height)
+        // Keep the action aligned and large enough for the longer running states.
+        let stopWidth = min(max(108, stopButton.frame.width), max(0, card.bounds.width - 16))
+        stopButton.frame = NSRect(x: card.bounds.width - stopWidth - 8, y: (card.bounds.height - 26) / 2,
+                                  width: stopWidth, height: 26)
         stopButton.isHidden = !showRunning
         runningHint.sizeToFit()
-        runningHint.frame = NSRect(x: stopButton.frame.minX - runningHint.frame.width - 10, y: (card.bounds.height - runningHint.frame.height) / 2, width: runningHint.frame.width, height: runningHint.frame.height)
         runningLabel.sizeToFit()
-        let rlx = ex + 5
-        runningLabel.frame = NSRect(x: rlx, y: (card.bounds.height - runningLabel.frame.height) / 2,
-                                    width: max(20, runningHint.frame.minX - rlx - 12), height: runningLabel.frame.height)
-        runningHint.isHidden = !showRunning || runningLabel.frame.width < 120
+        let labelX = ex + 5
+        let available = max(0, (showRunning ? stopButton.frame.minX : card.bounds.width) - labelX - 10)
+        let hintWidth = runningHint.frame.width + 12
+        let showHint = showRunning && available >= runningLabel.frame.width + hintWidth
+        if showHint {
+            runningHint.frame.origin = NSPoint(x: stopButton.frame.minX - hintWidth,
+                                               y: (card.bounds.height - runningHint.frame.height) / 2)
+        }
+        runningHint.isHidden = !showHint
+        runningLabel.frame = NSRect(x: labelX, y: (card.bounds.height - runningLabel.frame.height) / 2,
+                                    width: available - (showHint ? hintWidth : 0), height: runningLabel.frame.height)
 
         // Reserve room for the actions menu before placing any chips.
         let y = ((Self.statusHeight - Self.chipHeight) / 2).rounded()
         let onInputLine: [ChipView] = []
-        let chips = ([recChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, badgeChip, contextChip, envChip, broadcastChip, shareChip, cwdChip, branchChip, prChip, conflictChip, changesChip,
+        let chips = ([cwdChip, recChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, badgeChip, contextChip, envChip, broadcastChip, shareChip, branchChip, prChip, conflictChip, changesChip,
                      serverChip, statusChip, testsChip, fixChip, hintChip, explainChip, aliasChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
         let moreX = w - pad - 18
         buttons.forEach { $0.isHidden = true }
@@ -443,14 +461,14 @@ final class PaneView: NSView, ShellSessionDelegate {
         helpButton.contentTintColor = theme.foreground.withAlphaComponent(0.4)
         moreButton.contentTintColor = theme.foreground.withAlphaComponent(0.5)
 
-        // The hints row lines up with the command you type, not the window edge.
-        let rowStart = editorEnabled ? card.frame.minX + ex + editor.textContainerInset.width + (editor.textContainer?.lineFragmentPadding ?? 0) : pad
+        let promptX = card.frame.minX + gutter.frame.minX + GutterView.promptInset
+        let rowStart = editorEnabled ? promptX - cwdChip.iconInset : pad
         let rowEnd = editorEnabled ? helpX : moreX
-        let spacing: CGFloat = 8
+        let spacing: CGFloat = 12
         let room = rowEnd - spacing - rowStart
         // Recording, sharing and typing in all panes affect privacy or where input goes: they come first and never fold into +N.
         let mustShow: [ChipView] = [recChip, shareChip, broadcastChip]
-        let priorities = (mustShow + [waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, hintChip, badgeChip, contextChip, conflictChip, statusChip, testsChip, cwdChip, serverChip,
+        let priorities = (mustShow + [cwdChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, hintChip, badgeChip, contextChip, conflictChip, statusChip, testsChip, serverChip,
                           envChip, fixChip, aliasChip, branchChip, changesChip, prChip, explainChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
         var active = priorities.filter { !$0.text.isEmpty }.map { ($0, $0.preferredWidth) }
         // Keep the row calm: the folder and branch, plus the most important few.
@@ -466,7 +484,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         var widths: [ObjectIdentifier: CGFloat] = [:]
         var remaining = room + spacing - (overLimit > 0 ? moreRoom : 0)
         for (chip, preferred) in active {
-            let width = chip === cwdChip ? max(min(preferred, 70), preferred - excess) : preferred
+            let width = chip === cwdChip ? max(min(preferred, 108), preferred - excess) : preferred
             let must = mustShow.contains { $0 === chip }
             guard must || width + spacing <= remaining else { continue }
             widths[ObjectIdentifier(chip)] = width
@@ -496,10 +514,6 @@ final class PaneView: NSView, ShellSessionDelegate {
             x = moreChip.frame.maxX + spacing
         }
         updateFading()
-        if let welcome {
-            let ww = min(560, w - 40)
-            welcome.frame = NSRect(x: (w - ww) / 2, y: bounds.height - welcome.frame.height - 24, width: ww, height: welcome.frame.height)
-        }
         let hintW = rowEnd - x - 10
         // Too narrow for the whole hint: drop tips from the right ("⇥ complete   ↑ history   …").
         var shown = hintFull
@@ -516,7 +530,7 @@ final class PaneView: NSView, ShellSessionDelegate {
     /// While the screen isn't full, the editor sits just under the last line
     /// of output instead of at the bottom, so your eyes don't jump.
     private func computeFollowTop() -> CGFloat? {
-        guard viewportAtBottom, Services.shared.config.editorFollowsOutput, editorEnabled, !fullscreenProgram, !editorExpanded,
+        guard welcome?.isHidden != false, viewportAtBottom, Services.shared.config.editorFollowsOutput, editorEnabled, !fullscreenProgram, !editorExpanded,
               let surface = surfaceView.surface, surfaceView.frame.height > 0 else { return nil }
         var x = 0.0, y = 0.0, cw = 0.0, ch = 0.0
         ghostty_surface_ime_point(surface, &x, &y, &cw, &ch)
