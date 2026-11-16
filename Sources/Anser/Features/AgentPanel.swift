@@ -48,6 +48,7 @@ final class AgentPanel: NSPanel, NSTextFieldDelegate {
         isReleasedWhenClosed = false
         minSize = NSSize(width: 400, height: 380)
         build()
+        OverlayBackground.install(in: self)
         if let pw = pane.window {
             let f = pw.frame
             setFrameTopLeftPoint(NSPoint(x: min(f.maxX + 8, (pw.screen?.visibleFrame.maxX ?? f.maxX) - 520), y: f.maxY))
@@ -82,9 +83,12 @@ final class AgentPanel: NSPanel, NSTextFieldDelegate {
             tv.isEditable = false
             tv.textContainerInset = NSSize(width: 6, height: 6)
             tv.font = .systemFont(ofSize: 12)
+            tv.backgroundColor = OverlayBackground.contentColor
             transcriptView = tv
         }
-        scroll.borderType = .bezelBorder
+        scroll.borderType = .noBorder
+        scroll.wantsLayer = true
+        scroll.layer?.cornerRadius = 8
 
         why.font = .systemFont(ofSize: 12)
         commandField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)

@@ -182,6 +182,31 @@ public final class AIHelp: Sendable {
         return try await send(prompt, effort: "low")
     }
 
+    /// A one-line commit message for a diff (secrets removed first, long diffs cut).
+    public func commitMessage(diff: String, context: Context) async throws -> String {
+        let prompt = """
+        Write a git commit message for these changes: one line, at most 72 characters, \
+        imperative mood ("Add…", "Fix…"), no period, no quotes, no prefix like "feat:" unless the history uses one.
+
+        ```diff
+        \(Self.redact(String(diff.prefix(16000))))
+        ```
+
+        \(context.summary)
+        Reply with the message only.
+        """
+        return Self.oneLine(try await send(prompt, effort: "low").text)
+    }
+
+    /// The first non-empty line, without quotes, backticks or a "Commit message:" label.
+    public static func oneLine(_ text: String) -> String {
+        var line = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty && !$0.hasPrefix("```") } ?? ""
+        if let colon = line.range(of: ": "), line[..<colon.lowerBound].lowercased().contains("message") { line = String(line[colon.upperBound...]) }
+        line = line.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`* "))
+        return String(line.prefix(120))
+    }
+
     /// The JSON body for a request (exposed for tests).
     public static func body(prompt: String, effort: String) -> [String: Any] {
         [

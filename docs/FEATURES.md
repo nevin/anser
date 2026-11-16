@@ -58,6 +58,7 @@ Settings → Profiles (or `"profiles"` in `config.json`) applies settings by ssh
 
 - **Quitting Anser no longer stops your shells.** Builds, servers, ssh sessions and anything else running keep going. When Anser opens again, or after an automatic update, each tab comes back connected to the same shell, with its recent output (the last 2 MB) shown again and full-screen programs like vim redrawn.
 - **Closing a tab or pane still ends its shell**, as before.
+- **New tabs and splits open instantly.** Anser keeps one shell started ahead of time, so a new tab shows its prompt at once instead of after your `.zshrc` runs; it moves to the new tab's folder without typing anything, and another starts in the background. Settings → Sessions & Windows → "Keep a shell ready so new tabs and splits open instantly" turns it off. Folders with a profile that adds environment variables still get a fresh shell.
 - **Command drafts** reopen with their panes and cursor positions. Anser saves local drafts that pass its secret checks and skips panes with history paused. Turn this off under Settings → Sessions & Windows → Remember unfinished local commands when reopening windows.
 - **To end everything:** hold ⌥ in the Anser menu for **Quit and End All Shells**. Settings → Sessions & Windows → "Keep shells running when Anser quits or updates" turns it off.
 - **Crashes too:** windows and shells are saved every 20 seconds, so a crash or forced quit brings them back too. Shells no window came back to are ended on the next launch.
@@ -125,7 +126,11 @@ Settings → Profiles (or `"profiles"` in `config.json`) applies settings by ssh
 
 ## Project environments
 
-- When you `cd` into a project with a `.env`, a Python virtualenv (`.venv`, `venv`), an `.nvmrc`/`.node-version` (with nvm or fnm) or an `.envrc` (with direnv), a **Load** chip offers to load it. It loads silently (nothing typed, nothing in history) and unloads when you leave the folder. Choose **Always Load in This Project** or **Don't Offer in This Project** from the chip.
+- **Node versions by themselves.** When you `cd` into a project, Anser puts the Node version it needs first on PATH: from `.nvmrc`, `.node-version`, or package.json's `"engines": {"node": …}` (ranges like `>=22`, `^20 || ^22`, `18.x`). It picks from the versions nvm or fnm installed, keeps your default when it already fits, and switches back when you leave. nvm doesn't need to be loaded in your shell for this, so you can load it lazily and save ~0.3s on every new tab. A `node 22.23` chip shows the version; when nothing installed fits, a **Needs Node 24 · Install** chip runs `nvm install 24` (or `fnm install`) in the tab.
+- **Python virtualenvs by themselves.** A project's `.venv` or `venv` is activated when you `cd` in and deactivated when you leave. A virtualenv you activated yourself is left alone.
+- **pip outside a virtualenv.** When `pip install …` fails with no virtualenv active (Homebrew's Python refuses it), an **Install in a new .venv** chip puts `python3 -m venv .venv && source .venv/bin/activate && pip install …` in the editor.
+- Turn the automatic switching off under Settings → Suggestions & Helpers → "Use each project's Node version and Python virtualenv".
+- When you `cd` into a project with a `.env` or an `.envrc` (with direnv), a **Load** chip offers to load it. (With the automatic switching off, it also offers the virtualenv and `.nvmrc` through nvm or fnm.) It loads silently (nothing typed, nothing in history) and unloads when you leave the folder. Choose **Always Load in This Project** or **Don't Offer in This Project** from the chip.
 - `.env` values are read by Anser and set with `export`; the file is never run. Variables that would change which programs run (`PATH`, `DYLD_*`, `LD_*`…) are skipped. Shells opened before this version need a new tab.
 
 ## Runbooks
@@ -244,6 +249,7 @@ Settings → Profiles (or `"profiles"` in `config.json`) applies settings by ssh
 
 ## Git
 
+- **Commit from Changed Files.** Git → Commit… (⇧⌘M), or the **Commit…** button in Changed Files (⇧⌘G), asks for a message and can stage everything first, push (setting up the remote branch on the first push) and open a pull request on GitHub (`gh pr create --fill --web`, so you check it before it's created). It runs as one command in the tab, so you see git's output and it's in your history. With AI help on, **Commit with Claude Message…** sends the diff (secrets removed) and fills in a one-line message for you to edit.
 - **Pull requests.** With the GitHub CLI (`gh`) signed in, the branch's pull request shows next to the branch: `#42 ✓` when checks pass, `#42 ✗` when they fail, `#42 …` while they run. Click it to open the PR. Git → Open Pull Request offers to create one. Turn it off with `"showPullRequests": false`.
 - **Merge conflicts.** During a merge, rebase, cherry-pick or revert with conflicts, a red chip shows the count. Click it, or use Git → Resolve Conflicts…, for the list of files with their diffs:
   - ⏎ opens the file in your editor.

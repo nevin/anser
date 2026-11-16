@@ -976,6 +976,98 @@ enum SelfTest {
         check("Force Stop ends it", ok && pane.stopButton.title == "Stop", pane.stopButton.title)
     }
 
+    /// Closing several busy tabs at once mustn't freeze: their output threads
+    /// still post messages (titles here) while the app waits for them to stop.
+    @MainActor
+    private static func closeBusyTabsCheck(_ pane: PaneView, _ wc: TerminalWindowController, tmp: String) async {
+        var busy: [PaneView] = []
+        for _ in 0..<6 {
+            wc.addTab(cwd: tmp)
+            guard let p = wc.focusedPane, p !== pane else { continue }
+            _ = await wait(10) { p.session.atPrompt }
+            p.run(#"while :; do printf '\e]2;anser-selftest %s\a' $RANDOM; done"#)
+            busy.append(p)
+        }
+        _ = await wait(5) { busy.allSatisfy { $0.session.running != nil } }
+        await sleep(0.5)
+        let started = Date()
+        for p in busy { wc.close(p) }
+        let secs = Date().timeIntervalSince(started)
+        check("closing six tabs that flood their titles doesn't freeze", busy.count == 6 && secs < 5, String(format: "%d tabs in %.2fs", busy.count, secs))
+    }
+
+    /// Each project's Node version and virtualenv, the pip fix, and the pre-started shell for new tabs.
+    @MainActor
+    private static func runtimeChecks(_ pane: PaneView, _ wc: TerminalWindowController, tmp: String) async {
+        let s = pane.session
+        let fm = FileManager.default
+        func write(_ path: String, _ text: String, exec: Bool = false) {
+            try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            fm.createFile(atPath: path, contents: Data(text.utf8), attributes: [.posixPermissions: exec ? 0o755 : 0o644])
+        }
+        func cd(_ dir: String) async -> Bool {
+            pane.run("cd \(ShellLexer.escape(dir)) # anser-selftest")
+            return await wait(10) { s.atPrompt && s.cwd == dir }
+        }
+        // Fake nvm versions: 20.1.0 and 22.3.0 (the newest is the default).
+        let nvm = tmp + "/fake-nvm"
+        try? fm.removeItem(atPath: nvm)
+        for v in ["20.1.0", "22.3.0"] { write("\(nvm)/versions/node/v\(v)/bin/node", "#!/bin/sh\necho v\(v)\n", exec: true) }
+        PaneView.nodeFoldersForTest = [nvm + "/versions/node"]
+        defer { PaneView.nodeFoldersForTest = nil }
+        let bin20 = "\(nvm)/versions/node/v20.1.0/bin", bin22 = "\(nvm)/versions/node/v22.3.0/bin"
+
+        let pinned = tmp + "/node-pinned"
+        write(pinned + "/.nvmrc", "20\n")
+        var ok = await cd(pinned)
+        ok = await wait(8) { s.env.path.first == bin20 } && ok
+        pane.refreshBar()
+        check("cd into a project with .nvmrc puts its Node first on PATH", ok && pane.nodeChip.text == "node 20.1",
+              "\(s.env.path.first ?? "-") chip=\(pane.nodeChip.text)")
+        ok = await cd(tmp)
+        ok = await wait(8) { s.env.path.first == bin22 } && ok
+        pane.refreshBar()
+        check("leaving the project switches back to the default Node", ok && pane.nodeChip.text.isEmpty, s.env.path.first ?? "-")
+        let newer = tmp + "/node-newer"
+        write(newer + "/package.json", #"{"name":"x","engines":{"node":">=30"}}"#)
+        ok = await cd(newer)
+        pane.refreshBar()
+        check("a project needing an uninstalled Node offers to install it", ok && pane.nodeChip.text.contains("Needs Node 30"), pane.nodeChip.text)
+
+        // A project's virtualenv: activated on the way in, deactivated on the way out.
+        let py = tmp + "/py-proj"
+        write(py + "/.venv/bin/activate", "export VIRTUAL_ENV=\(ShellLexer.escape(py + "/.venv"))\ndeactivate() { unset VIRTUAL_ENV; unset -f deactivate; }\n")
+        ok = await cd(py)
+        ok = await wait(8) { s.cloudVars.virtualEnv == py + "/.venv" } && ok
+        check("cd into a project activates its .venv", ok, s.cloudVars.virtualEnv ?? "none")
+        ok = await cd(tmp)
+        ok = await wait(8) { (s.cloudVars.virtualEnv ?? "").isEmpty } && ok
+        check("leaving the project deactivates the .venv Anser activated", ok, s.cloudVars.virtualEnv ?? "none")
+        let fix = pane.pipFix(for: "pip install requests", exitCode: 1) ?? "-"
+        check("failed pip install without a virtualenv offers a .venv", fix.hasSuffix("source .venv/bin/activate && pip install requests")
+              && pane.pipFix(for: "pip install --user requests", exitCode: 1) == nil && pane.pipFix(for: "pip install requests", exitCode: 0) == nil, fix)
+
+        // A new tab takes the shell started ahead of time, moved to its folder.
+        PanePool.enabledInSelfTest = true
+        PanePool.shared.scheduleRefill(after: 0)
+        ok = await wait(20) { PanePool.shared.isReady }
+        let spare = PanePool.shared.spareForTest
+        let target = tmp + "/prewarm-dir"
+        try? fm.createDirectory(atPath: target, withIntermediateDirectories: true)
+        wc.addTab(cwd: target)
+        let tabPane = AppDelegate.shared.allPanes.first { $0 === spare }
+        if let tabPane {
+            tabPane.run("true # anser-selftest")
+            ok = await wait(10) { tabPane.session.atPrompt && tabPane.session.blocks.last?.command.contains("anser-selftest") == true } && ok
+        }
+        check("a new tab uses the pre-started shell, in the new tab's folder", ok && tabPane != nil && tabPane?.session.cwd == target,
+              tabPane?.session.cwd ?? "not used")
+        PanePool.enabledInSelfTest = false
+        PanePool.shared.discard()
+        if let tabPane { wc.close(tabPane) }
+        try? fm.removeItem(atPath: nvm)
+    }
+
     /// The product UX review: one search, Notebook + workflows, Library tabs, menus, settings pages.
     @MainActor
     private static func uxReviewChecks(_ pane: PaneView, _ wc: TerminalWindowController, tmp: String) async {
@@ -1045,7 +1137,7 @@ enum SelfTest {
         // Settings: Behavior split by purpose; config-only options have controls.
         SettingsWindowController.shared.show(section: "Sessions & Windows")
         let sessionsHit = SettingsWindowController.shared.searchHits("quick terminal height")
-        let helpersHit = SettingsWindowController.shared.searchHits("open ⌘-clicked files")
+        let helpersHit = SettingsWindowController.shared.searchHits("open files and folders")
         check("Settings has pages by purpose with the config-only options",
               SettingsWindowController.shared.selectedSectionName == "Sessions & Windows" && sessionsHit.first?.section == "Sessions & Windows"
                 && helpersHit.first?.section == "Suggestions & Helpers",
@@ -2849,6 +2941,8 @@ enum SelfTest {
         await uiChecks(pane, wc, live: live, tmp: tmp)
         await savedAndInsightsChecks(pane, wc, tmp: tmp)
         await uxReviewChecks(pane, wc, tmp: tmp)
+        await closeBusyTabsCheck(pane, wc, tmp: tmp)
+        await runtimeChecks(pane, wc, tmp: tmp)
         await stopChecks(pane)
         // Sharing one command, and startup timing.
         let shareMD = PaneView.shareMarkdown(command: "curl -H 'Authorization: Bearer abc.def.ghi' x", output: "token=ghp_abcdefghijklmnopqrstuvwxyz0123\nok",

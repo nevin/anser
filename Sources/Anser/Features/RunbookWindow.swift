@@ -56,6 +56,7 @@ final class RunbookWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: panel)
         panel.delegate = self
         build()
+        OverlayBackground.install(in: panel)
         if let pw = pane.window {
             let f = pw.frame
             panel.setFrameTopLeftPoint(NSPoint(x: min(f.maxX + 8, (pw.screen?.visibleFrame.maxX ?? f.maxX) - 520), y: f.maxY))

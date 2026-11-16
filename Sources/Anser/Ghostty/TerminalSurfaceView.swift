@@ -71,6 +71,12 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
     /// Frees the terminal. The shell gets SIGHUP.
     func destroy() {
         guard let s = surface else { return }
+        // Make room in the app's message queue first (64 messages, shared by
+        // every tab). While the terminal stops, its output thread still posts
+        // titles and folders for output it already read, and it waits for room
+        // with no limit — while this thread waits for it to stop. Closing
+        // several busy tabs in a row could fill the queue and freeze Anser.
+        if let app = GhosttyRuntime.shared.app { ghostty_app_tick(app) }
         surface = nil
         ghostty_surface_free(s)
     }

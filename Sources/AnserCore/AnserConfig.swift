@@ -173,6 +173,8 @@ public struct AnserConfig: Codable, Sendable {
     public var historyIgnore: [String] = AnserConfig.defaultHistoryIgnore
     /// Reopen windows, tabs, splits and their folders on launch.
     public var restoreSession: Bool = true
+    /// Keep one shell started ahead of time, so new tabs and splits open at once.
+    public var prewarmShell: Bool = true
     /// Restore unfinished local commands with the window layout.
     public var restoreDrafts: Bool = true
     /// Replace the shell's prompt with a short "❯", since the bar already shows folder and branch.
@@ -206,6 +208,8 @@ public struct AnserConfig: Codable, Sendable {
     public var pluginSettings: [String: [String: String]] = [:]
     /// Offer to load a project's environment (.env, virtualenv, Node version) when you cd into it.
     public var offerProjectEnvironment: Bool = true
+    /// Switch to a project's Node version and activate its virtualenv by themselves when you cd in.
+    public var projectRuntimes: Bool = true
     /// ssh port forwards Anser keeps open in the background.
     public var tunnels: [SSHTunnel] = []
     /// After a test command fails, list the failed tests (open, re-run one).
@@ -284,6 +288,7 @@ public struct AnserConfig: Codable, Sendable {
         helpCommands = try c.decodeIfPresent([String].self, forKey: .helpCommands) ?? []
         historyIgnore = try c.decodeIfPresent([String].self, forKey: .historyIgnore) ?? d.historyIgnore
         restoreSession = try c.decodeIfPresent(Bool.self, forKey: .restoreSession) ?? d.restoreSession
+        prewarmShell = try c.decodeIfPresent(Bool.self, forKey: .prewarmShell) ?? d.prewarmShell
         restoreDrafts = try c.decodeIfPresent(Bool.self, forKey: .restoreDrafts) ?? d.restoreDrafts
         compactPrompt = try c.decodeIfPresent(Bool.self, forKey: .compactPrompt) ?? d.compactPrompt
         shellPrompt = try c.decodeIfPresent(String.self, forKey: .shellPrompt) ?? (compactPrompt ? "compact" : d.shellPrompt)
@@ -305,6 +310,7 @@ public struct AnserConfig: Codable, Sendable {
         enabledPlugins = try c.decodeIfPresent([String].self, forKey: .enabledPlugins) ?? []
         pluginSettings = try c.decodeIfPresent([String: [String: String]].self, forKey: .pluginSettings) ?? [:]
         offerProjectEnvironment = try c.decodeIfPresent(Bool.self, forKey: .offerProjectEnvironment) ?? d.offerProjectEnvironment
+        projectRuntimes = try c.decodeIfPresent(Bool.self, forKey: .projectRuntimes) ?? d.projectRuntimes
         tunnels = (try? c.decodeIfPresent([SSHTunnel].self, forKey: .tunnels)) ?? []
         testFailureList = try c.decodeIfPresent(Bool.self, forKey: .testFailureList) ?? d.testFailureList
         suggestAliases = try c.decodeIfPresent(Bool.self, forKey: .suggestAliases) ?? d.suggestAliases
@@ -437,7 +443,7 @@ public enum AnserAction: String, CaseIterable, Sendable {
     case runWorkflow, saveWorkflow, exportMarkdown, copyMarkdown, reportProblem
     case explainError, askClaude
     case notebook, editNotebook, saveToNotebook, exportLastOutput, openWorkflowsFolder
-    case gitHistory, gitStashes, gitFetch, gitPull, gitPush
+    case gitHistory, gitStashes, gitFetch, gitPull, gitPush, gitCommit
     case quickTerminal, broadcastInput, searchOutput, resolveConflicts, openPullRequest
     case importSettings, checkForUpdates, showUsage
     case gitBlame, searchAllTabs, shareTab, deepClean
@@ -515,6 +521,7 @@ public enum AnserAction: String, CaseIterable, Sendable {
         case .gitFetch: "Git: Fetch"
         case .gitPull: "Git: Pull"
         case .gitPush: "Git: Push"
+        case .gitCommit: "Git: Commit…"
         case .quickTerminal: "Show / Hide Quick Terminal"
         case .broadcastInput: "Type in All Panes of This Tab"
         case .searchOutput: "Search Command Output"
@@ -575,7 +582,7 @@ extension AnserAction {
         case .toggleEditor, .expandEditor, .formatCommand, .externalEditor, .increaseFontSize, .decreaseFontSize, .resetFontSize: "Editor"
         case .rerunLastCommand, .whenDone, .watchAndRerun, .watchOutput, .failedTests, .killPort, .projectEnvironment: "Run"
         case .jumpToFolder, .openProjectInEditor: "Folders"
-        case .switchBranch, .changedFiles, .gitHistory, .gitStashes, .gitFetch, .gitPull, .gitPush, .resolveConflicts, .openPullRequest, .gitBlame: "Git"
+        case .switchBranch, .changedFiles, .gitHistory, .gitStashes, .gitFetch, .gitPull, .gitPush, .gitCommit, .resolveConflicts, .openPullRequest, .gitBlame: "Git"
         case .notebook, .editNotebook, .saveToNotebook, .runWorkflow, .saveWorkflow, .openWorkflowsFolder, .runbooks, .newRunbook, .aliases, .library: "Library"
         case .explainError, .askClaude, .aiTask: "AI"
         case .uploadToServer, .downloadFromServer, .addTunnel, .runOnServers, .forwardRemotePort: "Servers"

@@ -1,6 +1,7 @@
 import AppKit
 import GhosttyKit
 
+Startup.mark("main")
 let app = NSApplication.shared
 let delegate = AppDelegate()
 AppDelegate.shared = delegate

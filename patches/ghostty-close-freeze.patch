@@ -1,0 +1,110 @@
+diff --git a/src/Surface.zig b/src/Surface.zig
+index b532d4d5c..190ca5eb4 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -807,6 +807,10 @@ pub fn init(
+ }
+ 
+ pub fn deinit(self: *Surface) void {
++    // From here on, the IO thread drops messages it would otherwise wait
++    // forever to send (the app thread is busy waiting for it to stop).
++    self.renderer_state.closing.store(true, .release);
++
+     // Stop search thread
+     if (self.search) |*s| s.deinit();
+ 
+diff --git a/src/renderer/State.zig b/src/renderer/State.zig
+index 1e38d64a9..9a4914bdb 100644
+--- a/src/renderer/State.zig
++++ b/src/renderer/State.zig
+@@ -44,6 +44,15 @@ demand: std.atomic.Value(u32) = .init(0),
+ /// `yieldToDemand` knows the waiter had its turn.
+ handoff_gen: std.atomic.Value(u32) = .init(0),
+ 
++/// Set when the surface starts closing. Its renderer and IO threads are
++/// stopping (or already stopped) and the app thread may be waiting for them,
++/// so messages that would wait for a full mailbox to drain are dropped
++/// instead of waiting forever (which could deadlock the close).
++closing: std.atomic.Value(bool) = .init(false),
++
++/// How long a send to a full mailbox waits between checks of `closing`.
++pub const closing_poll_ns = 5 * std.time.ns_per_ms;
++
+ /// How long `yieldToDemand` sleeps waiting for a demanding waiter to
+ /// take its turn before giving up. This bounds how long the IO parse
+ /// thread can stall if a wake is lost or the waiter is descheduled; a
+diff --git a/src/termio/mailbox.zig b/src/termio/mailbox.zig
+index a053aaabe..622645857 100644
+--- a/src/termio/mailbox.zig
++++ b/src/termio/mailbox.zig
+@@ -97,6 +97,35 @@ pub const Mailbox = union(enum) {
+         }
+     }
+ 
++    /// Like `send`, but once `closing` is set a message that would wait for a
++    /// full queue is dropped: the IO thread that drains it is stopping and may
++    /// be waiting for the caller.
++    pub fn sendUnlessClosing(
++        self: *Mailbox,
++        msg: termio.Message,
++        mutex: ?*std.Io.Mutex,
++        closing: *const std.atomic.Value(bool),
++    ) void {
++        switch (self.*) {
++            .spsc => |*mb| send: {
++                if (mb.queue.push(global.io(), msg, .{ .instant = {} }) > 0) break :send;
++                mb.wakeup.notify() catch |err| {
++                    log.warn("failed to wake up writer, data will be dropped err={}", .{err});
++                    msg.deinit();
++                    return;
++                };
++                if (mutex) |m| m.unlock(global.io());
++                defer if (mutex) |m| m.lockUncancelable(global.io());
++                while (mb.queue.push(global.io(), msg, .{ .ns = 5 * std.time.ns_per_ms }) == 0) {
++                    if (closing.load(.acquire)) {
++                        msg.deinit();
++                        break;
++                    }
++                }
++            },
++        }
++    }
++
+     /// Notify that there are new messages. This may be a noop depending
+     /// on the writer type.
+     pub fn notify(self: *Mailbox) void {
+diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
+index 5d549d807..197ead694 100644
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -142,12 +142,14 @@ pub const StreamHandler = struct {
+         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+             self.renderer_state.mutex.unlock(global.io());
+             defer self.renderer_state.mutex.lockUncancelable(global.io());
+-            _ = self.surface_mailbox.push(msg, .{ .forever = {} });
++            while (self.surface_mailbox.push(msg, .{ .ns = renderer.State.closing_poll_ns }) == 0) {
++                if (self.renderer_state.closing.load(.acquire)) break;
++            }
+         }
+     }
+ 
+     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+-        self.termio_mailbox.send(msg, self.renderer_state.mutex);
++        self.termio_mailbox.sendUnlessClosing(msg, self.renderer_state.mutex, &self.renderer_state.closing);
+         self.termio_messaged = true;
+     }
+ 
+@@ -180,7 +182,12 @@ pub const StreamHandler = struct {
+                 .{err},
+             );
+         };
+-        _ = self.renderer_mailbox.push(msg, .{ .forever = {} });
++        while (self.renderer_mailbox.push(msg, .{ .ns = renderer.State.closing_poll_ns }) == 0) {
++            if (self.renderer_state.closing.load(.acquire)) {
++                msg.deinit();
++                break;
++            }
++        }
+     }
+ 
+     pub fn vt(

@@ -33,7 +33,7 @@ extension PaneView {
 
     var welcomeVisible: Bool { welcome != nil }
     var fixChipText: String { fixChip.isHidden ? "" : (fixChip.toolTip.map { _ in fixChipLabel } ?? "") }
-    private var fixChipLabel: String { fixCommand.map { "Did you mean: " + $0 } ?? (fixChip.isHidden ? "" : "Edit & retry") }
+    private var fixChipLabel: String { fixCommand.map { fixLabel ?? "Did you mean: " + $0 } ?? (fixChip.isHidden ? "" : "Edit & retry") }
     var changesChipVisible: Bool { !changesChip.isHidden }
     var stopVisible: Bool { !stopButton.isHidden }
 

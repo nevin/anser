@@ -77,7 +77,7 @@ final class DiffViewer: NSPanel {
         textView.isEditable = false
         textView.usesFindBar = true
         textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        textView.backgroundColor = t.background
+        textView.backgroundColor = OverlayBackground.contentColor
         textView.textContainerInset = NSSize(width: 6, height: 8)
         textView.isHorizontallyResizable = true
         textView.textContainer?.widthTracksTextView = false
@@ -91,6 +91,7 @@ final class DiffViewer: NSPanel {
         stack.orientation = .vertical
         stack.spacing = 0
         contentView = stack
+        OverlayBackground.install(in: self)
         reload()
     }
 
@@ -201,6 +202,7 @@ final class DataViewer: NSPanel, NSTableViewDataSource, NSTableViewDelegate, NSO
         stack.orientation = .vertical
         stack.spacing = 0
         contentView = stack
+        OverlayBackground.install(in: self)
         if table != nil { showTable() } else { showTree() }
     }
 

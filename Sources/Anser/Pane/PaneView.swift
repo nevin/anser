@@ -38,6 +38,7 @@ final class PaneView: NSView, ShellSessionDelegate {
     let watchChip = ChipView()
     let afterChip = ChipView()
     let envChip = ChipView()
+    let nodeChip = ChipView()
     let aliasChip = ChipView()
     let logChip = ChipView()
     let recChip = ChipView()
@@ -72,6 +73,10 @@ final class PaneView: NSView, ShellSessionDelegate {
     var envLoaded: ProjectEnv.Loaded?
     var envOffer: ProjectEnv.Found?
     var envCheckedCwd: String?
+    /// The project's Node version, when it asks for one (ProjectRuntimes.swift).
+    var runtimeNode: RuntimeNode?
+    /// A virtualenv Anser activated (so it only deactivates its own).
+    var runtimeVenv: String?
     var lastHandledFinish: UUID?
     /// Names of failed tests being re-run from the tests chip.
     var pendingTestRerun: Set<String>?
@@ -107,6 +112,8 @@ final class PaneView: NSView, ShellSessionDelegate {
     var welcome: WelcomeView?
     /// A corrected command after "command not found" (e.g. gti → git).
     private(set) var fixCommand: String?
+    /// What the fix chip says instead of "Did you mean: …".
+    private(set) var fixLabel: String?
     private let hintLabel = NSTextField(labelWithString: "")
     /// The whole hint; the label shows as much of it as fits.
     private var hintFull = NSAttributedString()
@@ -449,7 +456,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         // Reserve room for the actions menu before placing any chips.
         let y = ((Self.statusHeight - Self.chipHeight) / 2).rounded()
         let onInputLine: [ChipView] = []
-        let chips = ([cwdChip, recChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, badgeChip, contextChip, envChip, broadcastChip, shareChip, branchChip, prChip, conflictChip, changesChip,
+        let chips = ([cwdChip, recChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, badgeChip, contextChip, envChip, nodeChip, broadcastChip, shareChip, branchChip, prChip, conflictChip, changesChip,
                      serverChip, statusChip, testsChip, fixChip, hintChip, explainChip, aliasChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
         let moreX = w - pad - 18
         buttons.forEach { $0.isHidden = true }
@@ -469,7 +476,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         // Recording, sharing and typing in all panes affect privacy or where input goes: they come first and never fold into +N.
         let mustShow: [ChipView] = [recChip, shareChip, broadcastChip]
         let priorities = (mustShow + [cwdChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, hintChip, badgeChip, contextChip, conflictChip, statusChip, testsChip, serverChip,
-                          envChip, fixChip, aliasChip, branchChip, changesChip, prChip, explainChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
+                          envChip, nodeChip, fixChip, aliasChip, branchChip, changesChip, prChip, explainChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
         var active = priorities.filter { !$0.text.isEmpty }.map { ($0, $0.preferredWidth) }
         // Keep the row calm: the folder and branch, plus the most important few.
         var extras = 0
@@ -710,6 +717,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         var list: [ChipView] = [aliasChip, hintChip, logChip, explainChip]
         if fixCommand != nil { list.append(fixChip) }
         if envOffer != nil { list.append(envChip) }
+        if case .missing = runtimeNode?.choice { list.append(nodeChip) }
         if forwardedPorts.isEmpty, !remotePortsSeen.isEmpty { list.append(forwardChip) }
         return list
     }
@@ -723,7 +731,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         // Timed dimming is easy to miss: skip it with Reduce Motion or Increase Contrast.
         let ws = NSWorkspace.shared
         let steady = ws.accessibilityDisplayShouldReduceMotion || ws.accessibilityDisplayShouldIncreaseContrast
-        for chip in [aliasChip, hintChip, logChip, explainChip, fixChip, envChip, forwardChip] {
+        for chip in [aliasChip, hintChip, logChip, explainChip, fixChip, envChip, nodeChip, forwardChip] {
             if steady { chip.faded = false; continue }
             guard suggestions.contains(where: { $0 === chip }), !chip.isHidden, let since = chip.shownSince else { chip.faded = false; continue }
             let age = now.timeIntervalSince(since)
@@ -965,7 +973,8 @@ final class PaneView: NSView, ShellSessionDelegate {
             changesChip.set(symbol: nil, text: "", color: dim)
         }
         if let fix = fixCommand {
-            fixChip.set(role: .suggestion, symbol: "wand.and.stars", text: "Did you mean: " + fix, tooltip: "Put the corrected command in the editor", filled: true, theme: t)
+            fixChip.set(role: .suggestion, symbol: "wand.and.stars", text: fixLabel ?? "Did you mean: " + fix,
+                        tooltip: fixLabel == nil ? "Put the corrected command in the editor" : "Puts this in the editor:\n" + fix, filled: true, theme: t)
         } else if let last = s.lastBlockInContext, (last.exitCode ?? 0) != 0, !last.command.isEmpty, s.atPrompt {
             fixChip.filled = t.foreground
             fixChip.set(symbol: "arrow.uturn.backward", text: "Edit & retry", color: t.foreground.withAlphaComponent(0.75), tooltip: last.command)
@@ -1078,6 +1087,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         PluginHost.shared.commandFinished(in: self)
         commandFinishedForRunTools()
         checkProjectEnvironment()
+        checkProjectRuntimes()
         flushPendingShellScript()
         recorder?.capture()
         handleCommandFinishedForReconnect()
@@ -1097,7 +1107,11 @@ final class PaneView: NSView, ShellSessionDelegate {
         if stopPresses > 0 { stopPresses = 0; updateStopButton() }
         rawDirty = false
         fixCommand = nil
-        if session.lastExit == 127, let cmd = session.blocks.last?.command, let prog = HistoryStore.programName(cmd),
+        fixLabel = nil
+        if let last = session.blocks.last, let fix = pipFix(for: last.command, exitCode: last.exitCode ?? 0) {
+            fixCommand = fix
+            fixLabel = "Install in a new .venv"
+        } else if session.lastExit == 127, let cmd = session.blocks.last?.command, let prog = HistoryStore.programName(cmd),
            let better = CommandIndex.shared.suggestions(for: prog, env: session.env, frequency: Services.shared.history.commandNameFrequency()).first,
            let r = cmd.range(of: prog) {
             fixCommand = cmd.replacingCharacters(in: r, with: better)

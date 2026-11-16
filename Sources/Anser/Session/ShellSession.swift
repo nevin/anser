@@ -238,6 +238,9 @@ final class ShellSession {
 
     deinit { close() }
 
+    /// The shell was moved to `path` without a prompt (a pre-started shell given to a new tab).
+    func assumeCwd(_ path: String) { cwd = path }
+
     /// Environment variables for the shell so it loads Anser's hooks.
     func shellEnvironment() -> [String: String] {
         guard let res = Bundle.main.resourceURL?.path else { return [:] }
@@ -314,7 +317,10 @@ final class ShellSession {
                 if n < 0, errno == EINTR { continue }
                 if n <= 0 || stop.isSet { break }
                 let data = Data(buf[0..<n])
-                DispatchQueue.main.async { self?.received(data) }
+                let at = Date().timeIntervalSince1970
+                // The hooks speak first while the shell is still loading its config,
+                // so "shell started → first prompt" in the startup line is the user's rc files.
+                DispatchQueue.main.async { Startup.mark("shell started", at: at); self?.received(data) }
             }
             Darwin.close(fd)
         }

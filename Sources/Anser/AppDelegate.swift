@@ -71,6 +71,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             if self?.allPanes.contains(where: { $0.session.atPrompt }) == true { Startup.firstPrompt() }
         }
         HistorySyncService.shared.configure()
+        // After the first windows are up, so it doesn't slow the launch.
+        PanePool.shared.scheduleRefill(after: 3)
         WhatsNewWindowController.showIfUpdated()
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
@@ -108,6 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        PanePool.shared.discard()
         TunnelManager.shared.stopAll()
         OutputWatchManager.shared.stopAll()
         if Services.shared.config.syncHistory, !Services.isSelfTest { HistorySyncService.shared.syncNow(wait: true) }
@@ -498,6 +501,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let git = NSMenu(title: "Git")
         git.addItem(item("Switch Branch…", #selector(switchBranch(_:)), "b", [.command, .shift], for: .switchBranch))
         git.addItem(item("Changed Files…", #selector(changedFiles(_:)), "g", [.command, .shift], for: .changedFiles))
+        git.addItem(actionItem(.gitCommit, "Commit…", "m", [.command, .shift]))
         git.addItem(actionItem(.gitHistory, "Commit History…", "l", [.command, .shift]))
         git.addItem(actionItem(.gitStashes, "Stashes…", ""))
         git.addItem(actionItem(.gitBlame, "Blame File…", "l", [.command, .option, .shift]))
@@ -886,6 +890,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case .gitFetch: currentController?.runGit(.fetch, in: pane)
         case .gitPull: currentController?.runGit(.pull, in: pane)
         case .gitPush: currentController?.runGit(.push, in: pane); PaneView.forgetPullRequests()
+        case .gitCommit: currentController?.showCommit(for: pane, suggestMessage: false)
         case .quickTerminal: QuickTerminal.shared.toggle()
         case .broadcastInput: pane.windowController?.toggleBroadcast(for: pane)
         case .searchOutput: pane.windowController?.showHistorySearch(for: pane, scope: .output)

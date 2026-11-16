@@ -153,7 +153,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func makePane(cwd: String?, sessionID: String? = nil) -> PaneView {
-        let p = PaneView(cwd: cwd, sessionID: sessionID)
+        // New tabs and splits take the shell started ahead of time; restored ones reattach to their own.
+        let p = (sessionID == nil ? PanePool.shared.take(cwd: cwd) : nil) ?? PaneView(cwd: cwd, sessionID: sessionID)
         p.windowController = self
         return p
     }

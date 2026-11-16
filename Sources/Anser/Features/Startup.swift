@@ -19,9 +19,10 @@ enum Startup {
         return Double(tv.tv_sec) + Double(tv.tv_usec) / 1e6
     }()
 
-    static func mark(_ name: String) {
-        guard !done else { return }
-        marks.append((name, Date().timeIntervalSince1970))
+    /// `at`: when it happened, for events seen on another thread first.
+    static func mark(_ name: String, at time: Double? = nil) {
+        guard !done, !marks.contains(where: { $0.0 == name }) else { return }
+        marks.append((name, time ?? Date().timeIntervalSince1970))
     }
 
     static func firstPrompt() {
@@ -29,7 +30,7 @@ enum Startup {
         mark("first prompt")
         done = true
         var last = processStart
-        summary = marks.map { name, t in
+        summary = marks.sorted { $0.1 < $1.1 }.map { name, t in
             defer { last = t }
             return "\(name) +\(Int((t - last) * 1000))ms"
         }.joined(separator: " · ") + " = \(Int(((marks.last?.1 ?? last) - processStart) * 1000))ms"

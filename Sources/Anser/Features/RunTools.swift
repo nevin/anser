@@ -95,6 +95,8 @@ extension PaneView {
         watchChip.onClick = { [weak self] in self?.showWatchMenu() }
         afterChip.onClick = { [weak self] in self?.showAfterMenu() }
         envChip.onClick = { [weak self] in self?.showProjectEnvMenu() }
+        bar.addSubview(nodeChip)
+        nodeChip.onClick = { [weak self] in self?.nodeChipClicked() }
         aliasChip.onClick = { [weak self] in self?.showAliasTipMenu() }
         bar.addSubview(moreChip)
         moreChip.onClick = { [weak self] in
@@ -140,6 +142,7 @@ extension PaneView {
             afterChip.set(symbol: nil, text: "", color: dim)
         }
         refreshProjectEnvChip()
+        refreshNodeChip()
         refreshHabitChips()
         refreshFixAndForwardChips()
     }

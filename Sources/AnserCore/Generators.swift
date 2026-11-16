@@ -553,3 +553,30 @@ public enum ShellBuiltins {
         "shopt": "bash: shell options", "complete": "bash: completion spec", "mapfile": "bash: read lines to array",
     ]
 }
+
+/// The command the Changes view's Commit form runs, shown in the terminal and history like anything you type.
+public enum GitCommit {
+    public struct Options: Equatable, Sendable {
+        public var message: String
+        public var stageAll = false
+        public var push = false
+        /// The branch already tracks a remote branch (else the first push sets it up).
+        public var hasUpstream = true
+        public var openPullRequest = false
+        public init(message: String, stageAll: Bool = false, push: Bool = false, hasUpstream: Bool = true, openPullRequest: Bool = false) {
+            self.message = message; self.stageAll = stageAll; self.push = push; self.hasUpstream = hasUpstream; self.openPullRequest = openPullRequest
+        }
+    }
+
+    public static func command(_ o: Options) -> String {
+        var steps: [String] = []
+        if o.stageAll { steps.append("git add -A") }
+        let msg = o.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Single quotes read better in history than backslashes, and nothing inside them runs.
+        steps.append("git commit -m '" + msg.replacingOccurrences(of: "'", with: "'\\''") + "'")
+        if o.push || o.openPullRequest { steps.append(o.hasUpstream ? "git push" : "git push -u origin HEAD") }
+        // --fill takes the title and body from the commit; --web lets you check it before it's created.
+        if o.openPullRequest { steps.append("gh pr create --fill --web") }
+        return steps.joined(separator: " && ")
+    }
+}

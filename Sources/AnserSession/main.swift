@@ -436,7 +436,25 @@ func runShellDirectly(_ command: String, _ env: [String: String]) -> Never {
     exit(127)
 }
 
+/// Before exiting: a live tab reads what's left in a moment; a closing one
+/// never will, and login(1) — which started us — would wait for it forever
+/// as it exits while the app waits for login to close the tab. So give the
+/// output a moment to drain, then drop the rest.
+func dropUnreadOutput() {
+    let TIOCOUTQ: UInt = 0x4004_7473   // _IOR('t', 115, int)
+    for _ in 0..<20 {
+        var pending: Int32 = 0
+        if ioctl(1, TIOCOUTQ, &pending) != 0 || pending <= 0 { return }
+        usleep(10_000)
+    }
+    tcflush(1, TCOFLUSH)
+}
+
 func attachMain() -> Never {
+    // Closing the tab hangs up. Drop output nobody will read now: otherwise
+    // login(1), which started us, waits for it to drain while it exits, and the
+    // app waits for login while it closes the tab — a freeze.
+    signal(SIGHUP) { _ in tcflush(1, TCOFLUSH); _exit(0) }
     var env = environment
     let id = env.removeValue(forKey: "ANSER_SESSION_ID") ?? ""
     let command = env.removeValue(forKey: "ANSER_SESSION_COMMAND") ?? ""
@@ -455,6 +473,7 @@ func attachMain() -> Never {
     func finish(_ code: Int32, _ message: String? = nil) -> Never {
         if isTTY { var o = original; tcsetattr(0, TCSANOW, &o) }
         if let message { FileHandle.standardOutput.write(Data("\r\n[\(message)]\r\n".utf8)) }
+        dropUnreadOutput()
         exit(code)
     }
 

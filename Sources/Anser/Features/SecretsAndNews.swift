@@ -188,6 +188,7 @@ final class WhatsNewWindowController: NSWindowController {
         stack.edgeInsets = NSEdgeInsets(top: 34, left: 24, bottom: 18, right: 24)
         for v in [scroll, buttons] { v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48).isActive = true }
         w.contentView = stack
+        OverlayBackground.install(in: w)
     }
 
     required init?(coder: NSCoder) { fatalError() }

@@ -124,6 +124,19 @@ public enum ProjectEnv {
         return nil
     }
 
+    /// The nearest .venv/venv (its full path), up to the git repo or your home folder.
+    public static func findVenv(from cwd: String, home: String = NSHomeDirectory(),
+                                exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> String? {
+        var d = cwd
+        for _ in 0..<12 {
+            if d == home || d == "/" || d.isEmpty { return nil }
+            for n in venvNames where exists(d + "/" + n + "/bin/activate") { return d + "/" + n }
+            if exists(d + "/.git") { return nil }
+            d = (d as NSString).deletingLastPathComponent
+        }
+        return nil
+    }
+
     static func isSafeVersion(_ v: String) -> Bool {
         v.count < 40 && v.allSatisfy { $0.isLetter || $0.isNumber || ".-_/*".contains($0) }
     }
@@ -243,7 +256,7 @@ public enum ProjectEnv {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    static func q(_ s: String, _ shell: Shell) -> String {
+    public static func q(_ s: String, _ shell: Shell) -> String {
         switch shell {
         case .posix: return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
         case .fish: return "'" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'") + "'"

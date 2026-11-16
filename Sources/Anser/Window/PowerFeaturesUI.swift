@@ -162,7 +162,7 @@ final class OutputViewer: NSPanel {
         textView.isIncrementalSearchingEnabled = true
         textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         textView.textColor = t.foreground
-        textView.backgroundColor = t.background
+        textView.backgroundColor = OverlayBackground.contentColor
         textView.textContainerInset = NSSize(width: 8, height: 8)
         textView.string = output.isEmpty ? "(no output)" : output
         textView.isHorizontallyResizable = true
@@ -173,13 +173,14 @@ final class OutputViewer: NSPanel {
         scroll.documentView = textView
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
-        scroll.backgroundColor = t.background
+        scroll.backgroundColor = OverlayBackground.contentColor
 
         let stack = NSStackView(views: [top, scroll])
         stack.orientation = .vertical
         stack.spacing = 0
         top.setContentHuggingPriority(.required, for: .vertical)
         contentView = stack
+        OverlayBackground.install(in: self)
     }
 
     var text: String { output }

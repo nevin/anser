@@ -334,7 +334,7 @@ extension TerminalWindowController {
                                                              cwd: pane.session.cwd, env: pane.session.env, timeout: 3)
                     return PickerPanel.previewText(diff ?? "", diff: true)
                 },
-                actions: Self.fileActions(pane: pane) { item in
+                actions: (self?.commitActions(pane: pane) ?? []) + Self.fileActions(pane: pane) { item in
                     (item.payload as? GitChange).map { (pane.session.cwd as NSString).appendingPathComponent($0.path) }
                 }), pane: pane)
         }

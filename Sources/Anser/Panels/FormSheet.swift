@@ -46,6 +46,7 @@ final class FormSheet: NSObject, NSTextFieldDelegate, NSComboBoxDelegate {
         okButton = NSButton(title: ok, target: nil, action: nil)
         super.init()
         build(title: title, message: message, width: width)
+        OverlayBackground.install(in: panel)
     }
 
     private func build(title: String, message: String?, width: CGFloat) {

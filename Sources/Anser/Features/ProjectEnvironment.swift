@@ -40,12 +40,22 @@ extension PaneView {
         if let l = envLoaded, !(cwd == l.root || cwd.hasPrefix(l.root + "/")) { unloadProjectEnv(quiet: false) }
         envOffer = nil
         defer { refreshBar() }
-        guard let f = ProjectEnv.find(from: cwd), envLoaded?.root != f.root, hasSomethingToLoad(f) else { return }
+        guard let f = ProjectEnv.find(from: cwd).map(withoutRuntimes), envLoaded?.root != f.root, hasSomethingToLoad(f) else { return }
         switch ProjectEnvPrefs.get(f.root) {
         case "always": loadProjectEnv(f, automatic: true)
         case "never": break
         default: envOffer = f
         }
+    }
+
+    /// With automatic switching on, Node and the virtualenv aren't part of the offer.
+    func withoutRuntimes(_ f: ProjectEnv.Found) -> ProjectEnv.Found {
+        guard runtimesOn else { return f }
+        var f = f
+        f.venv = nil
+        f.nodeVersion = nil
+        f.nodeFile = nil
+        return f
     }
 
     private func hasSomethingToLoad(_ f: ProjectEnv.Found) -> Bool {
@@ -140,7 +150,7 @@ extension PaneView {
         } else if let l = envLoaded {
             m.addItem(ClosureMenuItem(title: "Unload") { [weak self] in self?.unloadProjectEnv() })
             m.addItem(ClosureMenuItem(title: "Reload") { [weak self] in
-                guard let self, let f = ProjectEnv.find(from: self.session.cwd) else { return }
+                guard let self, let f = ProjectEnv.find(from: self.session.cwd).map(self.withoutRuntimes) else { return }
                 self.unloadProjectEnv(quiet: true)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.loadProjectEnv(f) }
             })
@@ -161,7 +171,7 @@ extension PaneView {
         if let f = envOffer { loadProjectEnv(f); return }
         if envLoaded != nil, !envChip.isHidden { showProjectEnvMenu(); return }
         if envLoaded != nil { unloadProjectEnv(); return }
-        if let f = ProjectEnv.find(from: session.cwd), !session.isRemote { loadProjectEnv(f); return }
+        if let f = ProjectEnv.find(from: session.cwd).map(withoutRuntimes), !f.isEmpty, !session.isRemote { loadProjectEnv(f); return }
         flash("No .env, virtualenv, .nvmrc or .envrc in this project")
     }
 

@@ -12,5 +12,7 @@ pid=$!
 for _ in $(seq 1 300); do [[ -f "$dir/results.txt" ]] && break; sleep 1; done
 sleep 1; kill "$pid" 2>/dev/null
 rm -rf "$cfg"
+# The session helper on its own: closing a busy tab mustn't freeze the app.
+[[ -f "$dir/results.txt" ]] && bash "$root/scripts/test-session-helper.sh" >> "$dir/results.txt" 2>&1
 cat "$dir/results.txt" 2>/dev/null || { echo "no results (timed out)"; exit 1; }
 ! grep -q '^FAIL' "$dir/results.txt"
