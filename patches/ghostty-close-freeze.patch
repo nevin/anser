@@ -33,11 +33,48 @@ index 1e38d64a9..9a4914bdb 100644
  /// How long `yieldToDemand` sleeps waiting for a demanding waiter to
  /// take its turn before giving up. This bounds how long the IO parse
  /// thread can stall if a wake is lost or the waiter is descheduled; a
+diff --git a/src/termio/Exec.zig b/src/termio/Exec.zig
+index 2dfb1e5f7..0c15d5aa6 100644
+--- a/src/termio/Exec.zig
++++ b/src/termio/Exec.zig
+@@ -1487,7 +1487,10 @@ pub const ReadThread = struct {
+ 
+             // The batch buffer is owned by this stage until we advance
+             // the tail below, so it is safe to read outside the lock.
+-            io.processOutput(batch);
++            // Once the surface is closing nobody will see this output, so
++            // drop it: parsing up to a full ring of a flooding program's
++            // output only delays the close the app thread is waiting on.
++            if (!io.renderer_state.closing.load(.acquire)) io.processOutput(batch);
+ 
+             {
+                 pipeline.mutex.lockUncancelable(global.io());
+@@ -1702,8 +1705,18 @@ pub const ReadThread = struct {
+             if (fatal) return;
+ 
+             // A full buffer means the stream is still hot, so go
+-            // claim the next buffer without an intervening poll.
+-            if (total == buffer_capacity) continue;
++            // claim the next buffer without waiting. Still check the
++            // quit fd (without blocking): a program that never stops
++            // printing would otherwise keep us reading forever after
++            // a quit, since the wait below is the only other check.
++            if (total == buffer_capacity) {
++                const r = posix.poll(pollfds[1..2], 0) catch 0;
++                if (r > 0 and pollfds[1].revents & posix.POLL.IN != 0) {
++                    log.info("read thread got quit signal", .{});
++                    return;
++                }
++                continue;
++            }
+ 
+             // Wait for data. The idle fd is sliced off: the parse
+             // stage only writes to it while we're bridging.
 diff --git a/src/termio/mailbox.zig b/src/termio/mailbox.zig
-index a053aaabe..622645857 100644
+index a053aaabe..5e900edaa 100644
 --- a/src/termio/mailbox.zig
 +++ b/src/termio/mailbox.zig
-@@ -97,6 +97,35 @@ pub const Mailbox = union(enum) {
+@@ -97,6 +97,36 @@ pub const Mailbox = union(enum) {
          }
      }
  
@@ -60,11 +97,12 @@ index a053aaabe..622645857 100644
 +                };
 +                if (mutex) |m| m.unlock(global.io());
 +                defer if (mutex) |m| m.lockUncancelable(global.io());
-+                while (mb.queue.push(global.io(), msg, .{ .ns = 5 * std.time.ns_per_ms }) == 0) {
++                while (true) {
 +                    if (closing.load(.acquire)) {
 +                        msg.deinit();
 +                        break;
 +                    }
++                    if (mb.queue.push(global.io(), msg, .{ .ns = 5 * std.time.ns_per_ms }) > 0) break;
 +                }
 +            },
 +        }
@@ -74,16 +112,20 @@ index a053aaabe..622645857 100644
      /// on the writer type.
      pub fn notify(self: *Mailbox) void {
 diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
-index 5d549d807..197ead694 100644
+index 5d549d807..b6e6804ee 100644
 --- a/src/termio/stream_handler.zig
 +++ b/src/termio/stream_handler.zig
-@@ -142,12 +142,14 @@ pub const StreamHandler = struct {
+@@ -142,12 +142,18 @@ pub const StreamHandler = struct {
          if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
              self.renderer_state.mutex.unlock(global.io());
              defer self.renderer_state.mutex.lockUncancelable(global.io());
 -            _ = self.surface_mailbox.push(msg, .{ .forever = {} });
-+            while (self.surface_mailbox.push(msg, .{ .ns = renderer.State.closing_poll_ns }) == 0) {
-+                if (self.renderer_state.closing.load(.acquire)) break;
++            // Check `closing` before each wait, not after: once the surface
++            // is closing, the app thread is joining us and never drains its
++            // mailbox, so waiting even 5ms per message adds up to minutes
++            // while we parse the output left over from a title flood.
++            while (!self.renderer_state.closing.load(.acquire)) {
++                if (self.surface_mailbox.push(msg, .{ .ns = renderer.State.closing_poll_ns }) > 0) break;
 +            }
          }
      }
@@ -94,16 +136,17 @@ index 5d549d807..197ead694 100644
          self.termio_messaged = true;
      }
  
-@@ -180,7 +182,12 @@ pub const StreamHandler = struct {
+@@ -180,7 +186,13 @@ pub const StreamHandler = struct {
                  .{err},
              );
          };
 -        _ = self.renderer_mailbox.push(msg, .{ .forever = {} });
-+        while (self.renderer_mailbox.push(msg, .{ .ns = renderer.State.closing_poll_ns }) == 0) {
++        while (true) {
 +            if (self.renderer_state.closing.load(.acquire)) {
 +                msg.deinit();
 +                break;
 +            }
++            if (self.renderer_mailbox.push(msg, .{ .ns = renderer.State.closing_poll_ns }) > 0) break;
 +        }
      }
  

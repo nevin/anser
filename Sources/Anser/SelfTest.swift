@@ -2363,6 +2363,28 @@ enum SelfTest {
             if let p = NSApp.windows.compactMap({ $0 as? PickerPanel }).first(where: { $0.isVisible }), let v = p.contentView { snapView(v, "picker-light"); p.close() }
         }
 
+        // Background: a picture behind the terminal, and a see-through window without one.
+        do {
+            let saved = try? String(contentsOf: AnserConfig.fileURL, encoding: .utf8)
+            let png = NSTemporaryDirectory() + "anser-selftest-bg.png"
+            let img = NSImage(size: NSSize(width: 64, height: 40), flipped: false) { r in NSColor.systemTeal.setFill(); r.fill(); return true }
+            if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) { try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: png)) }
+            try? #"{"appearance":{"backgroundImage":"\#(png)","backgroundImageFit":"fit","backgroundOpacity":0.6}}"#.write(to: AnserConfig.fileURL, atomically: true, encoding: .utf8)
+            var ok = await wait(5) { !pane.backgroundImageView.isHidden && pane.backgroundImageView.layer?.contents != nil }
+            check("a background picture shows behind the terminal", ok && pane.backgroundImageView.layer?.contentsGravity == .resizeAspect
+                    && GhosttyRuntime.shared.configText.contains("background-opacity = 0.6") && wc.window?.isOpaque == true,
+                  "hidden=\(pane.backgroundImageView.isHidden) gravity=\(pane.backgroundImageView.layer?.contentsGravity.rawValue ?? "-") opaque=\(wc.window?.isOpaque ?? false)")
+            check("the picture covers the input line but not the status row",
+                  pane.backgroundImageView.frame.minY == pane.footer.frame.maxY && pane.backgroundImageView.frame.maxY == pane.bounds.maxY)
+            try? #"{"appearance":{"backgroundOpacity":0.6}}"#.write(to: AnserConfig.fileURL, atomically: true, encoding: .utf8)
+            ok = await wait(5) { pane.backgroundImageView.isHidden && wc.window?.isOpaque == false }
+            check("see-through without a picture shows what's behind the window", ok && (wc.window?.backgroundColor.alphaComponent ?? 1) < 0.7,
+                  "alpha=\(wc.window?.backgroundColor.alphaComponent ?? 1)")
+            if let saved { try? saved.write(to: AnserConfig.fileURL, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: AnserConfig.fileURL) }
+            _ = await wait(5) { wc.window?.isOpaque == true }
+            try? FileManager.default.removeItem(atPath: png)
+        }
+
         // Errors stay visible: a missing command's message isn't hidden or covered by the input area.
         pane.run("anser-no-such-tool --flag # anser-selftest")
         ok = await wait(10) { s.atPrompt && s.blocks.last?.command.hasPrefix("anser-no-such-tool") == true }
@@ -3089,6 +3111,33 @@ enum SelfTest {
         for _ in 0..<3 { pane.editor.doCommand(by: #selector(NSResponder.moveDownAndModifySelection(_:))) }
         let backDown = await wait(3) { pane.viewportAtBottom }
         check("Shift+↑/↓ at the prompt scrolls the terminal by lines", ok && backDown, "up=\(ok) down=\(backDown)")
+        // A long command recalled from history, with the screen full: the terminal gets
+        // shorter so the input never covers the last rows of output.
+        pane.run("seq 1 120 # anser-selftest")
+        _ = await wait(6) { s.atPrompt && s.blocks.last?.command.hasPrefix("seq 1 120") == true }
+        await sleep(0.4)
+        pane.editor.setTextForTests("echo one \\\n  two \\\n  three \\\n  four # anser-selftest")
+        let tallClear = await wait(3) {
+            pane.needsLayout = true; pane.layoutSubtreeIfNeeded()
+            return pane.editor.lineCount >= 4 && pane.followTop == nil && pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5 }
+        let tallTerm = pane.surfaceView.frame.minY, tallBar = pane.barTopForTest
+        let tallInfo = "lines \(pane.editor.lineCount) follow \(pane.followTop.map { Int($0) } ?? -1) running \(s.running != nil) atBottom \(pane.viewportAtBottom) out \(Int(pane.outputBottomForTest ?? -1))"
+        pane.editor.setTextForTests("")
+        let tallBack = await wait(3) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return pane.surfaceView.frame.minY < tallTerm - 1 }
+        // Pasting a lot of text grows the input the same way. (Inserted directly: the test
+        // mustn't touch your clipboard.)
+        let pasted = (1...40).map { "echo pasted-\($0)" }.joined(separator: "\n")
+        pane.editor.insertText(pasted, replacementRange: NSRange(location: 0, length: 0))
+        let pasteClear = await wait(3) {
+            pane.needsLayout = true; pane.layoutSubtreeIfNeeded()
+            return pane.editor.lineCount >= 8 && pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5 }
+        let pasteInfo = "paste: terminal bottom \(Int(pane.surfaceView.frame.minY)) · input top \(Int(pane.barTopForTest))"
+        pane.editor.setTextForTests("")
+        _ = await wait(3) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return pane.surfaceView.frame.minY < tallTerm - 1 }
+        await sleep(0.4)
+        check("pasting a lot of text doesn't cover the output", pasteClear, pasteInfo)
+        check("a long command from history doesn't cover the output", tallClear && tallBack,
+              "terminal bottom \(Int(tallTerm)) · input top \(Int(tallBar)) · \(tallInfo) · back=\(tallBack)")
         // Back to the default: the input line follows the output.
         Services.shared.setInlineInputForTest(true)
         pane.needsLayout = true

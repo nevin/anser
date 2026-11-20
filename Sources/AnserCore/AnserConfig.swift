@@ -79,8 +79,15 @@ public struct AnserConfig: Codable, Sendable {
             if usesDark(systemIsDark: systemIsDark) { return nonEmpty(darkTheme) ?? nonEmpty(theme) }
             return nonEmpty(lightTheme) ?? Self.defaultLightTheme
         }
-        /// 0.3–1.0
+        /// 0.1–1.0: how much of the background colour covers what's behind it
+        /// (the desktop, or `backgroundImage`). nil is solid.
         public var backgroundOpacity: Double?
+        /// A picture behind the terminal (a file path, `~` allowed), seen through the
+        /// background colour at `backgroundOpacity`.
+        public var backgroundImage: String?
+        /// How the picture fills the pane: "fill" (the default: covers it, cropping),
+        /// "fit" (all of it, with bars), "stretch", or "center" (actual size).
+        public var backgroundImageFit: String?
         /// "block", "bar", "underline", "block_hollow"
         public var cursorStyle: String?
         public var cursorBlink: Bool?
@@ -90,6 +97,15 @@ public struct AnserConfig: Codable, Sendable {
 
         public init() {}
 
+        public var hasBackgroundImage: Bool { !(backgroundImage?.trimmingCharacters(in: .whitespaces).isEmpty ?? true) }
+        /// What's used: a picture needs the colour see-through to show (70% unless set).
+        public var effectiveBackgroundOpacity: Double? {
+            let o = backgroundOpacity ?? (hasBackgroundImage ? 0.7 : nil)
+            return o.map { min(1, max(0.1, $0)) }
+        }
+        public static let imageFits = ["fill", "fit", "stretch", "center"]
+        public var imageFit: String { backgroundImageFit.flatMap { Self.imageFits.contains($0) ? $0 : nil } ?? "fill" }
+
         /// The Ghostty config lines for these settings (dark macOS assumed when not given).
         public var ghosttyLines: [String] { ghosttyLines(systemIsDark: true) }
 
@@ -98,7 +114,7 @@ public struct AnserConfig: Codable, Sendable {
             if let f = fontFamily, !f.isEmpty { l += ["font-family = \"\"", "font-family = \(f)"] }
             if let s = fontSize { l.append("font-size = \(s)") }
             if let t = themeName(systemIsDark: systemIsDark) { l.append("theme = \(t)") }
-            if let o = backgroundOpacity { l.append("background-opacity = \(min(1, max(0.2, o)))") }
+            if let o = effectiveBackgroundOpacity { l.append("background-opacity = \(o)") }
             if let c = cursorStyle, !c.isEmpty { l.append("cursor-style = \(c)") }
             if let b = cursorBlink { l.append("cursor-style-blink = \(b)") }
             if let p = padding { l += ["window-padding-x = \(Int(p))", "window-padding-y = \(Int(max(0, p - 2)))"] }
@@ -396,6 +412,8 @@ public struct AnserConfig: Codable, Sendable {
         "darkTheme": null,
         "lightTheme": null,
         "backgroundOpacity": null,
+        "backgroundImage": null,
+        "backgroundImageFit": "fill",
         "cursorStyle": null
       },
       "notifyAfterSeconds": 10,

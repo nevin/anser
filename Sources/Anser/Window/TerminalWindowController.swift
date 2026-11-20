@@ -145,9 +145,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
 
     private func applyTheme() {
         let t = GhosttyRuntime.shared.theme
-        let opacity = CGFloat(Services.shared.config.appearance.backgroundOpacity ?? 1)
-        window?.isOpaque = opacity >= 1
-        window?.backgroundColor = opacity >= 1 ? t.background : t.background.withAlphaComponent(opacity)
+        let a = Services.shared.config.appearance
+        let opacity = CGFloat(a.effectiveBackgroundOpacity ?? 1)
+        // With a picture, each pane draws it behind its terminal: the window itself stays solid.
+        let seeThrough = opacity < 1 && !a.hasBackgroundImage
+        window?.isOpaque = !seeThrough
+        window?.backgroundColor = seeThrough ? t.background.withAlphaComponent(opacity) : t.background
         window?.appearance = NSAppearance(named: t.isDark ? .darkAqua : .aqua)
         tabBar.reload()
     }

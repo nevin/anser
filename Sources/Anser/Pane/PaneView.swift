@@ -15,6 +15,11 @@ final class PaneView: NSView, ShellSessionDelegate {
     let bar = BarView()
     /// The status row: folder, branch, chips and hints. Always at the bottom.
     let footer = BarView()
+    /// Settings → Appearance → Background → Image: behind the terminal and the input line.
+    let backgroundImageView = NSView()
+    /// Between the terminal and the status row (room kept for the input line): the same
+    /// colour, at the same opacity, as the terminal's own background.
+    let inputAreaFill = NSView()
     let card = CardView()
     let gutter = GutterView()
     let editorScroll = NSScrollView()
@@ -207,6 +212,11 @@ final class PaneView: NSView, ShellSessionDelegate {
         session.delegate = self
         surfaceView.pane = self
         editor.pane = self
+        backgroundImageView.wantsLayer = true
+        backgroundImageView.isHidden = true
+        addSubview(backgroundImageView)
+        inputAreaFill.wantsLayer = true
+        addSubview(inputAreaFill)
         addSubview(surfaceView)
         blocksOverlay.pane = self
         addSubview(blocksOverlay)
@@ -233,6 +243,9 @@ final class PaneView: NSView, ShellSessionDelegate {
     private func applyTheme() {
         let t = theme
         footer.fill = t.barBackground
+        updateBackgroundImage()
+        let opacity = Services.shared.config.appearance.effectiveBackgroundOpacity ?? 1
+        inputAreaFill.layer?.backgroundColor = t.background.withAlphaComponent(opacity).cgColor
         welcome?.applyTheme()
         footer.separator = t.foreground.withAlphaComponent(0.2)
         footer.needsDisplay = true
@@ -381,8 +394,8 @@ final class PaneView: NSView, ShellSessionDelegate {
         return cardHeight + Self.cardMargin + Self.statusHeight
     }
 
-    /// The terminal keeps a fixed size for a one-line editor; extra editor
-    /// lines float over the terminal instead of resizing it.
+    /// The terminal's room for a one-line input. A taller input resting at the
+    /// bottom makes the terminal shorter (see `layout`), so it never covers output.
     private var reservedBarHeight: CGFloat {
         if fullscreenProgram { return 0 }
         guard editorEnabled else { return Self.statusHeight }
@@ -404,9 +417,18 @@ final class PaneView: NSView, ShellSessionDelegate {
         if showWelcome {
             welcome?.frame = NSRect(x: 10, y: welcomeY, width: min(440, w - 20), height: WelcomeView.height)
         }
-        let reserved = showWelcome ? welcomeBottom : reservedBarHeight
+        // Where the input line goes. The cursor is measured from the terminal's top,
+        // which doesn't move when the terminal's height changes, so this can come first.
+        followTop = computeFollowTop()
+        var reserved = showWelcome ? welcomeBottom : reservedBarHeight
+        // An input of several lines (a long command from history, say) resting at the
+        // bottom would cover the last rows of output: make the terminal shorter instead,
+        // so the output moves up above it.
+        if !showWelcome, !fullscreenProgram, editorEnabled, followTop == nil { reserved = max(reserved, barHeight) }
         let target = NSRect(x: 0, y: reserved, width: w, height: max(0, bounds.height - reserved - headerH))
         if surfaceView.frame != target { surfaceView.frame = target }
+        let fillBottom: CGFloat = fullscreenProgram ? 0 : Self.statusHeight
+        inputAreaFill.frame = NSRect(x: 0, y: fillBottom, width: w, height: max(0, target.minY - fillBottom))
         dimView.frame = target
         if blocksOverlay.frame != target { blocksOverlay.frame = target; blocksOverlay.setNeedsRefresh() }
         dimView.fill = theme.background.withAlphaComponent(0.38)
@@ -423,8 +445,9 @@ final class PaneView: NSView, ShellSessionDelegate {
         }
         // The footer stays at the bottom; the input line follows the output above it.
         footer.frame = NSRect(x: 0, y: 0, width: w, height: Self.statusHeight)
+        let imageBottom: CGFloat = fullscreenProgram ? 0 : Self.statusHeight
+        backgroundImageView.frame = NSRect(x: 0, y: imageBottom, width: w, height: max(0, bounds.height - imageBottom))
         let h = barHeight - Self.statusHeight
-        followTop = computeFollowTop()
         let barY = followTop.map { max(Self.statusHeight, $0 - h) } ?? Self.statusHeight
         bar.floating = barY > Self.statusHeight + 0.5
         bar.frame = NSRect(x: 0, y: barY, width: w, height: h)
@@ -556,6 +579,42 @@ final class PaneView: NSView, ShellSessionDelegate {
         hintLabel.frame = NSRect(x: x, y: y + (Self.chipHeight - 15) / 2, width: max(0, hintW), height: 15)
     }
 
+    // MARK: Background image
+
+    /// One decoded copy for every pane.
+    private static var imageCache: (path: String, image: CGImage)?
+
+    func updateBackgroundImage() {
+        let a = Services.shared.config.appearance
+        guard a.hasBackgroundImage, let raw = a.backgroundImage else {
+            backgroundImageView.isHidden = true
+            backgroundImageView.layer?.contents = nil
+            return
+        }
+        let path = (raw.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+        var image = Self.imageCache?.path == path ? Self.imageCache?.image : nil
+        if image == nil, let ns = NSImage(contentsOfFile: path) {
+            var rect = CGRect(origin: .zero, size: ns.size)
+            image = ns.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+            if let image { Self.imageCache = (path, image) }
+        }
+        guard let layer = backgroundImageView.layer, let image else {
+            backgroundImageView.isHidden = true
+            backgroundImageView.layer?.contents = nil
+            return
+        }
+        layer.contents = image
+        layer.contentsScale = window?.backingScaleFactor ?? 2
+        layer.masksToBounds = true
+        switch a.imageFit {
+        case "fit": layer.contentsGravity = .resizeAspect
+        case "stretch": layer.contentsGravity = .resize
+        case "center": layer.contentsGravity = .center
+        default: layer.contentsGravity = .resizeAspectFill
+        }
+        backgroundImageView.isHidden = false
+    }
+
     // MARK: Following the output
 
     /// While the screen isn't full, the editor sits just under the last line
@@ -574,7 +633,9 @@ final class PaneView: NSView, ShellSessionDelegate {
         // At a hidden prompt the cursor's row is empty: the input line takes its
         // place, its text centred on that row. Otherwise it goes below the cursor's row.
         let hiddenPrompt = session.atPrompt && session.integrated && Services.shared.config.shellPrompt == "hidden"
-        let textOffset = (Self.cardMargin - 4) + cardHeight / 2   // input band top → middle of its text
+        // Input band top → middle of its first line (not of the whole input: a command
+        // of several lines would otherwise be pushed up over the output by half its height).
+        let textOffset = Self.cardMargin + editor.textContainerInset.height + editor.lineHeight / 2
         let top = hiddenPrompt ? cursorTop - cellH / 2 + textOffset : cursorTop - cellH - 2
         // Close to the bottom anyway: rest just above the status row rather than a few points over it.
         guard top - barHeight > 20 else { return nil }

@@ -324,6 +324,7 @@ You can switch to the imported theme and font in the same step. Themes go to `~/
   - ⌘1–9 jump to a tab, ⇧⌘[ / ⇧⌘] switch to the previous or next one.
 - **Splits:** ⌘D splits right, ⇧⌘D splits down, ⌘[ / ⌘] move between panes.
 - **Appearance** (⌘,): font, text sizes, 725 color themes, background opacity, cursor shape and padding. Changes apply live.
+- **Background** (Settings → Appearance): **Solid colour**, **See-through** (the desktop shows through; Colour opacity goes down to 10%), or **Image**: a picture of your own behind the terminal and the input line, set to Fill, Fit, Stretch or Center. Colour opacity sets how much of the theme colour covers the picture, so text stays readable. The status row stays solid.
 - **Programmable.** `~/.config/anser/config.json` holds abbreviations, keybindings (`run:`, `insert:`, `snippet:`, `action:`, `ghostty:`), and extra Ghostty settings. Custom completions go in `~/.config/anser/completions/*.json`, and they can run scripts to produce suggestions. The config reloads when you save it.
 - **A status row you can click:**
   - The folder chip opens recent folders (⌘J); Enter `cd`s there.

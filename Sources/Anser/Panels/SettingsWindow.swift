@@ -1,5 +1,6 @@
 import AppKit
 import AnserCore
+import UniformTypeIdentifiers
 
 /// Settings window. It edits ~/.config/anser/config.json in place (keeping
 /// every other key as is); the app reloads that file automatically, so
@@ -65,8 +66,15 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     static let appearanceModes = [("system", "System (follow macOS)"), ("dark", "Dark"), ("light", "Light")]
     /// Which theme box the preview shows (the one last touched, else the active one).
     private var previewLight = false
-    private let opacity = NSSlider(value: 1, minValue: 0.4, maxValue: 1, target: nil, action: nil)
+    private let opacity = NSSlider(value: 1, minValue: 0.1, maxValue: 1, target: nil, action: nil)
     private let opacityLabel = NSTextField(labelWithString: "100%")
+    private let opacityNote = NSTextField(labelWithString: "")
+    private let backgroundPopup = NSPopUpButton()
+    static let backgroundModes = ["Solid colour", "See-through", "Image"]
+    private let imageButton = NSButton(title: "Choose Image…", target: nil, action: nil)
+    private let imagePathLabel = NSTextField(labelWithString: "")
+    private let imageFitPopup = NSPopUpButton()
+    static let imageFitTitles = ["Fill", "Fit", "Stretch", "Center"]
     private let cursorPopup = NSPopUpButton()
     private let cursorBlink = NSButton(checkboxWithTitle: "Blink", target: nil, action: nil)
     private let ligatures = NSButton(checkboxWithTitle: "Ligatures (=> != ->)", target: nil, action: nil)
@@ -225,6 +233,20 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
 
         opacity.target = self
         opacity.action = #selector(opacityChanged)
+        backgroundPopup.addItems(withTitles: Self.backgroundModes)
+        backgroundPopup.target = self
+        backgroundPopup.action = #selector(backgroundModeChanged)
+        imageButton.target = self
+        imageButton.action = #selector(chooseBackgroundImage)
+        imageButton.bezelStyle = .rounded
+        imagePathLabel.lineBreakMode = .byTruncatingMiddle
+        imagePathLabel.textColor = .secondaryLabelColor
+        imagePathLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 220).isActive = true
+        imageFitPopup.addItems(withTitles: Self.imageFitTitles)
+        imageFitPopup.target = self
+        imageFitPopup.action = #selector(imageFitChanged)
+        opacityNote.font = .systemFont(ofSize: 11)
+        opacityNote.textColor = .secondaryLabelColor
         opacity.isContinuous = false
         opacity.widthAnchor.constraint(equalToConstant: 180).isActive = true
 
@@ -296,7 +318,9 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
                 [label("Appearance:"), modePopup],
                 [label("Dark theme:"), themeBox],
                 [label("Light theme:"), themeColumn],
-                [label("Background opacity:"), NSStackView(views: [opacity, opacityLabel])],
+                [label("Background:"), backgroundPopup],
+                [label("Picture:"), NSStackView(views: [imageButton, imagePathLabel, imageFitPopup])],
+                [label("Colour opacity:"), NSStackView(views: [opacity, opacityLabel, opacityNote])],
                 [label("Cursor:"), NSStackView(views: [cursorPopup, cursorBlink])],
                 [label("Padding:"), stepperRow(padding, paddingStepper, min: 0, max: 40, action: #selector(paddingChanged), unit: "px")],
             ]),
@@ -786,9 +810,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
         themeBox.stringValue = (value(json, ["appearance", "darkTheme"]) as? String) ?? (value(json, ["appearance", "theme"]) as? String) ?? "Default"
         lightThemeBox.stringValue = (value(json, ["appearance", "lightTheme"]) as? String) ?? "Default"
         previewLight = !(AnserConfig.Appearance(mode: mode).usesDark(systemIsDark: GhosttyRuntime.systemIsDark))
-        let op = (value(json, ["appearance", "backgroundOpacity"]) as? Double) ?? 1
-        opacity.doubleValue = op
-        opacityLabel.stringValue = "\(Int(op * 100))%"
+        refreshBackgroundControls(json)
         let cs = value(json, ["appearance", "cursorStyle"]) as? String
         cursorPopup.selectItem(at: Self.cursorStyles.firstIndex { $0.0 == cs } ?? 0)
         cursorBlink.state = ((value(json, ["appearance", "cursorBlink"]) as? Bool) ?? true) ? .on : .off
@@ -909,7 +931,63 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     @objc private func opacityChanged() {
         let v = (opacity.doubleValue * 100).rounded() / 100
         opacityLabel.stringValue = "\(Int(v * 100))%"
-        set(["appearance", "backgroundOpacity"], v >= 0.995 ? nil : v)
+        // Solid is "no opacity set"; with a picture, 100% is kept as chosen (it hides the picture).
+        set(["appearance", "backgroundOpacity"], v >= 0.995 && backgroundPopup.indexOfSelectedItem != 2 ? nil : v)
+        if v >= 0.995, backgroundPopup.indexOfSelectedItem == 1 { backgroundPopup.selectItem(at: 0) }
+        refreshBackgroundControls(readJSON())
+    }
+
+    /// Solid, See-through or Image, and which controls apply.
+    private func refreshBackgroundControls(_ json: [String: Any]) {
+        let path = (value(json, ["appearance", "backgroundImage"]) as? String).flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+        let stored = value(json, ["appearance", "backgroundOpacity"]) as? Double
+        let mode = path != nil ? 2 : ((stored ?? 1) < 0.995 ? 1 : 0)
+        backgroundPopup.selectItem(at: mode)
+        let op = stored ?? (mode == 2 ? 0.7 : 1)
+        opacity.doubleValue = op
+        opacityLabel.stringValue = "\(Int((op * 100).rounded()))%"
+        opacity.isEnabled = mode != 0
+        imageButton.isEnabled = mode == 2
+        imageFitPopup.isEnabled = mode == 2
+        imagePathLabel.stringValue = path.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "No picture"
+        let fit = (value(json, ["appearance", "backgroundImageFit"]) as? String) ?? "fill"
+        imageFitPopup.selectItem(at: AnserConfig.Appearance.imageFits.firstIndex(of: fit) ?? 0)
+        opacityNote.stringValue = mode == 2 ? "Lower shows more of the picture" : mode == 1 ? "Lower shows more of what's behind the window" : ""
+    }
+
+    @objc private func backgroundModeChanged() {
+        switch backgroundPopup.indexOfSelectedItem {
+        case 0:
+            set(["appearance", "backgroundImage"], nil)
+            set(["appearance", "backgroundOpacity"], nil)
+        case 1:
+            set(["appearance", "backgroundImage"], nil)
+            if ((value(readJSON(), ["appearance", "backgroundOpacity"]) as? Double) ?? 1) >= 0.995 { set(["appearance", "backgroundOpacity"], 0.8) }
+        default:
+            let has = (value(readJSON(), ["appearance", "backgroundImage"]) as? String).map { !$0.isEmpty } ?? false
+            if !has { chooseBackgroundImage(); return }
+        }
+        refreshBackgroundControls(readJSON())
+    }
+
+    @objc private func chooseBackgroundImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a picture to show behind the terminal"
+        let done: (NSApplication.ModalResponse) -> Void = { [self] r in
+            if r == .OK, let url = panel.url {
+                set(["appearance", "backgroundImage"], url.path)
+                if ((value(readJSON(), ["appearance", "backgroundOpacity"]) as? Double) ?? 1) >= 0.995 { set(["appearance", "backgroundOpacity"], 0.7) }
+            }
+            refreshBackgroundControls(readJSON())
+        }
+        if let w = window { panel.beginSheetModal(for: w, completionHandler: done) } else { done(panel.runModal()) }
+    }
+
+    @objc private func imageFitChanged() {
+        set(["appearance", "backgroundImageFit"], AnserConfig.Appearance.imageFits[max(0, imageFitPopup.indexOfSelectedItem)])
     }
 
     @objc private func ligaturesChanged() { set(["appearance", "ligatures"], ligatures.state == .on ? nil : false) }
