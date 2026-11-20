@@ -28,6 +28,14 @@ enum SelfTest {
             Task { @MainActor in await resizeChecks(pane, wc); finish() }
             return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "script" {
+            Task { @MainActor in await runningScriptChecks(pane); finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "theme" {
+            Task { @MainActor in await themeOverrideChecks(wc); finish() }
+            return
+        }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "processes" {
             Task { @MainActor in await processChecks(pane, wc); finish() }
             return
@@ -162,9 +170,45 @@ enum SelfTest {
         _ = await wait(8) { s.atPrompt }
     }
 
-    /// Resizing the window: the output re-wraps and the input area stays right under it.
+    /// A prompt theme that insists on running last (like powerlevel10k, sourced again with
+    /// `source ~/.zshrc`) mustn't bring its prompt or the terminal's cursor back under the input.
     @MainActor
+    static func themeOverrideChecks(_ wc: TerminalWindowController) async {
+        let theme = NSTemporaryDirectory() + "anser-selftest-theme.zsh"
+        try? """
+        _fake_theme_precmd() {
+            PROMPT=$'%~ ···· fake-theme-top\\n❯ fake-theme-line '
+            [[ ${precmd_functions[-1]} != _fake_theme_precmd ]] && precmd_functions=(${precmd_functions:#_fake_theme_precmd} _fake_theme_precmd)
+        }
+        _fake_theme_line_init() { builtin print -rn -- $'\\e[?25h' }
+        precmd_functions=(_fake_theme_do_nothing ${precmd_functions:#_fake_theme_precmd} _fake_theme_precmd)
+        _fake_theme_do_nothing() { : }
+        autoload -Uz add-zle-hook-widget && add-zle-hook-widget line-init _fake_theme_line_init
+        """.write(toFile: theme, atomically: true, encoding: .utf8)
+        wc.addTab(cwd: NSTemporaryDirectory())
+        guard let p = wc.focusedPane else { check("a prompt theme that runs last stays hidden", false, "no tab"); return }
+        _ = await wait(30) { p.session.integrated && p.session.atPrompt }
+        p.run("source \(theme) # anser-selftest")
+        _ = await wait(8) { p.session.atPrompt && p.session.blocks.last?.command.contains("anser-selftest-theme") == true }
+        p.run("echo after-theme # anser-selftest")
+        _ = await wait(8) { p.session.atPrompt && p.session.blocks.last?.command.contains("after-theme") == true }
+        await sleep(0.8)
+        let screen = p.surfaceView.viewportText() ?? ""
+        check("a prompt theme that runs last doesn't show under the input", screen.contains("after-theme") && !screen.contains("fake-theme"),
+              screen.split(separator: "\n").suffix(4).joined(separator: " ⏎ "))
+        // Anser's line-init hook runs after the theme's (which shows the cursor).
+        p.run("zstyle -a zle-line-init widgets w; print -r -- \"order=${(j:,:)${(@)${(@on)w}#<->:}}\" # anser-selftest")
+        _ = await wait(8) { p.session.atPrompt && p.session.blocks.last?.command.contains("order=") == true }
+        await sleep(0.5)
+        let order = (p.surfaceView.viewportText() ?? "").split(separator: "\n").last { $0.hasPrefix("order=") }.map(String.init) ?? ""
+        check("Anser hides the cursor after the theme shows it", order.hasSuffix("_anser_line_init") && order.contains("_fake_theme_line_init"), order)
+        wc.closeTab(wc.tabs.count - 1)
+        wc.window?.makeKeyAndOrderFront(nil)
+        try? FileManager.default.removeItem(atPath: theme)
+    }
+
     /// The sidebar's Running section and the chips about processes and ports.
+    @MainActor
     static func processChecks(_ pane: PaneView, _ wc: TerminalWindowController) async {
         let s = pane.session
         let pm = ProcessMonitor.shared
@@ -265,7 +309,23 @@ enum SelfTest {
         _ = await wait(6) { pm.scan(); return pm.items(for: pane).isEmpty }
     }
 
+    /// A script of several lines, while it runs, shows as one row in the input card (not spilling over the output).
+    @MainActor
+    static func runningScriptChecks(_ pane: PaneView) async {
+        _ = await wait(10) { pane.session.atPrompt }
+        pane.editor.setTextForTests("export ANSER_ST=1\nsleep 3\necho anser-selftest-script-done")
+        pane.editor.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+        let ok = await wait(5) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return pane.runningLabelText.contains("sleep 3") || pane.runningLabelText.contains("export") }
+        await sleep(0.3)
+        pane.layoutSubtreeIfNeeded()
+        let text = pane.runningLabelText
+        check("a running script shows as one row in the input", ok && !text.contains("\n") && pane.runningLabelFitsCard && text.contains("more") == false && text.contains("+"),
+              "\"\(text)\" fits=\(pane.runningLabelFitsCard)")
+        _ = await wait(10) { pane.session.atPrompt }
+    }
+
     /// An input taller than the pane scrolls with the wheel or trackpad.
+    @MainActor
     static func inputScrollChecks(_ pane: PaneView) async {
         let text = (1...200).map { "echo scroll-\($0) # anser-selftest" }.joined(separator: "\n")
         pane.editor.setTextForTests(text)
@@ -294,6 +354,8 @@ enum SelfTest {
         _ = await wait(2) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return pane.editor.lineCount <= 1 }
     }
 
+    /// Resizing the window: the output re-wraps and the input area stays right under it.
+    @MainActor
     static func resizeChecks(_ pane: PaneView, _ wc: TerminalWindowController) async {
         let s = pane.session
         guard let w = wc.window else { return }
@@ -3174,6 +3236,7 @@ enum SelfTest {
         await savedAndInsightsChecks(pane, wc, tmp: tmp)
         await uxReviewChecks(pane, wc, tmp: tmp)
         await processChecks(pane, wc)
+        await themeOverrideChecks(wc)
         await closeBusyTabsCheck(pane, wc, tmp: tmp)
         await runtimeChecks(pane, wc, tmp: tmp)
         await stopChecks(pane)
@@ -3319,6 +3382,7 @@ enum SelfTest {
         check("a 20,000-character command runs whole", longRan && longScrolls && longOut.contains("20001"),
               "ran=\(longRan) scroller=\(longScrolls) · \(longOut.split(separator: "\n").suffix(3).joined(separator: " ⏎ "))")
         await inputScrollChecks(pane)
+        await runningScriptChecks(pane)
         check("a long command from history doesn't cover the output", tallClear && tallBack,
               "terminal bottom \(Int(tallTerm)) · input top \(Int(tallBar)) · \(tallInfo) · back=\(tallBack)")
         // Back to the default: the input line follows the output.

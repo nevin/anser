@@ -304,6 +304,8 @@ final class PaneView: NSView, ShellSessionDelegate {
         let size = Services.shared.config.editor.fontSize
         runningLabel.font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
         runningLabel.lineBreakMode = .byTruncatingTail
+        runningLabel.maximumNumberOfLines = 1
+        runningLabel.usesSingleLineMode = true
         runningHint.font = .systemFont(ofSize: 11)
         runningHint.alignment = .right
         runningHint.stringValue = "keys go to the program"
@@ -1163,9 +1165,15 @@ final class PaneView: NSView, ShellSessionDelegate {
         let t = theme
         let secs = Date().timeIntervalSince(r.started)
         let elapsed = Services.formatDuration(secs)
-        let s = NSMutableAttributedString(string: r.command.isEmpty ? "running" : r.command, attributes: [
+        // One row: a script of several lines shows its first line and how many more.
+        let lines = r.command.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let s = NSMutableAttributedString(string: lines.first ?? "running", attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: Services.shared.config.editor.fontSize, weight: .regular),
             .foregroundColor: t.foreground.withAlphaComponent(0.85)])
+        if lines.count > 1 {
+            s.append(NSAttributedString(string: "  +\(lines.count - 1) line\(lines.count == 2 ? "" : "s")", attributes: [
+                .font: NSFont.systemFont(ofSize: 11), .foregroundColor: t.foreground.withAlphaComponent(0.5)]))
+        }
         s.append(NSAttributedString(string: "   " + elapsed, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular), .foregroundColor: t.yellow]))
         // "usually 40s": from this command's recent successful runs.
@@ -1188,6 +1196,8 @@ final class PaneView: NSView, ShellSessionDelegate {
 
     /// For tests: the running command's line ("make   12s · usually 40s").
     var runningLabelText: String { runningLabel.stringValue }
+    /// For tests: the running command's line stays inside the input card.
+    var runningLabelFitsCard: Bool { runningLabel.frame.minY >= -0.5 && runningLabel.frame.maxY <= card.bounds.height + 0.5 }
 
     /// The usual time for a command, shown only for ones that take a while.
     static func usefulTiming(for command: String) -> HistoryStore.Timing? {

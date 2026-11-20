@@ -119,6 +119,40 @@ _anser_line_finish() {
     zle reset-prompt
 }
 
+# Some prompt themes insist on running last (powerlevel10k moves its precmd hook to
+# the end every time) and put their prompt and cursor back after _anser_prompt. So
+# look again when the line editor starts, after every other line-init hook.
+_anser_line_init() {
+    [[ $_anser_prompt_mode == hidden ]] || return 0
+    if [[ $PS1 != *$'\e[?25l'* ]]; then
+        [[ $PS1 != "$_anser_transient_ps1" ]] && { _anser_user_ps1=$PS1; _anser_user_rps1=$RPS1 }
+        PS1=$'%{\e]133;A;cl=line\a%}%{\e[?25l%}%{\e]133;B\a%}'; RPS1=''
+        _anser_set_ps1=$PS1
+        zle reset-prompt
+    fi
+    # A theme's own line-init hook may have shown the cursor again.
+    builtin print -n $'\e[?25l'
+}
+
+# Keeps Anser's line-init and line-finish hooks after everyone else's
+# (zsh runs them in the order of their numbers).
+_anser_hooks_last() {
+    local hook fn e i max mine
+    local -a entries
+    for hook fn in zle-line-init _anser_line_init zle-line-finish _anser_line_finish; do
+        zstyle -a $hook widgets entries
+        (( ${#entries} )) || continue
+        max=0; mine=0
+        for e in $entries; do
+            i=${e%%:*}
+            [[ $i == <-> ]] || continue
+            if [[ ${e#*:} == $fn ]]; then mine=$i; elif (( i > max )); then max=$i; fi
+        done
+        (( mine > max )) && continue
+        zstyle $hook widgets ${entries:#<->:$fn} $((max + 1)):$fn
+    done
+}
+
 # Anser sends these when its editor is turned off / on.
 _anser_mode_full() {
     _anser_prompt_mode=full
@@ -154,8 +188,12 @@ _anser_precmd() {
             builtin bindkey -M $km $'\e[9997~' _anser_mode_default 2>/dev/null
             builtin bindkey -M $km $'\e[9990~' _anser_load 2>/dev/null
         done
-        builtin autoload -Uz add-zle-hook-widget && add-zle-hook-widget line-finish _anser_line_finish
+        builtin autoload -Uz add-zle-hook-widget && {
+            add-zle-hook-widget line-finish _anser_line_finish
+            add-zle-hook-widget line-init _anser_line_init
+        }
     fi
+    _anser_hooks_last
     # Keep _anser_prompt after prompt themes (p10k, starship…) and before Ghostty's hook.
     # The separator goes right after Ghostty's hook (once the command's output is closed).
     local -a rest=(${${precmd_functions:#_anser_prompt}:#_anser_sep_print})
