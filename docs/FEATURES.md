@@ -35,7 +35,7 @@ Settings → Profiles (or `"profiles"` in `config.json`) applies settings by ssh
 
 ## The command editor
 
-- **The input line flows with the output.** You type on the line right after the last command, on the terminal's own background, and the status row (folder, branch, hints) stays at the bottom. When the screen is full, or you scroll back, it rests just above the status row. Turn off **Settings → Editor → Input line follows the output** to keep it at the bottom.
+- **The input line flows with the output.** You type on the line right after the last command, on the terminal's own background, and the status row (folder, branch, hints) stays at the bottom. When the screen is full, or you scroll back, it rests just above the status row. While a command keeps printing, the input stays at the bottom instead of drifting down line by line, and follows the output again at the next prompt. Its ❯ sits on the terminal's first column, under the ❯ of the commands above, and pressing Enter with nothing typed does nothing (no empty ❯ rows). Turn off **Settings → Editor → Input line follows the output** to keep it at the bottom.
 
 - **Mistakes as you type.** Once you move past it, a command that doesn't exist gets a red dotted underline, with "Did you mean…" in the status row. So does a quote or bracket left open.
 - **Bracket matching.** The bracket matching the one beside the cursor is highlighted.

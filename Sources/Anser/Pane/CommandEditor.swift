@@ -373,6 +373,8 @@ final class CommandEditor: NSTextView {
             extraSelections = []
             hidePopup()
             if needsContinuation(string) { insertText("\n", replacementRange: selectedRange()); return }
+            // Nothing typed: nothing to run, and no empty "❯" row left in the output.
+            if string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, pane?.session.atPrompt == true { return }
             submit()
 
         case #selector(insertTab(_:)):

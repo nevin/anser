@@ -76,7 +76,8 @@ final class GutterView: NSView {
         let top = editor.textContainerInset.height - (scroll?.contentView.bounds.origin.y ?? 0)
         if running || (editor.lineCount <= 1 && !alwaysNumbers) {
             let glyph = running ? "" : "❯"
-            (glyph as NSString).draw(at: NSPoint(x: Self.promptInset, y: top), withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .bold), .foregroundColor: dimmed ? promptColor.withAlphaComponent(0.45) : promptColor])
+            // The same glyph and weight as the "❯ command" rows in the output; the colour still shows the last exit.
+            (glyph as NSString).draw(at: NSPoint(x: Self.promptInset, y: top), withAttributes: [.font: font, .foregroundColor: dimmed ? promptColor.withAlphaComponent(0.45) : promptColor])
             return
         }
         // Line numbers for the lines that are actually visible.

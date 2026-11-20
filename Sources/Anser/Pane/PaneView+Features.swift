@@ -71,6 +71,9 @@ extension PaneView {
         return surfaceView.frame.maxY - CGFloat(y) + CGFloat(ch)
     }
 
+    /// For tests: where the input's ❯ is drawn, in pane coordinates.
+    var inputPromptXForTest: CGFloat { gutter.convert(NSPoint(x: GutterView.promptInset, y: 0), to: self).x }
+
     /// For tests: the top of the input line's text (the band around it is see-through).
     var inputTextTopForTest: CGFloat {
         editorScroll.convert(editorScroll.bounds, to: self).maxY - editor.textContainerInset.height

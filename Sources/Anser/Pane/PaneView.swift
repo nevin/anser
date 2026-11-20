@@ -163,6 +163,12 @@ final class PaneView: NSView, ShellSessionDelegate {
     private(set) var followTop: CGFloat?
     private(set) var viewportAtBottom = true
     private var followCheckScheduled = false
+    /// While a command runs: where the input line was when it started, and whether
+    /// its output has pushed the input down long enough to pin it at the bottom.
+    private var runFollowStart: CGFloat?
+    private(set) var pinnedForRun = false
+    /// A command printing for longer than this pins the input line until the next prompt.
+    static var pinStreamingAfter: TimeInterval = 0.5
     private var followTimer: Timer?
     private var resizeSettle: DispatchWorkItem?
     private var followStillTicks = 0
@@ -426,10 +432,21 @@ final class PaneView: NSView, ShellSessionDelegate {
 
         card.isHidden = !editorEnabled
         // A little more room above the input line than below it.
-        card.frame = NSRect(x: pad, y: 4, width: max(40, w - 2 * pad), height: cardHeight)
+        // From the left edge, so the ❯ can sit on the terminal's first column (by the sidebar's border).
+        card.frame = NSRect(x: 0, y: 4, width: max(40, w - pad), height: cardHeight)
         let textH = editorTextHeight
         let gw = showRunning ? 26 : gutter.preferredWidth
-        gutter.frame = NSRect(x: 4, y: 4, width: gw, height: textH)
+        gutter.frame = NSRect(x: pad + 4, y: 4, width: gw, height: textH)
+        // One line, at the prompt: put the ❯ on the terminal's first column and the command
+        // on its third, so the input reads as the next "❯ command" row of the output above.
+        if !showRunning, !gutter.running, editor.lineCount <= 1, !gutter.alwaysNumbers, surfaceView.cellSize.width > 0 {
+            let cellW = surfaceView.cellSize.width / (window?.backingScaleFactor ?? 2)
+            let col0 = surfaceView.frame.minX + BlocksOverlayView.paddingX() - card.frame.minX
+            let textPad = editor.textContainerInset.width + (editor.textContainer?.lineFragmentPadding ?? 5)
+            let gx = col0 - GutterView.promptInset
+            let tx = col0 + 2 * cellW - textPad
+            if gx >= 0, tx - gx >= 12 { gutter.frame = NSRect(x: gx, y: 4, width: tx - gx, height: textH) }
+        }
         let ex = gutter.frame.maxX
 
         // The command gets the whole line: commands can be long.
@@ -439,7 +456,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         gutter.needsDisplay = true
 
         // Running state, inside the card.
-        spinner.frame = NSRect(x: 9, y: (card.bounds.height - 16) / 2, width: 16, height: 16)
+        spinner.frame = NSRect(x: pad + 9, y: (card.bounds.height - 16) / 2, width: 16, height: 16)
         stopButton.sizeToFit()
         // Keep the action aligned and large enough for the longer running states.
         let stopWidth = min(max(108, stopButton.frame.width), max(0, card.bounds.width - 16))
@@ -561,7 +578,18 @@ final class PaneView: NSView, ShellSessionDelegate {
         let top = hiddenPrompt ? cursorTop - cellH / 2 + textOffset : cursorTop - cellH - 2
         // Close to the bottom anyway: rest just above the status row rather than a few points over it.
         guard top - barHeight > 20 else { return nil }
-        return min(top, sf.maxY).rounded()
+        let placed = min(top, sf.maxY).rounded()
+        // A command streaming output would drag the input down line by line: once it has
+        // run a moment and its output has moved the input, pin it until the next prompt.
+        if let r = session.running {
+            if pinnedForRun { return nil }
+            if runFollowStart == nil { runFollowStart = placed }
+            if let start = runFollowStart, placed < start - 1, Date().timeIntervalSince(r.started) >= Self.pinStreamingAfter {
+                pinnedForRun = true
+                return nil
+            }
+        }
+        return placed
     }
 
     func viewportChanged(atBottom: Bool) {
@@ -1071,6 +1099,9 @@ final class PaneView: NSView, ShellSessionDelegate {
 
     func sessionDidShowPrompt(_ session: ShellSession) {
         Startup.firstPrompt()
+        // Back at a prompt: follow the output again.
+        pinnedForRun = false
+        runFollowStart = nil
         if let b = session.blocks.last, session.running == nil, b.duration != nil {
             Diagnostics.shared.log(String(format: "command end: %@ exit=%d %.2fs", HistoryStore.programName(b.command) ?? "?", b.exitCode ?? 0, b.duration ?? 0))
         }
@@ -1143,6 +1174,9 @@ final class PaneView: NSView, ShellSessionDelegate {
     }
 
     func sessionDidStartCommand(_ session: ShellSession, command: String) {
+        pinnedForRun = false
+        // Measured at the first layout while it runs (the prompt row has become "❯ command" by then).
+        runFollowStart = nil
         Diagnostics.shared.log("command start: \(HistoryStore.programName(command) ?? "?")")
         ServerMonitor.shared.wake()
         commandStartedForReconnect(command)

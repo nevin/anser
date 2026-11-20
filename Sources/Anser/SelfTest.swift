@@ -1837,7 +1837,8 @@ enum SelfTest {
         pane.frame = narrowFrame
         pane.layout()
         check("widening the pane restores the folder icon under the prompt",
-              !pane.cwdChip.isHidden && pane.cwdChip.frame.minX + pane.cwdChip.iconInset == 19)
+              !pane.cwdChip.isHidden && abs(pane.cwdChip.frame.minX + pane.cwdChip.iconInset - pane.inputPromptXForTest) < 0.5,
+              "icon at \(pane.cwdChip.frame.minX + pane.cwdChip.iconInset), ❯ at \(pane.inputPromptXForTest)")
 
         wc.window!.setFrame(savedFrame, display: true)
         pane.layoutSubtreeIfNeeded()
@@ -3048,6 +3049,39 @@ enum SelfTest {
             return pane.followTop != nil && !(pane.surfaceView.viewportText() ?? "").contains("anser-scrollback-42")
         }
         check("returning to live output restores editor following", ok)
+        // A command streaming output pins the input line at the bottom (no drifting
+        // down line by line); a silent one leaves it in place; the next prompt follows again.
+        pane.run("clear # anser-selftest")
+        _ = await wait(10) { s.atPrompt && s.blocks.last?.command.hasPrefix("clear") == true }
+        pane.run("sleep 1.5 # anser-selftest")
+        _ = await wait(5) { s.running != nil }
+        await sleep(1)
+        pane.needsLayout = true
+        pane.layoutSubtreeIfNeeded()
+        let silentStays = !pane.pinnedForRun && pane.followTop != nil
+        _ = await wait(5) { s.atPrompt }
+        pane.run("for i in 1 2 3 4 5 6 7 8; do echo stream-$i; sleep 0.25; done # anser-selftest")
+        let pinned = await wait(4) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return pane.pinnedForRun && pane.followTop == nil }
+        let pinnedTop = pane.barTopForTest
+        await sleep(0.6)
+        pane.needsLayout = true
+        pane.layoutSubtreeIfNeeded()
+        let held = pane.barTopForTest == pinnedTop && s.running != nil
+        _ = await wait(6) { s.atPrompt }
+        let resumes = await wait(3) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return !pane.pinnedForRun && pane.followTop != nil }
+        check("streaming output pins the input line until the next prompt", silentStays && pinned && held && resumes,
+              "silent stays=\(silentStays) pinned=\(pinned) held=\(held) follows again=\(resumes)")
+        // Enter with nothing typed runs nothing and leaves no bare "❯" row behind.
+        pane.editor.string = ""
+        let emptyEnterBefore = s.blocks.count
+        pane.editor.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+        await sleep(0.8)
+        check("Enter with nothing typed leaves no empty ❯ row", s.blocks.count == emptyEnterBefore && s.atPrompt, "blocks \(emptyEnterBefore) → \(s.blocks.count)")
+        // The input's ❯ sits on the terminal's first column, like the "❯ command" rows above it.
+        pane.needsLayout = true
+        pane.layoutSubtreeIfNeeded()
+        let glyphX = pane.inputPromptXForTest, col0 = pane.surfaceView.frame.minX + BlocksOverlayView.paddingX()
+        check("the input's ❯ lines up with the ❯ rows in the output", abs(glyphX - col0) < 1, "❯ at \(glyphX), column 0 at \(col0)")
         // Shift+↑/↓ at the prompt scrolls the terminal a line at a time.
         pane.editor.string = ""
         for _ in 0..<3 { pane.editor.doCommand(by: #selector(NSResponder.moveUpAndModifySelection(_:))) }
