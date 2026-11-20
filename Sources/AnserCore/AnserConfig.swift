@@ -179,9 +179,10 @@ public struct AnserConfig: Codable, Sendable {
     public var restoreDrafts: Bool = true
     /// Replace the shell's prompt with a short "❯", since the bar already shows folder and branch.
     public var compactPrompt: Bool = false
-    /// The editor sits right under the last output line until the screen
-    /// fills, instead of at the bottom of the window.
-    public var editorFollowsOutput: Bool = false
+    /// The input line sits right under the last output line until the screen
+    /// fills, instead of at the bottom; the status row stays at the bottom.
+    /// (Replaces `editorFollowsOutput`, which was off by default.)
+    public var inlineInput: Bool = true
     /// Show macOS's "Last login: …" line when a tab opens.
     public var showLoginMessage: Bool = false
     /// A thin line after each command in the scrollback with who ran it, on which Mac, and when:
@@ -293,7 +294,7 @@ public struct AnserConfig: Codable, Sendable {
         compactPrompt = try c.decodeIfPresent(Bool.self, forKey: .compactPrompt) ?? d.compactPrompt
         shellPrompt = try c.decodeIfPresent(String.self, forKey: .shellPrompt) ?? (compactPrompt ? "compact" : d.shellPrompt)
         fullscreenApps = try c.decodeIfPresent([String].self, forKey: .fullscreenApps) ?? d.fullscreenApps
-        editorFollowsOutput = try c.decodeIfPresent(Bool.self, forKey: .editorFollowsOutput) ?? d.editorFollowsOutput
+        inlineInput = try c.decodeIfPresent(Bool.self, forKey: .inlineInput) ?? d.inlineInput
         showLoginMessage = try c.decodeIfPresent(Bool.self, forKey: .showLoginMessage) ?? d.showLoginMessage
         if let on = try? c.decodeIfPresent(Bool.self, forKey: .commandSeparator) { commandSeparator = on ? "line" : "none" }
         else {
@@ -384,7 +385,7 @@ public struct AnserConfig: Codable, Sendable {
       "restoreSession": true,
       "restoreDrafts": true,
       "shellPrompt": "hidden",
-      "editorFollowsOutput": false,
+      "inlineInput": true,
       "showLoginMessage": false,
       "commandSeparator": "dotted",
       "keyTips": "always",

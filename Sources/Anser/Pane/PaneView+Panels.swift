@@ -189,11 +189,15 @@ extension PaneView {
     func snapshotBar(to path: String, includeTerminalArea: Bool = false) {
         layoutSubtreeIfNeeded()
         let rect = includeTerminalArea ? bounds
-            : NSRect(x: 0, y: bar.frame.minY, width: bounds.width, height: min(bounds.height - bar.frame.minY, bar.frame.height + (bar.floating ? 40 : 4)))
+            : NSRect(x: 0, y: 0, width: bounds.width, height: min(bounds.height, max(bar.frame.maxY, footer.frame.maxY) + (bar.floating ? 40 : 4)))
         guard let rep = bitmapImageRepForCachingDisplay(in: rect) else { return }
         // The terminal is drawn by Metal and won't appear; paint its background instead.
         let saved = surfaceView.isHidden
+        bar.snapshotFill = theme.background
+        bar.display()
         cacheDisplay(in: rect, to: rep)
+        bar.snapshotFill = nil
+        bar.needsDisplay = true
         surfaceView.isHidden = saved
         let img = NSImage(size: rect.size)
         img.lockFocus()

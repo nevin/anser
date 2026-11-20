@@ -106,7 +106,7 @@ extension PaneView {
             self?.refreshBar()
             self?.flash("Recording discarded")
         })
-        m.popUp(positioning: nil, at: NSPoint(x: recChip.frame.minX, y: recChip.frame.maxY + 2), in: bar)
+        m.popUp(positioning: nil, at: NSPoint(x: recChip.frame.minX, y: recChip.frame.maxY + 2), in: footer)
     }
 }
 

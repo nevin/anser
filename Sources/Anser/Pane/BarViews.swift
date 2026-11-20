@@ -9,7 +9,16 @@ final class BarView: NSView {
     /// Where the hints row starts (its top edge), or nil for no second line.
     var hintsLineY: CGFloat? { didSet { if hintsLineY != oldValue { needsDisplay = true } } }
 
+    /// Draws nothing: the input line sits on the terminal's own background.
+    var seamless = false { didSet { if seamless != oldValue { needsDisplay = true } } }
+    /// Snapshots can't show what's behind a view: paint the terminal background there instead.
+    var snapshotFill: NSColor?
+
     override func draw(_ dirtyRect: NSRect) {
+        if seamless {
+            if let f = snapshotFill { f.setFill(); bounds.fill() }
+            return
+        }
         if !floating {
             fill.setFill()
             bounds.fill()

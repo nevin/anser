@@ -95,13 +95,13 @@ extension PaneView {
         watchChip.onClick = { [weak self] in self?.showWatchMenu() }
         afterChip.onClick = { [weak self] in self?.showAfterMenu() }
         envChip.onClick = { [weak self] in self?.showProjectEnvMenu() }
-        bar.addSubview(nodeChip)
+        footer.addSubview(nodeChip)
         nodeChip.onClick = { [weak self] in self?.nodeChipClicked() }
         aliasChip.onClick = { [weak self] in self?.showAliasTipMenu() }
-        bar.addSubview(moreChip)
+        footer.addSubview(moreChip)
         moreChip.onClick = { [weak self] in
             guard let self, let m = self.overflowStatusMenu() else { return }
-            m.popUp(positioning: nil, at: NSPoint(x: self.moreChip.frame.minX, y: self.moreChip.frame.maxY + 2), in: self.bar)
+            m.popUp(positioning: nil, at: NSPoint(x: self.moreChip.frame.minX, y: self.moreChip.frame.maxY + 2), in: self.footer)
         }
         logChip.onClick = { [weak self] in self?.openLogViewer() }
         recChip.onClick = { [weak self] in self?.showRecordingMenu() }
@@ -250,7 +250,7 @@ extension PaneView {
         m.addItem(.separator())
         m.addItem(ClosureMenuItem(title: "Add Another…") { [weak self] in self?.promptWhenDone() })
         m.addItem(ClosureMenuItem(title: "Clear All") { [weak self] in self?.afterSteps = []; self?.refreshBar() })
-        m.popUp(positioning: nil, at: NSPoint(x: afterChip.frame.minX, y: afterChip.frame.maxY + 2), in: bar)
+        m.popUp(positioning: nil, at: NSPoint(x: afterChip.frame.minX, y: afterChip.frame.maxY + 2), in: footer)
     }
 
     // MARK: Re-run when files change
@@ -327,7 +327,7 @@ extension PaneView {
         info.isEnabled = false
         m.addItem(.separator())
         m.addItem(info)
-        m.popUp(positioning: nil, at: NSPoint(x: watchChip.frame.minX, y: watchChip.frame.maxY + 2), in: bar)
+        m.popUp(positioning: nil, at: NSPoint(x: watchChip.frame.minX, y: watchChip.frame.maxY + 2), in: footer)
     }
 
     // MARK: Failed tests
@@ -370,9 +370,9 @@ extension PaneView {
     func showFailedTestsMenu(from chip: ChipView?) {
         guard let menu = failedTestsMenu() else { flash("No failed tests from the last test run"); return }
         if let chip, !chip.isHidden {
-            menu.popUp(positioning: nil, at: NSPoint(x: chip.frame.minX, y: chip.frame.maxY + 2), in: bar)
+            menu.popUp(positioning: nil, at: NSPoint(x: chip.frame.minX, y: chip.frame.maxY + 2), in: footer)
         } else {
-            menu.popUp(positioning: nil, at: NSPoint(x: 20, y: bar.frame.maxY), in: self)
+            menu.popUp(positioning: nil, at: NSPoint(x: 20, y: footer.frame.maxY), in: self)
         }
     }
 

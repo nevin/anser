@@ -458,7 +458,7 @@ extension PaneView {
         m.addItem(.separator())
         m.addItem(ClosureMenuItem(title: "Open Aliases…") { [weak self] in AliasesWindowController.shared.show(for: self) })
         m.addItem(ClosureMenuItem(title: "Hide") { [weak self] in self?.aliasTip = nil; self?.refreshBar() })
-        m.popUp(positioning: nil, at: NSPoint(x: aliasChip.frame.minX, y: aliasChip.frame.maxY + 2), in: bar)
+        m.popUp(positioning: nil, at: NSPoint(x: aliasChip.frame.minX, y: aliasChip.frame.maxY + 2), in: footer)
     }
 
     func flushPendingShellScript() {

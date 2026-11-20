@@ -200,7 +200,7 @@ final class Services {
     func setVimForTest(_ on: Bool) { config.editor.vimMode = on }
 
     /// Exercise optional editor following without changing the config file.
-    func setEditorFollowsOutputForTest(_ on: Bool) { config.editorFollowsOutput = on }
+    func setInlineInputForTest(_ on: Bool) { config.inlineInput = on }
 
     /// Tests set profiles without touching the user's config file.
     func setProfilesForTest(_ p: [Profile]) { config.profiles = p }

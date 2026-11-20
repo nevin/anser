@@ -36,6 +36,23 @@ enum SelfTest {
             Task { @MainActor in await stopChecks(pane); finish() }
             return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "window" {
+            // A few short commands, window in front, for scripts/window-shot.sh to capture.
+            Task { @MainActor in
+                _ = await wait(15) { pane.session.integrated && pane.session.atPrompt }
+                for c in ["echo hello # anser-selftest", "ls / | head -4 # anser-selftest", "false # anser-selftest"] {
+                    pane.run(c)
+                    _ = await wait(5) { pane.session.atPrompt && pane.session.blocks.last?.command == c }
+                }
+                NSApp.activate(ignoringOtherApps: true)
+                wc.window?.makeKeyAndOrderFront(nil)
+                pane.focus()
+                await sleep(1)
+                note("input line top \(Int(pane.barTopForTest)), follows output: \(pane.followTop != nil)")
+                finish()
+            }
+            return
+        }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "profile" {
             Task { @MainActor in await profileChecks(pane, wc); finish() }
             return
@@ -149,7 +166,7 @@ enum SelfTest {
             let text = (pane.surfaceView.viewportText() ?? "").split(separator: "\n", omittingEmptySubsequences: false)
             let ob = pane.outputBottomForTest
             let clear: Bool
-            if let ob { clear = pane.followTop != nil ? pane.barTopForTest <= ob + 0.5 : pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5 } else { clear = true }
+            if let ob { clear = pane.followTop != nil ? pane.inputTextTopForTest <= ob + 1 : pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5 } else { clear = true }
             check("resize \(name): input area clear of output", clear,
                   "w=\(Int(w.frame.width)) follow=\(pane.followTop.map { "\(Int($0))" } ?? "bottom") bar top \(Int(pane.barTopForTest)) out bottom \(ob.map { "\(Int($0))" } ?? "nil") term \(Int(pane.surfaceView.frame.minY))-\(Int(pane.surfaceView.frame.maxY)) lines=\(text.count) tail=\(text.suffix(4).joined(separator: " ⏎ "))")
             let marks = pane.surfaceView.promptMarks()
@@ -1378,16 +1395,20 @@ enum SelfTest {
         check("a separator with user, Mac and time follows the command",
               vp.split(separator: "\n").contains { CommandSeparator.isSeparator(String($0)) && $0.contains(NSUserName() + "@") }, String(vp.suffix(200)))
         check("no duplicate prompt waiting in the terminal", lastLine.contains("line3"), String(lastLine))
-        pane.layoutSubtreeIfNeeded()
-        check("input bar stays at the bottom by default",
-              pane.followTop == nil && pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5)
-        Services.shared.setEditorFollowsOutputForTest(true)
         pane.needsLayout = true
         pane.layoutSubtreeIfNeeded()
-        check("editor sits right under the output when enabled", pane.followTop != nil, "followTop=\(pane.followTop.map { "\(Int($0))" } ?? "bottom")")
-        Services.shared.setEditorFollowsOutputForTest(false)
-        pane.needsLayout = true
+        check("the input line sits right under the output by default", pane.followTop != nil && pane.bar.frame.minY > pane.footer.frame.maxY,
+              "followTop=\(pane.followTop.map { "\(Int($0))" } ?? "bottom") input=\(pane.bar.frame) footer=\(pane.footer.frame)")
+        check("the status row stays at the bottom while the input line follows the output",
+              pane.footer.frame.minY == 0 && !pane.footer.isHidden && pane.cwdChip.superview === pane.footer && pane.helpButton.superview === pane.footer)
         snap(pane, "follow", full: true)
+        Services.shared.setInlineInputForTest(false)
+        pane.needsLayout = true
+        pane.layoutSubtreeIfNeeded()
+        check("with the setting off, the input line stays at the bottom",
+              pane.followTop == nil && pane.bar.frame.minY == pane.footer.frame.maxY && pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5)
+        Services.shared.setInlineInputForTest(true)
+        pane.needsLayout = true
         check("no \u{201C}Last login\u{201D} line", !(pane.surfaceView.viewportText() ?? "").contains("Last login"))
 
         // Typing: ghost text, popup, history navigation.
@@ -2352,9 +2373,9 @@ enum SelfTest {
         check("a missing command's error is printed", errRow != nil, errLines.suffix(4).joined(separator: " ⏎ "))
         if errRow != nil, let outputBottom = pane.outputBottomForTest {
             // Floating under the output: its top is below the last output line. At the bottom: the terminal ends above it.
-            let clear = pane.followTop != nil ? pane.barTopForTest <= outputBottom + 0.5 : pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5
+            let clear = pane.followTop != nil ? pane.inputTextTopForTest <= outputBottom + 1 : pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5
             check("the input area doesn't cover the error", clear,
-                  "bar top \(Int(pane.barTopForTest)) · output bottom \(Int(outputBottom)) · terminal bottom \(Int(pane.surfaceView.frame.minY))")
+                  "bar top \(Int(pane.barTopForTest)) · text top \(Int(pane.inputTextTopForTest)) · output bottom \(Int(outputBottom)) · terminal bottom \(Int(pane.surfaceView.frame.minY))")
         }
         snap(pane, "error-visible", full: true)
 
@@ -2997,8 +3018,8 @@ enum SelfTest {
         check("every visible button has a label for VoiceOver", missing.isEmpty, missing.joined(separator: ", "))
 
         // Shell clear with scrollback preserved. The live cursor moves to the top.
-        // (Following is off by default, and config reloads earlier in the test turn the override off.)
-        Services.shared.setEditorFollowsOutputForTest(true)
+        // (Config reloads earlier in the test can reset the override.)
+        Services.shared.setInlineInputForTest(true)
         pane.run("echo anser-scrollback-$((6*7)) # anser-selftest")
         _ = await wait(10) { s.atPrompt && s.blocks.last?.command.contains("anser-scrollback") == true }
         pane.run("clear -x # anser-selftest")
@@ -3008,7 +3029,7 @@ enum SelfTest {
                 && pane.followTop != nil && !(pane.surfaceView.viewportText() ?? "").contains("anser-scrollback-42")
         }
         check("shell clear leaves the editor following the live prompt", ok,
-              "follow=\(Services.shared.config.editorFollowsOutput) top=\(String(describing: pane.followTop)) full=\(pane.fullscreenProgram) exp=\(pane.editorExpanded) ed=\(pane.editorEnabled) last=\(s.blocks.last?.command ?? "")")
+              "follow=\(Services.shared.config.inlineInput) top=\(String(describing: pane.followTop)) full=\(pane.fullscreenProgram) exp=\(pane.editorExpanded) ed=\(pane.editorEnabled) last=\(s.blocks.last?.command ?? "")")
         // The terminal only reports scrolling while it draws: make sure its window is in front.
         NSApp.activate(ignoringOtherApps: true)
         wc.window?.makeKeyAndOrderFront(nil)
@@ -3034,8 +3055,8 @@ enum SelfTest {
         for _ in 0..<3 { pane.editor.doCommand(by: #selector(NSResponder.moveDownAndModifySelection(_:))) }
         let backDown = await wait(3) { pane.viewportAtBottom }
         check("Shift+↑/↓ at the prompt scrolls the terminal by lines", ok && backDown, "up=\(ok) down=\(backDown)")
-        // Back to the default: the input bar at the bottom for the rest of the run.
-        Services.shared.setEditorFollowsOutputForTest(false)
+        // Back to the default: the input line follows the output.
+        Services.shared.setInlineInputForTest(true)
         pane.needsLayout = true
 
         // ---- Clear and Deep Clean ----

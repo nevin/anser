@@ -55,7 +55,7 @@ extension PaneView {
     /// the folder chip sits in the row under the divider.
     var inputLineForTest: (editorMaxX: CGFloat, barWidth: CGFloat, folderInHintsRow: Bool) {
         let editorMaxX = card.convert(editorScroll.frame, to: bar).maxX
-        let inRow = !cwdChip.isHidden && cwdChip.frame.maxY <= Self.statusHeight
+        let inRow = !cwdChip.isHidden && cwdChip.superview === footer && cwdChip.frame.maxY <= Self.statusHeight
         return (editorMaxX, bar.bounds.width, inRow)
     }
 
@@ -67,7 +67,13 @@ extension PaneView {
         guard let surface = surfaceView.surface else { return nil }
         var x = 0.0, y = 0.0, cw = 0.0, ch = 0.0
         ghostty_surface_ime_point(surface, &x, &y, &cw, &ch)
-        return surfaceView.frame.maxY - CGFloat(y)
+        // y is the bottom of the cursor's row; the output ends at that row's top.
+        return surfaceView.frame.maxY - CGFloat(y) + CGFloat(ch)
+    }
+
+    /// For tests: the top of the input line's text (the band around it is see-through).
+    var inputTextTopForTest: CGFloat {
+        editorScroll.convert(editorScroll.bounds, to: self).maxY - editor.textContainerInset.height
     }
 
 
@@ -412,7 +418,7 @@ extension PaneView {
     }
 
     func showResultMenu() {
-        resultMenu()?.popUp(positioning: nil, at: NSPoint(x: statusChip.frame.minX, y: statusChip.frame.maxY + 4), in: bar)
+        resultMenu()?.popUp(positioning: nil, at: NSPoint(x: statusChip.frame.minX, y: statusChip.frame.maxY + 4), in: footer)
     }
 
     func resultMenu() -> NSMenu? {

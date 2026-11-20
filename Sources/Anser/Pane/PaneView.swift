@@ -11,7 +11,10 @@ final class PaneView: NSView, ShellSessionDelegate {
     let editor = CommandEditor()
     weak var windowController: TerminalWindowController?
 
+    /// The input line: right under the output while the screen isn't full, else just above the footer.
     let bar = BarView()
+    /// The status row: folder, branch, chips and hints. Always at the bottom.
+    let footer = BarView()
     let card = CardView()
     let gutter = GutterView()
     let editorScroll = NSScrollView()
@@ -117,7 +120,7 @@ final class PaneView: NSView, ShellSessionDelegate {
     private let hintLabel = NSTextField(labelWithString: "")
     /// The whole hint; the label shows as much of it as fits.
     private var hintFull = NSAttributedString()
-    private let helpButton = NSButton()
+    private(set) var helpButton = NSButton()
     var buttons: [NSButton] = []
     private let moreButton = NSButton()
     private var overflowChips: [ChipView] = []
@@ -207,6 +210,8 @@ final class PaneView: NSView, ShellSessionDelegate {
         header.isHidden = true
         addSubview(header)
         buildBar()
+        addSubview(footer)
+        bar.seamless = true
         addSubview(bar)
         surfaceView.setAccessibilityLabel("Terminal output")
         editor.setAccessibilityLabel("Command editor")
@@ -221,10 +226,10 @@ final class PaneView: NSView, ShellSessionDelegate {
 
     private func applyTheme() {
         let t = theme
-        bar.fill = t.barBackground
+        footer.fill = t.barBackground
         welcome?.applyTheme()
-        bar.separator = t.foreground.withAlphaComponent(0.2)
-        bar.needsDisplay = true
+        footer.separator = t.foreground.withAlphaComponent(0.2)
+        footer.needsDisplay = true
         gutter.numberColor = t.foreground.withAlphaComponent(0.3)
         gutter.currentColor = t.foreground.withAlphaComponent(0.75)
         editor.applyFont()
@@ -266,7 +271,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         hintLabel.font = .systemFont(ofSize: 11)
         hintLabel.lineBreakMode = .byTruncatingTail
         for v in [waitChip, reconnectChip, badgeChip, contextChip, broadcastChip, shareChip, cwdChip, branchChip, prChip, conflictChip, changesChip,
-                  serverChip, statusChip, fixChip, explainChip, hintLabel] as [NSView] { bar.addSubview(v) }
+                  serverChip, statusChip, fixChip, explainChip, hintLabel] as [NSView] { footer.addSubview(v) }
         setUpLiveChips()
         shareChip.onClick = { [weak self] in
             guard let self, let s = TabShare.share(for: self) else { return }
@@ -324,7 +329,7 @@ final class PaneView: NSView, ShellSessionDelegate {
             b.isBordered = false
             b.toolTip = tip
             b.imageScaling = .scaleProportionallyDown
-            bar.addSubview(b)
+            footer.addSubview(b)
             buttons.append(b)
         }
         button("clock.arrow.circlepath", "Search history (⌘R or ⌃R)", #selector(AppDelegate.historySearch(_:)))
@@ -341,13 +346,13 @@ final class PaneView: NSView, ShellSessionDelegate {
         moreButton.target = self
         moreButton.action = #selector(showMoreMenu)
         moreButton.isHidden = true
-        bar.addSubview(moreButton)
+        footer.addSubview(moreButton)
         helpButton.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: "Keyboard shortcuts")
         helpButton.isBordered = false
         helpButton.imageScaling = .scaleProportionallyDown
         helpButton.toolTip = "Keyboard shortcuts (⌘/)"
         helpButton.action = #selector(AppDelegate.showShortcuts(_:))
-        bar.addSubview(helpButton)
+        footer.addSubview(helpButton)
     }
 
     /// Expanded mode opens a tall editing area (about 45% of the pane),
@@ -401,7 +406,8 @@ final class PaneView: NSView, ShellSessionDelegate {
         dimView.fill = theme.background.withAlphaComponent(0.38)
         header.refresh()
 
-        bar.isHidden = fullscreenProgram
+        footer.isHidden = fullscreenProgram
+        bar.isHidden = fullscreenProgram || !editorEnabled
         if let fb = findBar {
             fb.frame.origin = NSPoint(x: max(8, w - fb.frame.width - 12), y: bounds.height - fb.frame.height - 10)
         }
@@ -409,17 +415,18 @@ final class PaneView: NSView, ShellSessionDelegate {
             let fh = min(max(160, target.height * 0.6), target.height - 8)
             fp.frame = NSRect(x: 8, y: target.maxY - fh - 6, width: max(200, w - 16), height: fh)
         }
-        let h = barHeight
+        // The footer stays at the bottom; the input line follows the output above it.
+        footer.frame = NSRect(x: 0, y: 0, width: w, height: Self.statusHeight)
+        let h = barHeight - Self.statusHeight
         followTop = computeFollowTop()
-        let barY = followTop.map { max(0, $0 - h) } ?? 0
-        bar.floating = barY > 0.5
+        let barY = followTop.map { max(Self.statusHeight, $0 - h) } ?? Self.statusHeight
+        bar.floating = barY > Self.statusHeight + 0.5
         bar.frame = NSRect(x: 0, y: barY, width: w, height: h)
         let pad: CGFloat = 10
 
         card.isHidden = !editorEnabled
         // A little more room above the input line than below it.
-        card.frame = NSRect(x: pad, y: Self.statusHeight + 4, width: max(40, w - 2 * pad), height: cardHeight)
-        bar.hintsLineY = editorEnabled ? Self.statusHeight : nil
+        card.frame = NSRect(x: pad, y: 4, width: max(40, w - 2 * pad), height: cardHeight)
         let textH = editorTextHeight
         let gw = showRunning ? 26 : gutter.preferredWidth
         gutter.frame = NSRect(x: 4, y: 4, width: gw, height: textH)
@@ -537,23 +544,24 @@ final class PaneView: NSView, ShellSessionDelegate {
     /// While the screen isn't full, the editor sits just under the last line
     /// of output instead of at the bottom, so your eyes don't jump.
     private func computeFollowTop() -> CGFloat? {
-        guard welcome?.isHidden != false, viewportAtBottom, Services.shared.config.editorFollowsOutput, editorEnabled, !fullscreenProgram, !editorExpanded,
+        guard welcome?.isHidden != false, viewportAtBottom, Services.shared.config.inlineInput, editorEnabled, !fullscreenProgram, !editorExpanded,
               let surface = surfaceView.surface, surfaceView.frame.height > 0 else { return nil }
         var x = 0.0, y = 0.0, cw = 0.0, ch = 0.0
         ghostty_surface_ime_point(surface, &x, &y, &cw, &ch)
         let sf = surfaceView.frame
-        let cellH = surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : CGFloat(max(ch, 14))
-        // y is the top of the cursor's row, measured from the top.
-        let cursorTop = sf.maxY - CGFloat(y)
-        // At a hidden prompt the cursor's row is empty: the editor takes its
-        // place. Otherwise it goes below the cursor's row.
+        // The row height in points (cellSize is in pixels).
+        let cellH = ch > 0 ? CGFloat(ch) : 17
+        // y is the bottom of the cursor's row (where an IME window would go), measured from the top.
+        let cursorTop = sf.maxY - CGFloat(y) + cellH
+        guard cursorTop <= sf.maxY + 1 else { return nil }
+        // At a hidden prompt the cursor's row is empty: the input line takes its
+        // place, its text centred on that row. Otherwise it goes below the cursor's row.
         let hiddenPrompt = session.atPrompt && session.integrated && Services.shared.config.shellPrompt == "hidden"
-        // The divider at the top of the input area sits this far below the last output line.
-        let gap: CGFloat = 6
-        let top = hiddenPrompt ? cursorTop - gap : cursorTop - cellH - gap
-        // Close to the bottom anyway: sit at the bottom (full band and divider) rather than squeezed a few points above it.
-        guard top - barHeight > 20, top < sf.maxY else { return nil }
-        return top.rounded()
+        let textOffset = (Self.cardMargin - 4) + cardHeight / 2   // input band top → middle of its text
+        let top = hiddenPrompt ? cursorTop - cellH / 2 + textOffset : cursorTop - cellH - 2
+        // Close to the bottom anyway: rest just above the status row rather than a few points over it.
+        guard top - barHeight > 20 else { return nil }
+        return min(top, sf.maxY).rounded()
     }
 
     func viewportChanged(atBottom: Bool) {
@@ -561,12 +569,12 @@ final class PaneView: NSView, ShellSessionDelegate {
         viewportAtBottom = atBottom
         // The cursor belongs to the live screen. Its position cannot place
         // the editor safely over a viewport showing older output.
-        if Services.shared.config.editorFollowsOutput { needsLayout = true }
+        if Services.shared.config.inlineInput { needsLayout = true }
     }
 
     /// Re-checks the bar position soon (coalesced; output can stream fast).
     func scheduleFollowCheck() {
-        guard Services.shared.config.editorFollowsOutput, !followCheckScheduled else { return }
+        guard Services.shared.config.inlineInput, !followCheckScheduled else { return }
         followCheckScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self else { return }
@@ -595,7 +603,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         followTimer?.invalidate()
         followTimer = nil
         followStillTicks = 0
-        guard on, Services.shared.config.editorFollowsOutput else { return }
+        guard on, Services.shared.config.inlineInput else { return }
         followTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.followTick() }
         followTimer?.tolerance = interval / 3
     }
@@ -615,7 +623,7 @@ final class PaneView: NSView, ShellSessionDelegate {
     @objc private func showMoreMenu() {
         layoutSubtreeIfNeeded()
         let m = actionsMenu()
-        m.popUp(positioning: nil, at: NSPoint(x: moreButton.frame.minX, y: moreButton.frame.maxY + 4), in: bar)
+        m.popUp(positioning: nil, at: NSPoint(x: moreButton.frame.minX, y: moreButton.frame.maxY + 4), in: footer)
     }
 
     /// The pane's actions, with their shortcuts shown the macOS way.

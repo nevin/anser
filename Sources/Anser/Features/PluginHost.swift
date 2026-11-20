@@ -393,7 +393,7 @@ extension PaneView {
         let t = theme
         while pluginChipViews.count < items.count {
             let c = ChipView()
-            bar.addSubview(c)
+            footer.addSubview(c)
             pluginChipViews.append(c)
         }
         for (i, view) in pluginChipViews.enumerated() {

@@ -163,7 +163,7 @@ extension PaneView {
         } else {
             return
         }
-        m.popUp(positioning: nil, at: NSPoint(x: envChip.frame.minX, y: envChip.frame.maxY + 2), in: bar)
+        m.popUp(positioning: nil, at: NSPoint(x: envChip.frame.minX, y: envChip.frame.maxY + 2), in: footer)
     }
 
     /// Shell → Project Environment.

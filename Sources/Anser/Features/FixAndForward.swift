@@ -62,7 +62,7 @@ extension PaneView {
         m.addItem(ClosureMenuItem(title: "Put in Editor") { [weak self] in self?.insertIntoEditor(all); self?.fixHint = nil; self?.refreshBar() })
         m.addItem(.separator())
         m.addItem(ClosureMenuItem(title: "Hide") { [weak self] in self?.fixHint = nil; self?.refreshBar() })
-        m.popUp(positioning: nil, at: NSPoint(x: hintChip.frame.minX, y: hintChip.frame.maxY + 2), in: bar)
+        m.popUp(positioning: nil, at: NSPoint(x: hintChip.frame.minX, y: hintChip.frame.maxY + 2), in: footer)
     }
 
     private func runFixHint(_ cmd: String) {
@@ -101,7 +101,7 @@ extension PaneView {
             })
         }
         guard m.numberOfItems > 0 else { return }
-        m.popUp(positioning: nil, at: NSPoint(x: forwardChip.frame.minX, y: forwardChip.frame.maxY + 2), in: bar)
+        m.popUp(positioning: nil, at: NSPoint(x: forwardChip.frame.minX, y: forwardChip.frame.maxY + 2), in: footer)
     }
 
     /// Shell → Open a Server Port on This Mac…

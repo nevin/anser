@@ -16,7 +16,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     }
 
     private let toggles: [Toggle] = [
-        Toggle(section: .editor, path: ["editorFollowsOutput"], title: "Move the input bar up to follow short output", defaultValue: false),
+        Toggle(section: .editor, path: ["inlineInput"], title: "Input line follows the output (the status row stays at the bottom)", defaultValue: true),
         Toggle(section: .editor, path: ["editor", "autoPopup"], title: "Show completions while typing", defaultValue: true),
         Toggle(section: .editor, path: ["editor", "ghostText"], title: "Suggest from history as gray text", defaultValue: true),
         Toggle(section: .editor, path: ["aiCompletions"], title: "When history has nothing, ask a local AI model (Ollama) for the gray text", defaultValue: false),
