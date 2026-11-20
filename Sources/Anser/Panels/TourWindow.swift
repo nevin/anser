@@ -20,7 +20,7 @@ final class TourWindowController: NSWindowController {
              text: "⌘R searches everything: history, this tab, what commands printed, every tab and your saved commands (⇥ changes where). ⇧⌘P finds any action by what it does (“typo”, “port”, “record”). ⌥⌘O opens the Library, where your notebook, aliases and history are managed.",
              showMe: "Open the Library", action: { LibraryWindowController.shared.show(for: nil) }),
         Page(symbol: "sidebar.left", title: "Keep things one click away",
-             text: "The sidebar (⌃⌘S) shows git changes, servers, project tasks, failed tests, containers and more. Right-click a heading to move or hide it, so it shows what you use.",
+             text: "The sidebar (⌃⌘S) shows git changes, what your tabs are running (with ports, CPU and memory), project tasks, failed tests, containers and more. Right-click a heading to move or hide it, so it shows what you use.",
              showMe: "Show the Sidebar", action: { AppDelegate.shared.toggleSidebar(nil) }),
     ]
 

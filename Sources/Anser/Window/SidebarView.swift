@@ -12,7 +12,16 @@ final class SidebarView: NSView {
     private weak var lastPane: PaneView?
     private var lastChanges: [GitChange] = []
     /// Section titles you've folded away (remembered across launches).
-    private(set) var collapsedSections: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "sidebarCollapsed") ?? [])
+    private(set) var collapsedSections: Set<String> = {
+        SidebarPrefs.renameSection("Servers", to: "Running")
+        return Set(UserDefaults.standard.stringArray(forKey: "sidebarCollapsed") ?? [])
+    }()
+    /// Rows of the Running section by process, for updating CPU and memory in place.
+    private var processRows: [pid_t: SidebarRow] = [:]
+    /// Gray labels inside the Running section, as drawn (for tests).
+    private(set) var runningSubheadings: [String] = []
+    /// Process rows as drawn ("node  :3000"), for tests.
+    private(set) var runningRowTexts: [String] = []
     /// Header titles as drawn, for tests ("GIT · 6").
     private(set) var sectionTitles: [String] = []
 
@@ -50,8 +59,12 @@ final class SidebarView: NSView {
         NotificationCenter.default.addObserver(forName: .anserPluginsChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.controller?.refreshSidebar() }
         }
-        NotificationCenter.default.addObserver(forName: ServerMonitor.changed, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.controller?.refreshSidebar() }
+        // Processes came or went: rebuild without reloading git. New numbers only: update the rows in place.
+        NotificationCenter.default.addObserver(forName: ProcessMonitor.changed, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.rebuildNow() }
+        }
+        NotificationCenter.default.addObserver(forName: ProcessMonitor.sampled, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateProcessRows() }
         }
         for name in [ContainerMonitor.changed, TunnelManager.changed, OutputWatchManager.changed] {
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -105,6 +118,9 @@ final class SidebarView: NSView {
         sectionTitles = []
         sectionStarts = []
         hiddenNow = []
+        processRows = [:]
+        runningSubheadings = []
+        runningRowTexts = []
         lastPane = pane
         lastChanges = changes
         defer { arrangeSections(); needsLayout = true }
@@ -172,19 +188,7 @@ final class SidebarView: NSView {
             }
         }
 
-        // Servers your tabs started, in every window.
-        let servers = ServerMonitor.shared.all
-        if !servers.isEmpty, section("Servers", count: servers.count) {
-            for (p, srv) in servers {
-                let tab = p.windowController.flatMap { wc in wc.tab(for: p).map { wc.title(of: $0) } } ?? ""
-                row(symbol: "server.rack", text: ":\(srv.port)  \(srv.process)", detail: tab, color: t.green,
-                    tooltip: "\(srv.url)\nClick to open · right-click to copy or stop",
-                    actions: [.init(symbol: "stop.circle", tip: "Stop \(srv.process)") { ServerMonitor.stop(pid: srv.pid) }],
-                    menu: { ServerMonitor.menu(for: srv, pane: p) }) {
-                    if let u = URL(string: srv.url) { NSWorkspace.shared.open(u) }
-                }
-            }
-        }
+        buildRunning(pane: pane)
 
         // One-click project tasks: npm scripts, Make targets, just recipes…
         if !s.isRemote, let project = ProjectTasks.find(from: s.cwd), section("Tasks", count: project.tasks.count) {
@@ -503,16 +507,37 @@ final class SidebarView: NSView {
         return !folded
     }
 
+    @discardableResult
     private func row(symbol: String, text: String, detail: String?, color: NSColor, tooltip: String? = nil,
-                     actions: [SidebarRow.Action] = [], wraps: Bool = false, highlighted: Bool = false,
-                     menu: (() -> NSMenu?)? = nil, action: (() -> Void)?) {
-        let r = SidebarRow(symbol: symbol, text: text, detail: detail, color: color, actions: actions, wraps: wraps, action: action)
+                     actions: [SidebarRow.Action] = [], wraps: Bool = false, highlighted: Bool = false, indent: CGFloat = 0,
+                     menu: (() -> NSMenu?)? = nil, action: (() -> Void)?) -> SidebarRow {
+        let r = SidebarRow(symbol: symbol, text: text, detail: detail, color: color, actions: actions, wraps: wraps, indent: indent, action: action)
         r.highlighted = highlighted
         r.menuProvider = menu
         r.toolTip = tooltip ?? text
         stack.addArrangedSubview(r)
         r.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
         rowCount += 1
+        return r
+    }
+
+    /// A small gray label inside a section ("LEFT OVER FROM CLOSED TABS").
+    private func subheading(_ text: String) {
+        let l = NSTextField(labelWithString: text.uppercased())
+        l.font = .systemFont(ofSize: 9.5, weight: .medium)
+        l.textColor = GhosttyRuntime.shared.theme.dim.withAlphaComponent(0.8)
+        let box = NSView()
+        box.translatesAutoresizingMaskIntoConstraints = false
+        l.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(l)
+        NSLayoutConstraint.activate([
+            box.heightAnchor.constraint(equalToConstant: 18),
+            l.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 27),
+            l.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -2),
+        ])
+        stack.addArrangedSubview(box)
+        box.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
+        runningSubheadings.append(text)
     }
 }
 
@@ -571,7 +596,7 @@ final class SidebarRow: NSView {
     private let actions: [Action]
     private var detailLabel: NSTextField?
 
-    init(symbol: String, text: String, detail: String?, color: NSColor, actions: [Action] = [], wraps: Bool = false, action: (() -> Void)?) {
+    init(symbol: String, text: String, detail: String?, color: NSColor, actions: [Action] = [], wraps: Bool = false, indent: CGFloat = 0, action: (() -> Void)?) {
         self.action = action
         self.actions = actions
         super.init(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
@@ -602,7 +627,7 @@ final class SidebarRow: NSView {
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         d.setContentCompressionResistancePriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6 + indent),
             icon.centerYAnchor.constraint(equalTo: centerYAnchor),
             icon.widthAnchor.constraint(equalToConstant: 14),
             label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
@@ -638,6 +663,14 @@ final class SidebarRow: NSView {
     }
 
     var actionTips: [String] { actions.map(\.tip) }
+
+    /// New detail text (CPU and memory) without rebuilding the row.
+    func setDetail(_ text: String, color: NSColor? = nil) {
+        guard let d = detailLabel, d.stringValue != text else { return }
+        d.stringValue = text
+        if let color { d.textColor = color }
+    }
+    var detailText: String { detailLabel?.stringValue ?? "" }
 
     private func updateHover() {
         guard !actions.isEmpty else { return }
@@ -721,9 +754,131 @@ enum SidebarPrefs {
         set { defaults.set(Array(newValue).sorted(), forKey: "sidebarHidden") }
     }
 
+    /// Keeps your place and hidden setting when a section is renamed.
+    static func renameSection(_ old: String, to new: String) {
+        if let i = order.firstIndex(of: old) {
+            var o = order
+            o[i] = new
+            var seen = Set<String>()
+            order = o.filter { seen.insert($0).inserted }
+        }
+        if hidden.contains(old) { var h = hidden; h.remove(old); h.insert(new); hidden = h }
+        let key = "sidebarCollapsed"
+        if var c = defaults.stringArray(forKey: key), let i = c.firstIndex(of: old) { c[i] = new; defaults.set(c, forKey: key) }
+    }
+
     static func setHidden(_ title: String, _ on: Bool) {
         var h = hidden
         if on { h.insert(title) } else { h.remove(title) }
         hidden = h
+    }
+}
+
+// MARK: Running
+
+extension SidebarView {
+    static let maxRowsPerTab = 8
+    private static let showSystemKey = "sidebarShowSystemPorts"
+
+    /// What your tabs are running, what closed tabs left behind, and other programs on ports.
+    fileprivate func buildRunning(pane: PaneView) {
+        let t = GhosttyRuntime.shared.theme
+        let pm = ProcessMonitor.shared
+        let tabs: [(PaneView, [ProcessMonitor.Item])] = AppDelegate.shared.allPanes.compactMap { p in
+            let items = pm.items(for: p)
+            return items.isEmpty ? nil : (p, items)
+        }
+        let count = tabs.reduce(0) { $0 + $1.1.count } + pm.leftovers.count
+        let open = section("Running", count: count == 0 ? nil : count)
+        // The full picture (left over, other ports) is only gathered while it shows.
+        pm.sidebar(self, showsRunning: open)
+        guard open else { return }
+
+        if tabs.isEmpty {
+            row(symbol: "checkmark.circle", text: "Nothing running in your tabs", detail: nil, color: t.dim,
+                tooltip: "Commands you start, and anything they start, show here with their CPU, memory and ports.", action: nil)
+        }
+        for (p, items) in tabs {
+            let title = p.windowController.flatMap { wc in wc.tab(for: p).map { wc.title(of: $0) } } ?? "Tab"
+            row(symbol: "terminal", text: title, detail: items.count == 1 ? nil : "\(items.count)", color: t.foreground,
+                tooltip: "Click to show this tab",
+                actions: [.init(symbol: "stop.circle", tip: "Stop everything in this tab") { ProcessMonitor.stopAll(in: p) }]) {
+                _ = AppDelegate.shared.reveal(sessionID: p.session.id)
+            }
+            for it in items.prefix(Self.maxRowsPerTab) { processRow(it, pane: p) }
+            if items.count > Self.maxRowsPerTab {
+                row(symbol: "ellipsis", text: "\(items.count - Self.maxRowsPerTab) more", detail: nil, color: t.dim,
+                    tooltip: items.dropFirst(Self.maxRowsPerTab).map(\.name).joined(separator: ", "), indent: 14, action: nil)
+            }
+        }
+
+        if !pm.leftovers.isEmpty {
+            subheading("Left over from closed tabs")
+            for it in pm.leftovers.prefix(12) { processRow(it, pane: nil) }
+            let pids = pm.leftovers.map(\.pid)
+            row(symbol: "xmark.circle", text: pids.count == 1 ? "Stop \(pm.leftovers[0].name)" : "Stop all \(pids.count)", detail: nil, color: t.dim,
+                tooltip: "Stops what closed tabs left running") { [weak self] in self?.confirmStopLeftovers(pm.leftovers) }
+        }
+
+        let showSystem = UserDefaults.standard.bool(forKey: Self.showSystemKey)
+        let other = pm.otherPorts.filter { showSystem || !$0.isSystem }
+        let systemCount = pm.otherPorts.filter(\.isSystem).count
+        if !other.isEmpty || systemCount > 0 {
+            subheading("Other programs on ports")
+            for it in other.prefix(20) { processRow(it, pane: nil) }
+            if systemCount > 0 {
+                row(symbol: showSystem ? "eye.slash" : "eye", text: showSystem ? "Hide macOS ports" : "\(systemCount) macOS port\(systemCount == 1 ? "" : "s") hidden",
+                    detail: nil, color: t.dim, tooltip: "Ports held by macOS itself (AirPlay, Handoff…). Anser lists them but never stops them.") { [weak self] in
+                    UserDefaults.standard.set(!showSystem, forKey: Self.showSystemKey)
+                    self?.rebuildNow()
+                }
+            }
+        }
+        row(symbol: "gauge.with.dots.needle.33percent", text: "All processes…", detail: nil, color: t.dim,
+            tooltip: "Opens Activity Monitor") {
+            NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"), configuration: .init())
+        }
+    }
+
+    private func processRow(_ it: ProcessMonitor.Item, pane: PaneView?) {
+        let t = GhosttyRuntime.shared.theme
+        let symbol = it.runaway != nil ? "flame" : (!it.ports.isEmpty ? "server.rack" : (it.isSystem ? "apple.logo" : "gearshape"))
+        let color: NSColor = it.runaway != nil ? .systemOrange : (it.isSystem ? t.dim : (!it.ports.isEmpty ? t.green : t.foreground))
+        let indent: CGFloat = pane == nil ? 14 : 14 + CGFloat(min(it.depth, 4) - 1) * 10
+        let label = it.app.map { app in app == it.name ? it.title : "\(app) · \(it.title)" } ?? it.title
+        let canStop = ProcessMonitor.canStop(it.pid)
+        let window = self.window
+        let first = it.ports.first
+        let r = row(symbol: symbol, text: label, detail: it.isSystem ? "macOS" : it.usageText, color: color,
+                    tooltip: it.tooltip + (pane != nil ? "\nClick to show its tab" : (first != nil ? "\nClick to open it" : "")) + " · right-click for more",
+                    actions: canStop ? [.init(symbol: "stop.circle", tip: "Stop \(it.name)") { ProcessMonitor.confirmStop(it, fromTab: pane != nil || !it.background || ProcessMonitor.shared.leftovers.contains { $0.pid == it.pid }, over: window) }] : [],
+                    indent: indent, menu: { ProcessMonitor.menu(for: it, pane: pane, over: window) }) {
+            if let pane { _ = AppDelegate.shared.reveal(sessionID: pane.session.id) }
+            else if let first, let u = URL(string: first.url) { NSWorkspace.shared.open(u) }
+        }
+        processRows[it.pid] = r
+        runningRowTexts.append(label)
+    }
+
+    /// New CPU and memory numbers, written into the rows already showing.
+    fileprivate func updateProcessRows() {
+        guard !processRows.isEmpty else { return }
+        let pm = ProcessMonitor.shared
+        let all = pm.byTab.values.flatMap { $0 } + pm.leftovers
+        for it in all { processRows[it.pid]?.setDetail(it.usageText) }
+    }
+
+    /// The text a process row shows on its right (for tests).
+    func processRowDetail(_ pid: pid_t) -> String? { processRows[pid]?.detailText }
+
+    private func confirmStopLeftovers(_ items: [ProcessMonitor.Item]) {
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = items.count == 1 ? "Stop \(items[0].name)?" : "Stop \(items.count) processes left over from closed tabs?"
+        a.informativeText = items.prefix(8).map { "\($0.name) (process \($0.pid))" }.joined(separator: "\n") + (items.count > 8 ? "\n…" : "")
+        a.addButton(withTitle: "Stop")
+        a.addButton(withTitle: "Cancel")
+        let go: (NSApplication.ModalResponse) -> Void = { if $0 == .alertFirstButtonReturn { ProcessMonitor.stop(items.map(\.pid)) } }
+        if let window { a.beginSheetModal(for: window, completionHandler: go) } else { go(a.runModal()) }
     }
 }

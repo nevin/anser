@@ -105,6 +105,8 @@ final class CommandEditor: NSTextView {
         drawsBackground = false
         isVerticallyResizable = true
         isHorizontallyResizable = false
+        // No cap on height: a long input grows past the box and scrolls (the default cap is the starting frame).
+        maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         autoresizingMask = [.width]
         textContainerInset = NSSize(width: 0, height: 3)
         registerForDraggedTypes([.fileURL, .string])

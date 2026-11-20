@@ -28,6 +28,14 @@ enum SelfTest {
             Task { @MainActor in await resizeChecks(pane, wc); finish() }
             return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "processes" {
+            Task { @MainActor in await processChecks(pane, wc); finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "tallinput" {
+            Task { @MainActor in await inputScrollChecks(pane); finish() }
+            return
+        }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "editor" {
             Task { @MainActor in await fileEditorChecks(pane); finish() }
             return
@@ -156,6 +164,136 @@ enum SelfTest {
 
     /// Resizing the window: the output re-wraps and the input area stays right under it.
     @MainActor
+    /// The sidebar's Running section and the chips about processes and ports.
+    static func processChecks(_ pane: PaneView, _ wc: TerminalWindowController) async {
+        let s = pane.session
+        let pm = ProcessMonitor.shared
+        func scanned() async { await withCheckedContinuation { c in pm.scan { c.resume() } } }
+        _ = await wait(10) { s.atPrompt }
+        pm.forceDetail = true
+        defer { pm.forceDetail = false; pm.cpuSeconds = 120 }
+
+        // A background job shows under its tab, with its memory.
+        pane.run("sleep 611 & echo anser-selftest-bg")
+        var ok = await wait(8) { s.atPrompt }
+        var found = false
+        for _ in 0..<12 where !found { await sleep(0.5); await scanned(); found = pm.items(for: pane).contains { $0.name == "sleep" } }
+        check("a background job shows under its tab", found, pm.items(for: pane).map(\.name).joined(separator: ", "))
+        wc.sidebar.refresh(for: pane)
+        ok = await wait(4) { wc.sidebar.runningRowTexts.contains("sleep") }
+        let bg = pm.items(for: pane).first { $0.name == "sleep" }
+        check("the sidebar's Running section lists it with its memory", ok && wc.sidebar.sectionTitles.contains { $0.hasPrefix("RUNNING") }
+              && (bg.flatMap { wc.sidebar.processRowDetail($0.pid) }?.hasSuffix("MB") ?? false),
+              wc.sidebar.sectionTitles.joined(separator: ", ") + " · " + wc.sidebar.runningRowTexts.joined(separator: ", "))
+        // Something you double-forked from this tab still belongs to it; one from a tab you closed is left over.
+        pane.run("( sleep 612 & ) ; echo anser-selftest-detached")
+        _ = await wait(8) { s.atPrompt }
+        var mine = false
+        for _ in 0..<12 where !mine { await sleep(0.5); await scanned(); mine = pm.items(for: pane).contains { $0.commandLine == "sleep 612" } }
+        check("a process detached from a tab still shows under it", mine, pm.items(for: pane).map { $0.commandLine ?? $0.name }.joined(separator: ", "))
+        let all = Dictionary(ProcessScan.all().map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
+        let shellP = all[s.shellPID]
+        check("the shell's own helpers (prompt, git status) aren't listed", !pm.items(for: pane).contains { $0.name == "zsh" || $0.name == "git" },
+              "shell \(s.shellPID) pgid \(shellP?.pgid ?? 0) tty \(shellP?.tty ?? 0) · " + pm.items(for: pane).map { i in
+                  let p = all[i.pid]
+                  return "\(i.name)[\(i.pid) ppid \(p?.ppid ?? 0) pgid \(p?.pgid ?? 0) tty \(p?.tty ?? 0) sid \(getsid(i.pid)) d\(i.depth)]"
+              }.joined(separator: ", "))
+        wc.addTab(cwd: NSTemporaryDirectory())
+        let other = wc.focusedPane!
+        _ = await wait(30) { other.session.integrated && other.session.atPrompt }
+        await scanned()
+        other.run("( nohup sleep 613 >/dev/null 2>&1 & ) ; echo anser-selftest-leaves-one")
+        _ = await wait(8) { other.session.atPrompt }
+        var before = false
+        for _ in 0..<6 where !before { await sleep(0.5); await scanned(); before = pm.items(for: other).contains { $0.commandLine == "sleep 613" } }
+        let beforeInfo = "before closing: under its tab \(before), output " + String((other.surfaceView.viewportText() ?? "").suffix(120)).replacingOccurrences(of: "\n", with: " ⏎ ")
+        wc.closeTab(wc.tabs.count - 1)
+        wc.window?.makeKeyAndOrderFront(nil)
+        var left = false
+        for _ in 0..<12 where !left { await sleep(0.5); await scanned(); left = pm.leftovers.contains { $0.commandLine == "sleep 613" } }
+        let otherShell = other.session.shellPID
+        check("a process left by a closed tab shows as left over", left, pm.leftovers.map { $0.commandLine ?? $0.name }.joined(separator: ", ")
+              + " · \(beforeInfo) · closed shell \(otherShell) remembered \(pm.remembers(shell: otherShell)) · "
+              + ProcessScan.all().filter { $0.name == "sleep" }.map { "sleep[\($0.pid) ppid \($0.ppid) pgid \($0.pgid) sid \(getsid($0.pid)) tty \($0.tty) age \(Int(Date().timeIntervalSince($0.started)))]" }.joined(separator: ", "))
+        wc.sidebar.rebuildNow()
+        check("left-over processes get their own heading", wc.sidebar.runningSubheadings.contains("Left over from closed tabs"),
+              wc.sidebar.runningSubheadings.joined(separator: ", "))
+        let sidebarWasOpen = wc.sidebarVisible
+        if !sidebarWasOpen { wc.toggleSidebar() }
+        wc.sidebar.rebuildNow()
+        await sleep(0.4)
+        snapView(wc.sidebar, "sidebar-running")
+        if !sidebarWasOpen { wc.toggleSidebar() }
+        let leftPIDs = pm.leftovers.filter { $0.commandLine == "sleep 613" }.map(\.pid)
+        await withCheckedContinuation { c in ProcessMonitor.stop(leftPIDs) { c.resume() } }
+        check("stopping a left-over process ends it", !leftPIDs.isEmpty && leftPIDs.allSatisfy { kill($0, 0) != 0 } && !pm.leftovers.contains { $0.commandLine == "sleep 613" })
+        check("Anser won't stop its own shells or macOS", !ProcessMonitor.canStop(s.shellPID) && !ProcessMonitor.canStop(getpid()) && !ProcessMonitor.canStop(1))
+
+        // A background process keeping a core busy gets a chip.
+        pm.cpuSeconds = 2
+        pane.run("yes anser-selftest > /dev/null & echo started")
+        _ = await wait(8) { s.atPrompt }
+        ok = false
+        for _ in 0..<12 where !ok {
+            await sleep(1); await scanned(); pane.refreshBar(); pane.layoutSubtreeIfNeeded()
+            ok = pane.heavyChip.text.hasPrefix("yes ·") && pane.heavyChip.text.hasSuffix("% CPU")
+        }
+        check("a process running away gets a chip", ok, pane.heavyChip.text + " · " + pm.items(for: pane).map { "\($0.name) \(Int($0.cpu))%" }.joined(separator: ", "))
+        snap(pane, "runaway-chip")
+        await withCheckedContinuation { c in ProcessMonitor.stopAll(in: pane) { c.resume() } }
+        ok = await wait(5) { pane.refreshBar(); return pm.items(for: pane).isEmpty && pane.heavyChip.text.isEmpty }
+        check("Stop everything in this tab ends its jobs", ok, pm.items(for: pane).map(\.name).joined(separator: ", "))
+        pm.cpuSeconds = 120
+
+        // A command fails because its port is taken: the chip names what has it, and frees it.
+        let port = 49000 + Int.random(in: 0..<900)
+        pane.run("python3 -m http.server \(port) --bind 127.0.0.1 >/dev/null 2>&1 & echo anser-selftest-holder")
+        _ = await wait(8) { s.atPrompt }
+        var holding = false
+        for _ in 0..<20 where !holding { await sleep(0.5); await scanned(); holding = pm.items(for: pane).contains { $0.ports.contains { $0.port == port } } }
+        check("a server started in the background shows with its port", holding, pm.items(for: pane).map(\.title).joined(separator: ", "))
+        pane.run("python3 -m http.server \(port) --bind 127.0.0.1 # anser-selftest")
+        ok = await wait(12) { pane.portBusy?.owner != nil }
+        pane.layoutSubtreeIfNeeded()
+        check("a port-in-use failure names what holds the port", ok && pane.portChip.text.contains(":\(port) is taken by"),
+              pane.portChip.text + " · " + (s.blocks.last?.command ?? ""))
+        snap(pane, "port-busy-chip")
+        if let b = pane.portBusy { pane.freePortAndRetry(b, rerun: false) }
+        ok = await wait(8) { pane.portBusy == nil && !pm.items(for: pane).contains { !$0.ports.isEmpty } }
+        check("the chip stops what holds the port", ok, pm.items(for: pane).map(\.title).joined(separator: ", "))
+        ProcessMonitor.stopAll(in: pane)
+        _ = await wait(6) { pm.scan(); return pm.items(for: pane).isEmpty }
+    }
+
+    /// An input taller than the pane scrolls with the wheel or trackpad.
+    static func inputScrollChecks(_ pane: PaneView) async {
+        let text = (1...200).map { "echo scroll-\($0) # anser-selftest" }.joined(separator: "\n")
+        pane.editor.setTextForTests(text)
+        _ = await wait(3) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return pane.editor.lineCount >= 100 }
+        pane.editor.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+        pane.editor.scrollRangeToVisible(pane.editor.selectedRange())
+        await sleep(0.2)
+        let sv = pane.editorScroll
+        let shown = sv.contentSize.height, content = pane.editor.frame.height
+        let atEnd = sv.contentView.bounds.origin.y
+        // A real wheel event, sent to whatever is under the pointer in the middle of the input.
+        var target = "nothing"
+        if let cg = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: 8, wheel2: 0, wheel3: 0),
+           let ev = NSEvent(cgEvent: cg), let root = pane.window?.contentView {
+            let pt = root.convert(sv.convert(NSPoint(x: sv.bounds.midX, y: sv.bounds.midY), to: nil), from: nil)
+            if let hit = root.hitTest(root.superview.map { root.convert(pt, to: $0) } ?? pt) {
+                target = String(describing: Swift.type(of: hit))
+                hit.scrollWheel(with: ev)
+            }
+        }
+        await sleep(0.3)
+        let after = sv.contentView.bounds.origin.y
+        check("a long input scrolls", content > shown + 50 && atEnd > 0 && after < atEnd - 1,
+              "content \(Int(content)) shown \(Int(shown)) at end \(Int(atEnd)) after wheel \(Int(after)) · wheel went to \(target)")
+        pane.editor.setTextForTests("")
+        _ = await wait(2) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return pane.editor.lineCount <= 1 }
+    }
+
     static func resizeChecks(_ pane: PaneView, _ wc: TerminalWindowController) async {
         let s = pane.session
         guard let w = wc.window else { return }
@@ -3035,6 +3173,7 @@ enum SelfTest {
         await uiChecks(pane, wc, live: live, tmp: tmp)
         await savedAndInsightsChecks(pane, wc, tmp: tmp)
         await uxReviewChecks(pane, wc, tmp: tmp)
+        await processChecks(pane, wc)
         await closeBusyTabsCheck(pane, wc, tmp: tmp)
         await runtimeChecks(pane, wc, tmp: tmp)
         await stopChecks(pane)
@@ -3179,6 +3318,7 @@ enum SelfTest {
         let longOut = pane.surfaceView.viewportText() ?? ""
         check("a 20,000-character command runs whole", longRan && longScrolls && longOut.contains("20001"),
               "ran=\(longRan) scroller=\(longScrolls) · \(longOut.split(separator: "\n").suffix(3).joined(separator: " ⏎ "))")
+        await inputScrollChecks(pane)
         check("a long command from history doesn't cover the output", tallClear && tallBack,
               "terminal bottom \(Int(tallTerm)) · input top \(Int(tallBar)) · \(tallInfo) · back=\(tallBack)")
         // Back to the default: the input line follows the output.

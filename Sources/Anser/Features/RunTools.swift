@@ -151,6 +151,7 @@ extension PaneView {
 
     func commandStartedForRunTools(_ command: String) {
         if fixHint != nil { fixHint = nil }
+        if portBusy != nil { portBusy = nil }
         if let w = fileWatch, command != w.command { w.quietUntil = .distantFuture }
     }
 
@@ -171,6 +172,7 @@ extension PaneView {
             self.checkTestFailures(b, output: out)
             self.checkHabit(b)
             self.checkFixHint(b)
+            self.checkPortInUse(b, output: out)
         }
     }
 

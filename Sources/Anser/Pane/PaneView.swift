@@ -57,6 +57,13 @@ final class PaneView: NSView, ShellSessionDelegate {
     static let maxExtraChips = 4
     private var fadeWork: DispatchWorkItem?
     let forwardChip = ChipView()
+    /// ":3000 is taken by node" after a command fails because its port is in use.
+    let portChip = ChipView()
+    /// A process this tab started is running away (a whole core for minutes, or GBs of memory).
+    let heavyChip = ChipView()
+    var portBusy: PortBusy?
+    /// Runaway processes you said to leave alone.
+    var heavyIgnored = Set<pid_t>()
     /// What fixed this command last time it failed (from history).
     var fixHint: (command: String, steps: [String])?
     /// Ports a program in this ssh tab announced, and the ones forwarded to this Mac.
@@ -531,7 +538,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         let y = ((Self.statusHeight - Self.chipHeight) / 2).rounded()
         let onInputLine: [ChipView] = []
         let chips = ([cwdChip, recChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, badgeChip, contextChip, envChip, nodeChip, broadcastChip, shareChip, branchChip, prChip, conflictChip, changesChip,
-                     serverChip, statusChip, testsChip, fixChip, hintChip, explainChip, aliasChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
+                     portChip, heavyChip, serverChip, statusChip, testsChip, fixChip, hintChip, explainChip, aliasChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
         let moreX = w - pad - 18
         buttons.forEach { $0.isHidden = true }
         moreButton.isHidden = false
@@ -549,7 +556,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         let room = rowEnd - spacing - rowStart
         // Recording, sharing and typing in all panes affect privacy or where input goes: they come first and never fold into +N.
         let mustShow: [ChipView] = [recChip, shareChip, broadcastChip]
-        let priorities = (mustShow + [cwdChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, hintChip, badgeChip, contextChip, conflictChip, statusChip, testsChip, serverChip,
+        let priorities = (mustShow + [cwdChip, waitChip, reconnectChip, afterChip, watchChip, logChip, forwardChip, hintChip, badgeChip, contextChip, conflictChip, portChip, statusChip, testsChip, heavyChip, serverChip,
                           envChip, nodeChip, fixChip, aliasChip, branchChip, changesChip, prChip, explainChip] + pluginChipViews).filter { c in !onInputLine.contains { $0 === c } }
         var active = priorities.filter { !$0.text.isEmpty }.map { ($0, $0.preferredWidth) }
         // Keep the row calm: the folder and branch, plus the most important few.
@@ -1216,6 +1223,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         if session.running == nil { sshTarget = nil }
         clearWaiting()
         ServerMonitor.shared.wake()
+        ProcessMonitor.shared.wake()
         PluginHost.shared.refresh(self)
         PluginHost.shared.commandFinished(in: self)
         commandFinishedForRunTools()
@@ -1273,6 +1281,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         runFollowStart = nil
         Diagnostics.shared.log("command start: \(HistoryStore.programName(command) ?? "?")")
         ServerMonitor.shared.wake()
+        ProcessMonitor.shared.wake()
         commandStartedForReconnect(command)
         commandStartedForRunTools(command)
         commandStartedForHabits(command)

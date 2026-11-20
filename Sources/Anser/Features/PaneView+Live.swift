@@ -27,6 +27,7 @@ extension PaneView {
         contextChip.onClick = { [weak self] in self?.showContextMenu() }
         reconnectChip.onClick = { [weak self] in self?.showReconnectMenu() }
         setUpRunToolChips()
+        setUpProcessChips()
         NotificationCenter.default.addObserver(forName: ServerMonitor.changed, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshBar() }
         }
@@ -73,6 +74,7 @@ extension PaneView {
         }
         refreshContextChip(layout: false)
         refreshRunToolChips()
+        refreshProcessChips()
         refreshPluginChips()
     }
 
