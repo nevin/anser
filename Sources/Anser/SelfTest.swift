@@ -28,6 +28,10 @@ enum SelfTest {
             Task { @MainActor in await resizeChecks(pane, wc); finish() }
             return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "perf" {
+            Task { @MainActor in await perfChecks(pane, wc); finish() }
+            return
+        }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "script" {
             Task { @MainActor in await runningScriptChecks(pane); finish() }
             return
@@ -63,8 +67,19 @@ enum SelfTest {
                 NSApp.activate(ignoringOtherApps: true)
                 wc.window?.makeKeyAndOrderFront(nil)
                 pane.focus()
+                let shotEnv = ProcessInfo.processInfo.environment
+                // Optional window size ("700x400"), to see a narrow or short window.
+                if let size = shotEnv["ANSER_SHOT_SIZE"]?.split(separator: "x").compactMap({ Double($0) }), size.count == 2, let w = wc.window {
+                    w.setContentSize(NSSize(width: size[0], height: size[1]))
+                    await sleep(0.5)
+                }
+                // Optional command left running (or finished) when the picture is taken.
+                if let cmd = shotEnv["ANSER_SHOT_RUN"], !cmd.isEmpty {
+                    pane.run(cmd.replacingOccurrences(of: "\\n", with: "\n"))
+                    await sleep(Double(shotEnv["ANSER_SHOT_WAIT"] ?? "") ?? 2)
+                }
                 // Optional text in the input, e.g. a long command, to see how it looks.
-                if let t = ProcessInfo.processInfo.environment["ANSER_SHOT_INPUT"], !t.isEmpty { pane.editor.setTextForTests(t.replacingOccurrences(of: "\\n", with: "\n")) }
+                if let t = shotEnv["ANSER_SHOT_INPUT"], !t.isEmpty { pane.editor.setTextForTests(t.replacingOccurrences(of: "\\n", with: "\n")) }
                 await sleep(1)
                 if !pane.editor.string.isEmpty { note("input \(pane.editor.string.debugDescription) issues \(pane.editor.issues.map(\.message))") }
                 note("input line top \(Int(pane.barTopForTest)), follows output: \(pane.followTop != nil)")
@@ -196,6 +211,14 @@ enum SelfTest {
         let screen = p.surfaceView.viewportText() ?? ""
         check("a prompt theme that runs last doesn't show under the input", screen.contains("after-theme") && !screen.contains("fake-theme"),
               screen.split(separator: "\n").suffix(4).joined(separator: " ⏎ "))
+        // The terminal's own cursor: hidden at a prompt (you type in Anser's input), shown for a running program.
+        p.refreshBar()
+        let hiddenAtPrompt = p.surfaceView.cursorHidden
+        p.run("read -t 3 x; echo anser-selftest-read")
+        let shownWhileRunning = await wait(3) { p.session.running != nil && !p.surfaceView.cursorHidden }
+        let hiddenAfter = await wait(8) { p.session.atPrompt && p.surfaceView.cursorHidden }
+        check("the terminal's cursor is hidden at a prompt and shown for a running program", hiddenAtPrompt && shownWhileRunning && hiddenAfter,
+              "prompt \(hiddenAtPrompt) running \(shownWhileRunning) after \(hiddenAfter)")
         // Anser's line-init hook runs after the theme's (which shows the cursor).
         p.run("zstyle -a zle-line-init widgets w; print -r -- \"order=${(j:,:)${(@)${(@on)w}#<->:}}\" # anser-selftest")
         _ = await wait(8) { p.session.atPrompt && p.session.blocks.last?.command.contains("order=") == true }
@@ -508,7 +531,7 @@ enum SelfTest {
     }
 
     @MainActor
-    private static func wait(_ timeout: Double, _ cond: () -> Bool) async -> Bool {
+    static func wait(_ timeout: Double, _ cond: () -> Bool) async -> Bool {
         let start = Date()
         while !cond() {
             if Date().timeIntervalSince(start) > timeout { return false }
@@ -536,7 +559,7 @@ enum SelfTest {
     }
 
     @MainActor
-    private static func sleep(_ s: Double) async { try? await Task.sleep(nanoseconds: UInt64(s * 1e9)) }
+    static func sleep(_ s: Double) async { try? await Task.sleep(nanoseconds: UInt64(s * 1e9)) }
 
     /// Types text into the editor the way keystrokes do.
     @MainActor
@@ -2636,6 +2659,10 @@ enum SelfTest {
               !BlocksOverlayView.markFits(command: String(repeating: "x", count: 300), cellWidth: 8, markStart: 900)
                 && BlocksOverlayView.markFits(command: "ls", cellWidth: 8, markStart: 900)
                 && !BlocksOverlayView.markFits(command: "echo a\necho b", cellWidth: 8, markStart: 900))
+        // A theme's right-side prompt on the same row keeps the time and result marks off it.
+        check("marks stay off text on the right of a row",
+              BlocksOverlayView.textFits("❯ ls   ", cellWidth: 8, padding: 10, markStart: 900)
+                && !BlocksOverlayView.textFits("╰─(22:36:19)──> false" + String(repeating: " ", count: 80) + "(Fri,Nov20)─╯", cellWidth: 8, padding: 10, markStart: 900))
 
         // ---- Output search ----
         pane.run("echo anser-needle-$((40+2))-found # anser-selftest")

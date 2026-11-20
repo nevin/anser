@@ -7,6 +7,8 @@ dir="${1:-$root/build/selftest}"
 mkdir -p "$dir"; rm -f "$dir"/*.png "$dir/results.txt"
 # A throwaway config folder, so the test never touches your settings.
 cfg="$(mktemp -d)"
+# Optional starting settings, e.g. CONFIG='{"keepShellsRunning":false}'
+if [[ -n "${CONFIG:-}" ]]; then mkdir -p "$cfg/anser"; printf '%s' "$CONFIG" > "$cfg/anser/config.json"; fi
 XDG_CONFIG_HOME="$cfg" ANSER_SELFTEST_ONLY="${ANSER_SELFTEST_ONLY:-}" ANSER_SELFTEST="$dir/results.txt" "$root/build/Anser.app/Contents/MacOS/Anser" >/dev/null 2>&1 &
 pid=$!
 for _ in $(seq 1 300); do [[ -f "$dir/results.txt" ]] && break; sleep 1; done

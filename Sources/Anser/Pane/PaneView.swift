@@ -176,6 +176,8 @@ final class PaneView: NSView, ShellSessionDelegate {
     /// The terminal is shorter to make room for an input of several lines.
     private var roomForTallInput = false
     private var inputWasEmpty = true
+    /// The input's line count at the last layout (typing re-lays out the pane only when it changes).
+    private var laidOutEditorLines = 1
     private(set) var viewportAtBottom = true
     private var followCheckScheduled = false
     /// While a command runs: where the input line was when it started, and whether
@@ -427,6 +429,11 @@ final class PaneView: NSView, ShellSessionDelegate {
     }
 
     override func layout() {
+        PerfProbe.time("pane layout") { layoutPane() }
+    }
+
+
+    private func layoutPane() {
         super.layout()
         let w = bounds.width
         let headerH = showsHeader && !fullscreenProgram ? Self.headerHeight : 0
@@ -885,7 +892,9 @@ final class PaneView: NSView, ShellSessionDelegate {
         // "Edit & retry" shows only while the input is empty: refresh when that flips.
         let empty = editor.string.isEmpty
         if empty != inputWasEmpty { inputWasEmpty = empty; refreshBar() }
-        needsLayout = true
+        // The pane's layout depends on how many lines the input has, not on what they say.
+        let lines = editor.lineCount
+        if lines != laidOutEditorLines { laidOutEditorLines = lines; needsLayout = true }
         gutter.needsDisplay = true
         // Keep the caret visible inside a tall editor.
         editor.scrollRangeToVisible(editor.selectedRange())
@@ -934,7 +943,6 @@ final class PaneView: NSView, ShellSessionDelegate {
                                         attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: theme.yellow]))
             setHintText(s)
             hintLabel.toolTip = tip + "\nTips show once. Turn them off in Settings → Editor → Keyboard tips."
-            needsLayout = true
             if tipShownAt == nil {
                 tipShownAt = Date()
                 let shown = tip
@@ -962,6 +970,8 @@ final class PaneView: NSView, ShellSessionDelegate {
     var hintText: String { hintFull.string }
 
     private func setHintText(_ s: NSAttributedString) {
+        // Typing calls this on every key: lay out again only when the hint really changed.
+        guard !s.isEqual(to: hintFull) else { return }
         hintFull = s
         hintLabel.attributedStringValue = s
         needsLayout = true
@@ -1019,7 +1029,6 @@ final class PaneView: NSView, ShellSessionDelegate {
         s.append(NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: color.withAlphaComponent(0.85)]))
         setHintText(s)
         hintLabel.toolTip = text
-        needsLayout = true
     }
 
     private func setHint(_ title: String?, _ detail: String?, keys: Bool = false) {
@@ -1043,7 +1052,6 @@ final class PaneView: NSView, ShellSessionDelegate {
             s.append(NSAttributedString(string: detail, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: t.foreground.withAlphaComponent(0.45)]))
         }
         setHintText(s)
-        needsLayout = true
     }
 
     // MARK: State
@@ -1052,6 +1060,8 @@ final class PaneView: NSView, ShellSessionDelegate {
         let s = session
         let t = theme
         let dim = t.foreground.withAlphaComponent(0.55)
+        // At a prompt you type in Anser's input: the terminal's own cursor would only be a stray box.
+        surfaceView.cursorHidden = editorEnabled && s.integrated && s.atPrompt && s.running == nil && !fullscreenProgram
         if s.isRemote {
             cwdChip.set(symbol: "network", text: (s.remoteHost ?? "") + ":" + PathDisplay.short(s.remoteCwd ?? "~", max: 30), color: t.cyan,
                         tooltip: "ssh session on \(s.remoteHost ?? "a remote host") — the editor and history work here too")
@@ -1287,6 +1297,8 @@ final class PaneView: NSView, ShellSessionDelegate {
 
     func sessionDidStartCommand(_ session: ShellSession, command: String) {
         pinnedForRun = false
+        // The program gets the terminal, cursor included.
+        surfaceView.cursorHidden = false
         // Measured at the first layout while it runs (the prompt row has become "❯ command" by then).
         runFollowStart = nil
         Diagnostics.shared.log("command start: \(HistoryStore.programName(command) ?? "?")")

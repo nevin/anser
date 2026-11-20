@@ -18,6 +18,8 @@ public struct InlineImageFilter: Sendable {
 
     /// Feeds output; returns what to show now (images already converted).
     public mutating func feed(_ data: Data) -> Data {
+        // Almost all output has no picture in it: hand it straight back.
+        if !inImage, pending.isEmpty, !Self.mayHoldImage(data) { return data }
         var out = Data()
         var buf = pending + [UInt8](data)
         pending = []
@@ -59,6 +61,27 @@ public struct InlineImageFilter: Sendable {
             i = esc + 1
         }
         return out
+    }
+
+    /// Whether `data` has the start of an iTerm2 picture ("ESC ] 1337;File="), or may have
+    /// one cut off at its end. One memchr pass: no copying.
+    static func mayHoldImage(_ data: Data) -> Bool {
+        data.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+            let n = raw.count
+            var i = 0
+            while i < n, let hit = memchr(base + i, 0x1b, n - i) {
+                let at = UnsafeRawPointer(hit) - UnsafeRawPointer(base)
+                let rest = n - at
+                // Compare as much of the marker as there is.
+                let k = min(rest, marker.count)
+                var same = true
+                for j in 1..<k where base[at + j] != marker[j] { same = false; break }
+                if same { return true }
+                i = at + 1
+            }
+            return false
+        }
     }
 
     static func terminator(in b: [UInt8], from: Int) -> (start: Int, after: Int)? {

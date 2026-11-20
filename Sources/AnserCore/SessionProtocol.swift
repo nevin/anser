@@ -118,13 +118,7 @@ public struct ReplayBuffer: Sendable {
         // Track the alternate screen, including sequences split across reads:
         // whichever of "on" / "off" came last wins.
         let scan = tail + d
-        var lastOn: Int?, lastOff: Int?
-        for (on, seq) in Self.altSequences {
-            guard let r = scan.range(of: seq, options: .backwards) else { continue }
-            let at = r.lowerBound - scan.startIndex
-            if on { lastOn = max(lastOn ?? -1, at) } else { lastOff = max(lastOff ?? -1, at) }
-        }
-        if lastOn != nil || lastOff != nil { alternateScreen = (lastOn ?? -1) > (lastOff ?? -1) }
+        if let on = Self.lastAlternateSwitch(in: scan) { alternateScreen = on }
         tail = scan.suffix(16)
         if data.count > limit {
             // Drop the oldest part, starting again at a line break (or else an
@@ -143,6 +137,30 @@ public struct ReplayBuffer: Sendable {
             data.removeSubrange(data.startIndex..<(data.startIndex + at))
         }
     }
+
+    /// The last "alternate screen on/off" sequence in `data` (true = on), found in one
+    /// memchr pass over its escape bytes (output is full of colors: this runs on every read).
+    static func lastAlternateSwitch(in data: Data) -> Bool? {
+        data.withUnsafeBytes { raw -> Bool? in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            let n = raw.count
+            var found: Bool?
+            var i = 0
+            while i < n, let hit = memchr(base + i, 0x1b, n - i) {
+                let at = UnsafeRawPointer(hit) - UnsafeRawPointer(base)
+                i = at + 1
+                guard at + 2 < n, base[at + 1] == 0x5b, base[at + 2] == 0x3f else { continue }   // "ESC [ ?"
+                for (on, seq) in altBytes where at + seq.count <= n {
+                    var same = true
+                    for j in 3..<seq.count where base[at + j] != seq[j] { same = false; break }
+                    if same { found = on; break }
+                }
+            }
+            return found
+        }
+    }
+
+    static let altBytes: [(on: Bool, seq: [UInt8])] = altSequences.map { ($0.on, [UInt8]($0.seq)) }
 
     static let altSequences: [(on: Bool, seq: Data)] = [
         (true, Data("\u{1b}[?1049h".utf8)), (false, Data("\u{1b}[?1049l".utf8)),

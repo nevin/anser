@@ -46,6 +46,21 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
         }
         updateTrackingAreas()
         registerForDraggedTypes([.fileURL])
+        NotificationCenter.default.addObserver(forName: .anserThemeChanged, object: nil, queue: .main) { [weak self] _ in
+            // A reloaded config was just applied to every tab: put the hidden cursor back where it was.
+            MainActor.assumeIsolated { if self?.cursorHidden == true { self?.applyCursorConfig() } }
+        }
+    }
+
+    /// Hides the terminal's own cursor (while you type in Anser's input at a prompt).
+    var cursorHidden = false {
+        didSet { if cursorHidden != oldValue { applyCursorConfig() } }
+    }
+
+    private func applyCursorConfig() {
+        let rt = GhosttyRuntime.shared
+        guard let surface, let cfg = cursorHidden ? rt.hiddenCursorConfig : rt.config else { return }
+        ghostty_surface_update_config(surface, cfg)
     }
 
     // Files dropped on the terminal: their paths (or, in an ssh tab, an offer to upload them).

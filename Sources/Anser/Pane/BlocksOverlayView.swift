@@ -307,6 +307,13 @@ final class BlocksOverlayView: NSView {
     }
 
     /// Whether "❯ command" on its row ends clear of a mark starting at `markStart`.
+    /// Whether a terminal row's text ends well before `markStart` (trailing spaces don't count).
+    static func textFits(_ row: String, cellWidth: CGFloat, padding: CGFloat, markStart: CGFloat) -> Bool {
+        let text = row.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+        let cells = text.unicodeScalars.reduce(0) { $0 + ($1.properties.isEmojiPresentation || ($1.value >= 0x1100 && $1.value <= 0xFFDC && $1.properties.isIdeographic) ? 2 : 1) }
+        return padding + CGFloat(cells) * cellWidth + 12 < markStart
+    }
+
     static func markFits(command: String, cellWidth: CGFloat, markStart: CGFloat) -> Bool {
         let firstLine = command.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
         guard !command.contains("\n") else { return false }
@@ -345,7 +352,11 @@ final class BlocksOverlayView: NSView {
         let pill = NSRect(x: bounds.width - size.width - 22, y: b.top + max(0, (b.rowHeight - size.height - 2) / 2), width: size.width + 12, height: size.height + 2)
         // Never cover text: skip the mark when the command line reaches it
         // (the hover strip still shows the result).
-        if let cmd = b.info?.command, !Self.markFits(command: cmd, cellWidth: pane?.surfaceView.cellSize.width ?? 8, markStart: pill.minX) { return }
+        // Reads what's really on that row: a theme's prompt or right-side prompt (RPROMPT) can reach further than the command.
+        let cellW = (pane?.surfaceView.cellSize.width ?? 16) / (window?.backingScaleFactor ?? 2)
+        if b.rowHeight > 0, let text = pane?.surfaceView.rowText(Int((b.top / b.rowHeight).rounded(.down))) {
+            if !Self.textFits(text, cellWidth: cellW, padding: Self.paddingX(), markStart: pill.minX) { return }
+        } else if let cmd = b.info?.command, !Self.markFits(command: cmd, cellWidth: cellW, markStart: pill.minX) { return }
         // A backing so a long command line under it stays readable around it.
         t.background.setFill()
         NSBezierPath(roundedRect: pill, xRadius: 4, yRadius: 4).fill()

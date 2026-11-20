@@ -188,24 +188,23 @@ final class CommandEditor: NSTextView {
 
     override func didChangeText() {
         super.didChangeText()
-        highlight()
-        updateGhost()
+        PerfProbe.time("highlight+lint") { highlight() }
+        PerfProbe.time("ghost text") { updateGhost() }
         if !programmatic { aiNote = nil }
-        pane?.editorContentChanged()
-        pane?.updateHint()
+        PerfProbe.time("chips") { pane?.editorContentChanged() }
+        PerfProbe.time("hint") { pane?.updateHint() }
         if !programmatic, !multiEditing {
             resetHistoryNavigation()
-            if inlineHistory { refreshInlineHistory() } else { scheduleCompletion(explicit: false) }
+            PerfProbe.time("history/completion") { if inlineHistory { refreshInlineHistory() } else { scheduleCompletion(explicit: false) } }
         }
     }
 
     override func setSelectedRange(_ charRange: NSRange, affinity: NSSelectionAffinity, stillSelecting: Bool) {
         super.setSelectedRange(charRange, affinity: affinity, stillSelecting: stillSelecting)
-        updateGhost()
-        if !stillSelecting { pane?.updateHint() }
+        PerfProbe.time("caret: ghost") { updateGhost() }
+        if !stillSelecting { PerfProbe.time("caret: hint") { pane?.updateHint() } }
         if charRange != lastExpanded { selectionStack.removeAll() }
-        updateBracketMatch()
-        applyIssueStyles()
+        PerfProbe.time("caret: brackets+issues") { updateBracketMatch(); applyIssueStyles() }
         needsDisplay = true
     }
 
@@ -240,7 +239,7 @@ final class CommandEditor: NSTextView {
         }
         ts.endEditing()
         typingAttributes = [.font: font, .foregroundColor: theme.foreground]
-        lint()
+        PerfProbe.time("lint") { lint() }
     }
 
     private func updateGhost() {

@@ -359,13 +359,20 @@ final class Daemon {
     private func readShell(_ s: Session) {
         // At most 1 MB per turn: a shell printing nonstop (with nobody attached
         // to slow it down) must not keep every other tab waiting.
-        for _ in 0..<16 {
-            if let c = s.client, (clients[c]?.pending ?? 0) > Self.maxBehind { return }
+        // A pty hands out about 1 KB per read: gather this turn's reads into one frame
+        // (one replay update, one message), not a frame per kilobyte.
+        var chunk = Data()
+        defer {
+            if !chunk.isEmpty {
+                s.replay.append(chunk)
+                if let c = s.client { send(c, SessionProtocol.frame(.output, chunk)) }
+            }
+        }
+        for _ in 0..<1024 {
+            if let c = s.client, (clients[c]?.pending ?? 0) + chunk.count > Self.maxBehind { return }
             let n = read(s.master, &readBuffer, readBuffer.count)
             if n > 0 {
-                let d = Data(readBuffer[0..<n])
-                s.replay.append(d)
-                if let c = s.client { send(c, SessionProtocol.frame(.output, d)) }
+                chunk.append(readBuffer, count: n)
                 continue
             }
             if n < 0, errno == EAGAIN || errno == EINTR { return }
@@ -512,14 +519,17 @@ func attachMain() -> Never {
         if fds[1].revents != 0 {
             let n = read(sock, &buf, buf.count)
             if n <= 0 { if n < 0 && errno == EINTR { continue }; finish(1, "Anser's session helper stopped; this shell has ended") }
+            // One write for everything this read brought (the shell's output arrives in many small frames).
+            var shown = Data()
             for (kind, payload) in decoder.append(Data(buf[0..<n])) {
                 switch kind {
-                case .output: writeAll(1, images.feed(payload))
-                case .exit: finish(SessionProtocol.parseExit(payload))
-                case .error: finish(1, String(decoding: payload, as: UTF8.self))
+                case .output: shown.append(images.feed(payload))
+                case .exit: if !shown.isEmpty { writeAll(1, shown) }; finish(SessionProtocol.parseExit(payload))
+                case .error: if !shown.isEmpty { writeAll(1, shown) }; finish(1, String(decoding: payload, as: UTF8.self))
                 default: break
                 }
             }
+            if !shown.isEmpty { writeAll(1, shown) }
         }
     }
 }
