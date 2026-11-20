@@ -214,6 +214,7 @@ Settings → Profiles (or `"profiles"` in `config.json`) applies settings by ssh
 - **Clipboard history skips huge copies** (over 1 MB) and keeps 16 MB at most.
 - **Freed memory goes back to macOS** after big output, after closing a tab or Deep Clean, and 10 seconds after you switch to another app.
 - **When macOS reports memory pressure,** Anser keeps far less output, drops caches and trims clipboard history right away.
+- **Hidden tabs don't hold graphics memory.** A tab you can't see draws nothing and keeps no frame buffers; after 10 seconds hidden it also lets go of its last picture. With 10 tabs open that's about half the memory (193 MB → 89 MB).
 - **Scrollback per tab** (Settings → Sessions & Windows: 2, 10, 50 or 100 MB) is the biggest cost when many tabs are open. Lower it if you keep lots of tabs.
 - **Help → Report a Problem** shows Anser's memory now and at its peak, and how long the last startup took (also written to `~/Library/Logs/Anser/anser.log`).
 - **Battery.** Anser checks the clipboard less often while it's in the background, updates hidden tabs' running timers less often, and skips the 20-second window save when nothing changed.
@@ -345,6 +346,7 @@ You can switch to the imported theme and font in the same step. Themes go to `~/
 - **AI help (off by default):** see above.
 - **Open a command's output in its own window** from its hover strip: scroll, find (⌘F), copy or export it.
 - **Problem reports:** crashes, UI hangs and recent activity are logged locally in `~/Library/Logs/Anser`. Help → Report a Problem builds a report you review and copy; nothing is uploaded.
+- **Shift+↑ / Shift+↓** scroll the terminal a line at a time, at the prompt or while a command runs (not in full-screen programs; in a command of several lines they select text).
 - **Find** in scrollback with ⌘F, using Ghostty's own search.
 - **This tab's commands** (⌘B, the This tab scope of Search): every command you ran, with exit status and duration. ⏎ jumps to it; ⌃Return opens its actions. Copy output, edit and retry, export, or save to Notebook. ⌘↑/⌘↓ jumps between prompts.
 - **Safe by default:**

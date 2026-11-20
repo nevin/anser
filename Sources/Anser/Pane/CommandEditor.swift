@@ -395,6 +395,14 @@ final class CommandEditor: NSTextView {
             if caretOnLastLine, historyIndex >= 0 { historyForward(); return }
             super.doCommand(by: selector)
 
+        // Shift+↑/↓ scrolls the terminal above; in a command of several lines it still selects.
+        case #selector(moveUpAndModifySelection(_:)), #selector(moveDownAndModifySelection(_:)):
+            if !popup.isVisible, !string.contains("\n"), let surface = pane?.surfaceView {
+                surface.scrollLines(selector == #selector(moveUpAndModifySelection(_:)) ? -1 : 1)
+                return
+            }
+            super.doCommand(by: selector)
+
         case #selector(scrollPageUp(_:)), #selector(pageUp(_:)):
             if popup.isVisible { popup.move(-8); popupUserNavigated = true; return }
             super.doCommand(by: selector)

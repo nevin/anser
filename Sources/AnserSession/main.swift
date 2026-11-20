@@ -354,13 +354,16 @@ final class Daemon {
         if ev & Int16(POLLIN | POLLHUP | POLLERR) != 0 { readShell(s) }
     }
 
+    private var readBuffer = [UInt8](repeating: 0, count: 65536)
+
     private func readShell(_ s: Session) {
-        var buf = [UInt8](repeating: 0, count: 65536)
-        while true {
+        // At most 1 MB per turn: a shell printing nonstop (with nobody attached
+        // to slow it down) must not keep every other tab waiting.
+        for _ in 0..<16 {
             if let c = s.client, (clients[c]?.pending ?? 0) > Self.maxBehind { return }
-            let n = read(s.master, &buf, buf.count)
+            let n = read(s.master, &readBuffer, readBuffer.count)
             if n > 0 {
-                let d = Data(buf[0..<n])
+                let d = Data(readBuffer[0..<n])
                 s.replay.append(d)
                 if let c = s.client { send(c, SessionProtocol.frame(.output, d)) }
                 continue

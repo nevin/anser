@@ -36,6 +36,17 @@ enum SelfTest {
             Task { @MainActor in await stopChecks(pane); finish() }
             return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "profile" {
+            Task { @MainActor in await profileChecks(pane, wc); finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "busytabs" {
+            Task { @MainActor in
+                _ = await wait(15) { pane.session.integrated && pane.session.atPrompt }
+                await closeBusyTabsCheck(pane, wc, tmp: NSTemporaryDirectory()); finish()
+            }
+            return
+        }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "hang" {
             Task { @MainActor in await hangChecks(); finish() }
             return
@@ -253,6 +264,10 @@ enum SelfTest {
         memoryLog.append(String(format: "%5.0f MB peak · %5.0f MB now   %@", Double(memorySampler.takePeak()) / 1_048_576,
                                 Double(MemoryUse.footprint().current) / 1_048_576, name))
     }
+    /// A measurement line (not a pass or fail).
+    static func note(_ text: String) { lines.append("INFO  " + text) }
+    static func pass(_ name: String) { check(name, true) }
+    static func fail(_ name: String, _ detail: String = "") { check(name, false, detail) }
     private static var memoryLog: [String] = []
     private static let memorySampler = MemorySampler()
 
@@ -994,6 +1009,16 @@ enum SelfTest {
         for p in busy { wc.close(p) }
         let secs = Date().timeIntervalSince(started)
         check("closing six tabs that flood their titles doesn't freeze", busy.count == 6 && secs < 5, String(format: "%d tabs in %.2fs", busy.count, secs))
+        // And their shells really end (one left printing would keep the helper busy for good).
+        let ids = Set(busy.map(\.session.id))
+        var left: Set<String> = []
+        var ended = false
+        for _ in 0..<16 {
+            left = await Task.detached { SessionHost.shared.liveIDs() }.value.intersection(ids)
+            if left.isEmpty { ended = true; break }
+            await sleep(0.5)
+        }
+        check("closing busy tabs ends their shells", ended, "\(left.count) of \(ids.count) still running")
     }
 
     /// Each project's Node version and virtualenv, the pip fix, and the pre-started shell for new tabs.
@@ -3002,6 +3027,13 @@ enum SelfTest {
             return pane.followTop != nil && !(pane.surfaceView.viewportText() ?? "").contains("anser-scrollback-42")
         }
         check("returning to live output restores editor following", ok)
+        // Shift+↑/↓ at the prompt scrolls the terminal a line at a time.
+        pane.editor.string = ""
+        for _ in 0..<3 { pane.editor.doCommand(by: #selector(NSResponder.moveUpAndModifySelection(_:))) }
+        ok = await wait(3) { !pane.viewportAtBottom }
+        for _ in 0..<3 { pane.editor.doCommand(by: #selector(NSResponder.moveDownAndModifySelection(_:))) }
+        let backDown = await wait(3) { pane.viewportAtBottom }
+        check("Shift+↑/↓ at the prompt scrolls the terminal by lines", ok && backDown, "up=\(ok) down=\(backDown)")
         // Back to the default: the input bar at the bottom for the rest of the run.
         Services.shared.setEditorFollowsOutputForTest(false)
         pane.needsLayout = true

@@ -1,0 +1,32 @@
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 95e708344..fde2a103c 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -318,10 +318,9 @@ fn drainMailbox(self: *Thread) !void {
+                 // draw. Going through renderCallback also reschedules
+                 // any Kitty graphics animation wakeup that lapsed
+                 // while we were invisible.
+-                if (v) _ = renderCallback(self, undefined, undefined, {});
+-
+-                // Notify the renderer so it can update any state.
++                // The renderer learns first: it doesn't draw while hidden.
+                 self.renderer.setVisible(v);
++                if (v) _ = renderCallback(self, undefined, undefined, {});
+ 
+                 // Note that we're explicitly today not stopping any
+                 // cursor timers, draw timers, etc. These things have very
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index 2e01d9b66..8f1875503 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -1694,6 +1694,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             const sync_display_link = locked: {
+                 self.draw_mutex.lockUncancelable(global.io());
+                 defer self.draw_mutex.unlock(global.io());
++                // A hidden surface doesn't draw, even when its layer asks to
++                // (a bounds change on macOS): drawing would rebuild the swap
++                // chain that hiding released. Becoming visible redraws.
++                if (!self.visible) break :locked false;
+                 break :locked try self.drawFrameLocked(sync);
+             };
+ 

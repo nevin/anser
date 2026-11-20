@@ -42,6 +42,8 @@ final class PanePool {
     private func refill() {
         guard isEnabled, spare == nil, !AppDelegate.shared.isTerminating else { return }
         spare = PaneView(cwd: nil)
+        // Not on screen: no GPU frame buffers until it's used.
+        spare?.surfaceView.setVisible(false)
         signature = Self.currentSignature
     }
 
@@ -57,6 +59,7 @@ final class PanePool {
             if let env = Profile.resolve(Services.shared.config.profiles, host: nil, cwd: cwd)?.env, !env.isEmpty { return nil }
         }
         spare = nil
+        p.surfaceView.setVisible(true)
         if let cwd, cwd != p.session.cwd {
             let shell = ProjectEnv.Shell(p.session.env.shell)
             _ = p.sendToShell((shell == .fish ? "cd " : "builtin cd -- ") + ProjectEnv.q(cwd, shell) + " 2>/dev/null\n")

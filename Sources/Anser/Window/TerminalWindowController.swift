@@ -527,8 +527,15 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             window?.title = title(of: tab)
             window?.representedURL = URL(fileURLWithPath: pane.session.cwd)
         }
-        tabBar.reload()
+        // Titles can change many times a second: redraw the tab bar once per turn.
+        guard !tabBarReloadPending else { return }
+        tabBarReloadPending = true
+        DispatchQueue.main.async { [weak self] in
+            self?.tabBarReloadPending = false
+            self?.tabBar.reload()
+        }
     }
+    private var tabBarReloadPending = false
 
     // MARK: Splits
 

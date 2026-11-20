@@ -127,12 +127,20 @@ public struct ReplayBuffer: Sendable {
         if lastOn != nil || lastOff != nil { alternateScreen = (lastOn ?? -1) > (lastOff ?? -1) }
         tail = scan.suffix(16)
         if data.count > limit {
-            // Drop the oldest part, starting again at a line break so the
-            // replay never begins halfway through an escape sequence.
-            var cut = data.count - limit
-            let start = data.startIndex + cut
-            if let nl = data[start...].firstIndex(of: 0x0A) { cut = nl - data.startIndex + 1 }
-            data.removeSubrange(data.startIndex..<(data.startIndex + min(cut, data.count)))
+            // Drop the oldest part, starting again at a line break (or else an
+            // escape sequence's start) so the replay never begins halfway through one.
+            // Trim an extra eighth so this runs once per limit/8 bytes, not every read,
+            // and look only a little way ahead: output without line breaks (a title
+            // flood) used to scan the whole buffer on every read.
+            let cut = data.count - (limit - limit / 8)
+            let window = min(4096, data.count - cut)
+            let at: Int = data.withUnsafeBytes { raw in
+                let p = raw.baseAddress! + cut
+                if let nl = memchr(p, 0x0A, window) { return cut + (UnsafeRawPointer(nl) - UnsafeRawPointer(p)) + 1 }
+                if let esc = memchr(p, 0x1B, window) { return cut + (UnsafeRawPointer(esc) - UnsafeRawPointer(p)) }
+                return cut
+            }
+            data.removeSubrange(data.startIndex..<(data.startIndex + at))
         }
     }
 

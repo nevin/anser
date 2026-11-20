@@ -4,6 +4,8 @@ import AnserCore
 
 /// Owns the single libghostty app instance and routes its callbacks.
 final class GhosttyRuntime {
+    private static let titleLock = NSLock()
+    private static var pendingTitles: [ObjectIdentifier: String] = [:]
     static let shared = GhosttyRuntime()
 
     private(set) var app: ghostty_app_t?
@@ -172,7 +174,22 @@ final class GhosttyRuntime {
                     DispatchQueue.main.async { pane?.session.handleRemote(token: token, fields) }
                     return true
                 }
-                DispatchQueue.main.async { pane?.titleChanged(title) }
+                // A program can set its title thousands of times a second: keep only
+                // the latest per pane, so the main thread handles one update at a time.
+                guard let view else { return true }
+                let key = ObjectIdentifier(view)
+                Self.titleLock.lock()
+                let scheduled = Self.pendingTitles[key] != nil
+                Self.pendingTitles[key] = title
+                Self.titleLock.unlock()
+                if !scheduled {
+                    DispatchQueue.main.async {
+                        Self.titleLock.lock()
+                        let latest = Self.pendingTitles.removeValue(forKey: key)
+                        Self.titleLock.unlock()
+                        if let latest { pane?.titleChanged(latest) }
+                    }
+                }
             }
             return true
         case GHOSTTY_ACTION_PWD:

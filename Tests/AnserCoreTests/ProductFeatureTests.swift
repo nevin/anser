@@ -382,6 +382,17 @@ final class SessionProtocolTests: XCTestCase {
         r.append(Data("\u{1b}[?1049l".utf8))
         XCTAssertFalse(r.alternateScreen)
     }
+
+    func testReplayBufferStaysFastWithoutLineBreaks() {
+        // A title flood: no line breaks at all. Used to rescan the whole buffer on every read.
+        var r = ReplayBuffer()
+        let chunk = Data(String(repeating: "\u{1b}]2;anser-selftest 12345\u{07}", count: 2500).utf8)
+        let start = Date()
+        for _ in 0..<400 { r.append(chunk) }   // ~27 MB
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2)
+        XCTAssertLessThanOrEqual(r.data.count, r.limit)
+        XCTAssertEqual(r.data.first, 0x1B, "starts at an escape sequence")
+    }
 }
 
 final class SSHConfigTests: XCTestCase {

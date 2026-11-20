@@ -1211,8 +1211,10 @@ final class PaneView: NSView, ShellSessionDelegate {
     private var titleFromProgram = false
 
     func titleChanged(_ t: String) {
+        let fromProgram = session.running != nil && !t.contains(session.running?.command ?? "\u{0}")
+        guard t != title || fromProgram != titleFromProgram else { return }
         title = t
-        titleFromProgram = session.running != nil && !t.contains(session.running?.command ?? "\u{0}")
+        titleFromProgram = fromProgram
         windowController?.paneTitleChanged(self)
     }
 

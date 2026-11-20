@@ -105,15 +105,41 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
         updateScale()
     }
 
-    /// Hidden tabs tell Ghostty they're not visible so it can stop drawing them.
+    /// False while this view's tab isn't the one shown.
+    private(set) var tabVisible = true
+
+    /// Hidden tabs tell Ghostty they're not visible so it stops drawing them and
+    /// frees their GPU frame buffers (rebuilt when the tab is shown again).
     func setVisible(_ visible: Bool) {
-        guard let surface else { return }
-        ghostty_surface_set_occlusion(surface, visible && (window?.occlusionState.contains(.visible) ?? true))
+        tabVisible = visible
+        updateOcclusion()
+        frameDrop?.cancel()
+        frameDrop = nil
+        guard !visible else { return }
+        // Tabs you flip between keep their last frame, so they show at once.
+        let work = DispatchWorkItem { [weak self] in self?.dropHeldFrame() }
+        frameDrop = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.frameDropDelay, execute: work)
+    }
+    private var frameDrop: DispatchWorkItem?
+    static var frameDropDelay: TimeInterval = 10
+
+    /// Drops the last frame a hidden tab's layer still holds (a window-sized
+    /// GPU image). Ghostty draws a new one when the tab is shown again.
+    @discardableResult
+    func dropHeldFrame() -> Int {
+        guard !tabVisible, let layer else { return 0 }
+        var n = 0
+        for l in [layer] + (layer.sublayers ?? []) where l.contents != nil { l.contents = nil; n += 1 }
+        return n
     }
 
-    @objc private func occlusionChanged() {
-        guard let surface, let window else { return }
-        ghostty_surface_set_occlusion(surface, window.occlusionState.contains(.visible))
+    /// The window being covered, minimized or uncovered must not wake hidden tabs.
+    @objc private func occlusionChanged() { updateOcclusion() }
+
+    private func updateOcclusion() {
+        guard let surface else { return }
+        ghostty_surface_set_occlusion(surface, tabVisible && (window?.occlusionState.contains(.visible) ?? true))
     }
 
     override func viewDidChangeBackingProperties() {
@@ -167,6 +193,11 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
         // At a prompt with the command editor on, typing belongs in the editor.
         if let pane, pane.redirectKeyToEditor(event) { return }
         guard let surface else { interpretKeyEvents([event]); return }
+        // Shift+↑/↓ scrolls by a line, except in full-screen programs (vim, less…), which get the key.
+        if let lines = Self.shiftScrollLines(event), pane?.fullscreenProgram != true {
+            scrollLines(lines)
+            return
+        }
         pane?.noteRawTyping()
 
         // Which modifiers should be used to translate text (handles option-as-alt).
@@ -488,6 +519,19 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
     }
 
     // MARK: Edit actions
+
+    /// -1 for Shift+↑, 1 for Shift+↓ (no other modifiers), else nil.
+    static func shiftScrollLines(_ event: NSEvent) -> Int? {
+        guard event.modifierFlags.intersection([.shift, .control, .option, .command]) == .shift else { return nil }
+        switch event.keyCode {
+        case 126: return -1   // up arrow
+        case 125: return 1    // down arrow
+        default: return nil
+        }
+    }
+
+    /// Scrolls the terminal's scrollback by whole lines (negative is up).
+    func scrollLines(_ n: Int) { binding("scroll_page_lines:\(n)") }
 
     @discardableResult
     func binding(_ action: String) -> Bool {
