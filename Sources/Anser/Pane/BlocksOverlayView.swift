@@ -201,7 +201,7 @@ final class BlocksOverlayView: NSView {
 
     /// Separator labels sit on the row or two above each prompt.
     private func findSeparatorRules(_ marks: [ghostty_prompt_mark_s]) -> [SeparatorRule] {
-        guard Services.shared.config.commandSeparator != "none", let pane, let surface = pane.surfaceView.surface else { return [] }
+        guard !["none", "time"].contains(Services.shared.config.commandSeparator), let pane, let surface = pane.surfaceView.surface else { return [] }
         let size = ghostty_surface_size(surface)
         let scale = pane.window?.backingScaleFactor ?? 2
         let cellW = CGFloat(size.cell_width_px) / scale
@@ -261,6 +261,17 @@ final class BlocksOverlayView: NSView {
             }
             path.stroke()
         }
+        // "time" style: a faint line between commands instead of a separator row.
+        if Services.shared.config.commandSeparator == "time" {
+            let line = NSBezierPath()
+            for b in blocks where b.top > 2 && b.info != nil {
+                line.move(to: NSPoint(x: padX, y: b.top.rounded() + 0.5 / scale))
+                line.line(to: NSPoint(x: bounds.width - padX, y: b.top.rounded() + 0.5 / scale))
+            }
+            line.lineWidth = 1 / scale
+            t.foreground.withAlphaComponent(0.12).setStroke()
+            line.stroke()
+        }
         for b in blocks {
             let color: NSColor
             if b.running { color = t.yellow }
@@ -304,15 +315,33 @@ final class BlocksOverlayView: NSView {
         return CGFloat(cells) * cellWidth + 16 < markStart
     }
 
+    static let timeFormat: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
+    }()
+
+    /// "16:38:45" (and "on host" over SSH) for the "time" separator style.
+    func timeLabel(_ b: Block) -> String? {
+        guard Services.shared.config.commandSeparator == "time", let info = b.info, !b.running else { return nil }
+        var s = Self.timeFormat.string(from: info.started)
+        if let pane, pane.session.isRemote, let host = pane.sshTarget { s = host + " · " + s }
+        return s
+    }
+
     private func drawResultMark(_ b: Block) {
-        guard bounds.width > 320, let text = resultMark(b) else { return }
+        let mark = resultMark(b), time = timeLabel(b)
+        guard bounds.width > 320, mark != nil || time != nil else { return }
         let t = GhosttyRuntime.shared.theme
         let failed = (b.info?.exitCode ?? 0) != 0 && !b.running
         let color: NSColor = b.running ? t.yellow : (failed ? t.red : t.foreground.withAlphaComponent(0.4))
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: failed ? .semibold : .regular),
                                                     .foregroundColor: color]
-        let s = text as NSString
-        let size = s.size(withAttributes: attrs)
+        let s = NSMutableAttributedString(string: mark ?? "", attributes: attrs)
+        if let time {
+            s.append(NSAttributedString(string: (mark == nil ? "" : "  ") + time,
+                                        attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular),
+                                                     .foregroundColor: t.foreground.withAlphaComponent(0.32)]))
+        }
+        let size = s.size()
         let pill = NSRect(x: bounds.width - size.width - 22, y: b.top + max(0, (b.rowHeight - size.height - 2) / 2), width: size.width + 12, height: size.height + 2)
         // Never cover text: skip the mark when the command line reaches it
         // (the hover strip still shows the result).
@@ -322,9 +351,10 @@ final class BlocksOverlayView: NSView {
         NSBezierPath(roundedRect: pill, xRadius: 4, yRadius: 4).fill()
         if failed {
             t.red.withAlphaComponent(0.14).setFill()
-            NSBezierPath(roundedRect: pill, xRadius: 4, yRadius: 4).fill()
+            NSBezierPath(roundedRect: mark == nil ? pill : NSRect(x: pill.minX, y: pill.minY, width: NSAttributedString(string: mark!, attributes: attrs).size().width + 12, height: pill.height),
+                         xRadius: 4, yRadius: 4).fill()
         }
-        s.draw(at: NSPoint(x: pill.minX + 6, y: pill.minY + 1), withAttributes: attrs)
+        s.draw(at: NSPoint(x: pill.minX + 6, y: pill.minY + 1))
     }
 
     // MARK: Right-click menu

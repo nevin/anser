@@ -22,6 +22,17 @@ public struct TipEngine: Sendable {
 
     public init(state: State = State()) { self.state = state }
 
+    /// The shortcuts in the key-tips row under the input. Each drops out once
+    /// you've used it a few times, and the row goes away when you know them all.
+    public static let keyTips: [(key: String, label: String)] = [
+        ("⇥", "complete"), ("↑", "history"), ("⌘R", "search"), ("⇧⏎", "new line"), ("⌥⌘E", "open in $EDITOR")]
+    public static let learnedAfter = 3
+
+    public mutating func usedKey(_ key: String) { state.counts["key." + key, default: 0] += 1 }
+    public func knowsKey(_ key: String) -> Bool { state.counts["key." + key, default: 0] >= Self.learnedAfter }
+    /// The tips still worth showing.
+    public func keyTipsToShow(all: Bool) -> [(key: String, label: String)] { Self.keyTips.filter { all || !knowsKey($0.key) } }
+
     /// A command just started.
     public mutating func commandStarted(_ command: String, aiEnabled: Bool, now: Date = Date()) -> Tip? {
         let c = command.trimmingCharacters(in: .whitespaces)

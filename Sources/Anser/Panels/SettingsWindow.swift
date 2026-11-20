@@ -52,7 +52,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private let preview = ThemePreviewView()
     private let notifyToggle = NSButton(checkboxWithTitle: "Notify when a command in a background tab takes longer than", target: nil, action: nil)
     private let tipsPopup = NSPopUpButton()
-    private static let tipModes: [(String, String)] = [("always", "Always"), ("auto", "While I'm new (first 300 commands)"), ("never", "Never")]
+    private static let tipModes: [(String, String)] = [("auto", "Until I've used each shortcut a few times"), ("always", "Always"), ("never", "Never")]
 
     private var checkboxes: [NSButton] = []
     private let fontPopup = NSPopUpButton()
@@ -122,7 +122,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private var themes: [String] = []
 
     private static let cursorStyles: [(String?, String)] = [(nil, "Default"), ("block", "Block"), ("bar", "Bar"), ("underline", "Underline"), ("block_hollow", "Hollow block")]
-    private static let separatorStyles: [(String, String)] = [("dotted", "Dotted  ⋯ you@mac · 14:02 ⋯⋯⋯"), ("line", "Line  ─ you@mac · 14:02 ───"), ("none", "None")]
+    private static let separatorStyles: [(String, String)] = [("time", "Time on each command's row  (no extra rows)"), ("dotted", "Dotted  ⋯ you@mac · 14:02 ⋯⋯⋯"), ("line", "Line  ─ you@mac · 14:02 ───"), ("none", "None")]
     private static let promptModes: [(String, String)] = [("hidden", "Hidden (the editor is the only input)"), ("compact", "Short ❯ prompt"), ("full", "My shell's own prompt")]
 
     private init() {

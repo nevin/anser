@@ -173,6 +173,26 @@ final class Services {
         if tips.state != before, !Self.isSelfTest, let d = try? JSONEncoder().encode(tips.state) { UserDefaults.standard.set(d, forKey: "AnserTips") }
         if let t, let pane { pane.showTip(t.text) ; record("tip.\(t.id)") }
     }
+    /// Once, for config files written by an older Anser: they spell out the old defaults
+    /// (separator rows, key tips always on), which would hide the new quieter ones.
+    func adoptQuieterDefaults() {
+        guard !Self.isSelfTest, !UserDefaults.standard.bool(forKey: "AnserQuieterDefaults") else { return }
+        UserDefaults.standard.set(true, forKey: "AnserQuieterDefaults")
+        guard let json = (try? Data(contentsOf: AnserConfig.fileURL)).flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }) else { return }
+        if json["commandSeparator"] as? String == "dotted" {
+            SettingsWindowController.setValue(["commandSeparator"], "time"); config.commandSeparator = "time"
+        }
+        if json["keyTips"] as? String == "always" {
+            SettingsWindowController.setValue(["keyTips"], "auto"); config.keyTips = "auto"
+        }
+    }
+
+    /// A shortcut from the key-tips row was used (its tip retires after a few uses).
+    func usedKey(_ key: String) {
+        guard !tips.knowsKey(key) else { return }
+        tips.usedKey(key)
+        if !Self.isSelfTest, let d = try? JSONEncoder().encode(tips.state) { UserDefaults.standard.set(d, forKey: "AnserTips") }
+    }
     /// Tests turn tips on and reset them.
     var tipsForcedOn = false
     func resetTipsForTest() { tips = TipEngine(); tips.spacing = 0 }

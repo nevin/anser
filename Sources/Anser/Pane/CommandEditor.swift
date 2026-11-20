@@ -330,6 +330,7 @@ final class CommandEditor: NSTextView {
 
         // Shift/Option-Return: newline instead of running.
         if key == kVK_Return || key == kVK_ANSI_KeypadEnter, flags.contains(.shift) || flags.contains(.option) {
+            Services.shared.usedKey("⇧⏎")
             insertText("\n", replacementRange: selectedRange())
             return
         }
@@ -378,6 +379,7 @@ final class CommandEditor: NSTextView {
             submit()
 
         case #selector(insertTab(_:)):
+            Services.shared.usedKey("⇥")
             if popup.isVisible, let c = popup.selected { accept(c); return }
             // "# what you want" then Tab: AI writes the command.
             if isAIRequest { askAIInline(); return }
@@ -389,7 +391,7 @@ final class CommandEditor: NSTextView {
 
         case #selector(moveUp(_:)):
             if popup.isVisible { popup.move(-1); popupUserNavigated = true; return }
-            if caretOnFirstLine { historyBack(); return }
+            if caretOnFirstLine { Services.shared.usedKey("↑"); historyBack(); return }
             super.doCommand(by: selector)
 
         case #selector(moveDown(_:)):

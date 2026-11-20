@@ -201,12 +201,13 @@ public struct AnserConfig: Codable, Sendable {
     public var inlineInput: Bool = true
     /// Show macOS's "Last login: …" line when a tab opens.
     public var showLoginMessage: Bool = false
-    /// A thin line after each command in the scrollback with who ran it, on which Mac, and when:
-    /// "dotted", "line" or "none".
-    public var commandSeparator: String = "dotted"
+    /// Between commands in the scrollback. "time" (default): a faint line between commands
+    /// and the time each ran at the end of its own row, so no extra rows. "dotted" / "line":
+    /// a row after each command with who ran it, on which Mac, and when. "none": nothing.
+    public var commandSeparator: String = "time"
     /// Keyboard tips in the hints row under the editor. "auto" shows them while you're new
     /// (your first few hundred commands), then hides them.
-    public var keyTips: String = "always"
+    public var keyTips: String = "auto"
     /// Mark the tab and notify when a running program waits for an answer (y/n, password, an AI agent's approval).
     public var waitAlerts: Bool = true
     /// Show servers a tab started (anything listening on a port) as a chip.
@@ -315,7 +316,7 @@ public struct AnserConfig: Codable, Sendable {
         if let on = try? c.decodeIfPresent(Bool.self, forKey: .commandSeparator) { commandSeparator = on ? "line" : "none" }
         else {
             let v = (try? c.decodeIfPresent(String.self, forKey: .commandSeparator)) ?? nil
-            commandSeparator = ["line", "dotted", "none"].contains(v ?? "") ? v! : d.commandSeparator
+            commandSeparator = ["time", "line", "dotted", "none"].contains(v ?? "") ? v! : d.commandSeparator
         }
         keyTips = try c.decodeIfPresent(String.self, forKey: .keyTips) ?? d.keyTips
         waitAlerts = try c.decodeIfPresent(Bool.self, forKey: .waitAlerts) ?? d.waitAlerts
@@ -403,8 +404,8 @@ public struct AnserConfig: Codable, Sendable {
       "shellPrompt": "hidden",
       "inlineInput": true,
       "showLoginMessage": false,
-      "commandSeparator": "dotted",
-      "keyTips": "always",
+      "commandSeparator": "time",
+      "keyTips": "auto",
       "appearance": {
         "fontFamily": null,
         "fontSize": null,

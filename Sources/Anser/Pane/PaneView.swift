@@ -166,6 +166,9 @@ final class PaneView: NSView, ShellSessionDelegate {
     /// Top edge of the bar when it follows the output (pane coordinates), or
     /// nil when it sits at the bottom of the pane.
     private(set) var followTop: CGFloat?
+    /// The terminal is shorter to make room for an input of several lines.
+    private var roomForTallInput = false
+    private var inputWasEmpty = true
     private(set) var viewportAtBottom = true
     private var followCheckScheduled = false
     /// While a command runs: where the input line was when it started, and whether
@@ -183,7 +186,15 @@ final class PaneView: NSView, ShellSessionDelegate {
     static let chipHeight: CGFloat = 20
     /// Space between the line at the top of the input area and the editor box.
     static let cardMargin: CGFloat = 12
-    var maxEditorLines: Int { editorExpanded ? 24 : 8 }
+    /// The input grows to show all of a long command or paste, up to the pane's height
+    /// less a few rows of output; past that it scrolls.
+    var maxEditorLines: Int {
+        let headerH = showsHeader ? Self.headerHeight : 0
+        let keepOutput: CGFloat = 4 * 17 + 10
+        let room = bounds.height - headerH - Self.statusHeight - Self.cardMargin - 8
+            - editor.textContainerInset.height * 2 - keepOutput
+        return max(editorExpanded ? 24 : 8, Int(room / max(editor.lineHeight, 1)))
+    }
 
     var theme: Theme { GhosttyRuntime.shared.theme }
 
@@ -266,7 +277,11 @@ final class PaneView: NSView, ShellSessionDelegate {
     private func buildBar() {
         editorScroll.documentView = editor
         editorScroll.drawsBackground = false
-        editorScroll.hasVerticalScroller = false
+        // No limit on length: past the pane's height the input scrolls, with the
+        // system's overlay scroll bar so you can see there's more.
+        editorScroll.hasVerticalScroller = true
+        editorScroll.autohidesScrollers = true
+        editorScroll.scrollerStyle = .overlay
         editorScroll.hasHorizontalScroller = false
         editorScroll.borderType = .noBorder
         editorScroll.contentView.postsBoundsChangedNotifications = true
@@ -424,7 +439,19 @@ final class PaneView: NSView, ShellSessionDelegate {
         // An input of several lines (a long command from history, say) resting at the
         // bottom would cover the last rows of output: make the terminal shorter instead,
         // so the output moves up above it.
-        if !showWelcome, !fullscreenProgram, editorEnabled, followTop == nil { reserved = max(reserved, barHeight) }
+        // Making room moves the output up, which can make the input "fit" under it again;
+        // letting go then would move the output back and flicker between the two. So keep
+        // the room while the input stays tall, unless the output is so short that it would
+        // still fit with the terminal back at full height.
+        let extra = barHeight - reserved
+        if showWelcome || fullscreenProgram || !editorEnabled || extra <= 0.5 {
+            roomForTallInput = false
+        } else if followTop == nil {
+            roomForTallInput = true
+        } else if let top = followTop, top - barHeight > extra + 40 {
+            roomForTallInput = false
+        }
+        if roomForTallInput { reserved = barHeight }
         let target = NSRect(x: 0, y: reserved, width: w, height: max(0, bounds.height - reserved - headerH))
         if surfaceView.frame != target { surfaceView.frame = target }
         let fillBottom: CGFloat = fullscreenProgram ? 0 : Self.statusHeight
@@ -846,6 +873,9 @@ final class PaneView: NSView, ShellSessionDelegate {
 
     func editorContentChanged() {
         refreshContextChip()
+        // "Edit & retry" shows only while the input is empty: refresh when that flips.
+        let empty = editor.string.isEmpty
+        if empty != inputWasEmpty { inputWasEmpty = empty; refreshBar() }
         needsLayout = true
         gutter.needsDisplay = true
         // Keep the caret visible inside a tall editor.
@@ -913,7 +943,7 @@ final class PaneView: NSView, ShellSessionDelegate {
             return
         }
         if text.isEmpty {
-            setHint(nil, showKeyTips ? Self.keyTipsRow : nil)
+            setHint(nil, showKeyTips ? keyTipsLeft : nil, keys: true)
             return
         }
         let h = Services.shared.engine.hint(line: text, cursor: editor.selectedRange().location, cwd: session.cwd, env: session.env)
@@ -933,7 +963,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         switch Services.shared.config.keyTips {
         case "always": return true
         case "never": return false
-        default: return Services.shared.history.commandCount < 300
+        default: return true   // "auto": each tip retires on its own once learned (see keyTipsLeft)
         }
     }
 
@@ -950,14 +980,20 @@ final class PaneView: NSView, ShellSessionDelegate {
         ("⌘B lists the commands in this tab", []),
     ]
     static let runningTipsRow = "⌃C stop   ⌘K clear   ⌘B commands in this tab"
-    static let keyTipsRow = "⇥ complete   ↑ history   ⌘R search   ⇧⏎ new line   ⌥⌘E open in $EDITOR"
+    static let keyTipsRow = TipEngine.keyTips.map { "\($0.key) \($0.label)" }.joined(separator: "   ")
+    /// The key tips you haven't learned yet ("always" shows them all); nil when there are none.
+    var keyTipsLeft: String? {
+        let left = Services.shared.tips.keyTipsToShow(all: Services.shared.config.keyTips == "always")
+        return left.isEmpty ? nil : left.map { "\($0.key) \($0.label)" }.joined(separator: "   ")
+    }
     private var placeholderIndex = 0
 
     /// The editor's empty-state text, rotating once per prompt. Falls back to
     /// plain "Type a command" when the tip wouldn't fit `width`.
     func placeholder(fitting width: CGFloat, font: NSFont) -> String {
         let base = "Type a command"
-        let tips = Self.placeholderTips.filter { t in !(showKeyTips && t.keys.contains { Self.keyTipsRow.contains($0) }) }
+        let row = showKeyTips ? (keyTipsLeft ?? "") : ""
+        let tips = Self.placeholderTips.filter { t in !t.keys.contains { row.contains($0) } }
         guard !tips.isEmpty else { return base }
         let full = base + " · " + tips[placeholderIndex % tips.count].tip
         return (full as NSString).size(withAttributes: [.font: font]).width <= width ? full : base
@@ -977,13 +1013,13 @@ final class PaneView: NSView, ShellSessionDelegate {
         needsLayout = true
     }
 
-    private func setHint(_ title: String?, _ detail: String?) {
+    private func setHint(_ title: String?, _ detail: String?, keys: Bool = false) {
         let t = theme
         let s = NSMutableAttributedString()
         if let title, !title.isEmpty {
             s.append(NSAttributedString(string: title, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium), .foregroundColor: t.foreground.withAlphaComponent(0.7)]))
         }
-        if let detail, detail == Self.keyTipsRow || detail == Self.runningTipsRow {
+        if let detail, keys || detail == Self.runningTipsRow {
             // "⇥ complete   ↑ history …": each key a little brighter than what it does.
             for (i, tip) in detail.components(separatedBy: "   ").enumerated() {
                 if i > 0 { s.append(NSAttributedString(string: "   ", attributes: [.font: NSFont.systemFont(ofSize: 11)])) }
@@ -1072,14 +1108,15 @@ final class PaneView: NSView, ShellSessionDelegate {
         if let fix = fixCommand {
             fixChip.set(role: .suggestion, symbol: "wand.and.stars", text: fixLabel ?? "Did you mean: " + fix,
                         tooltip: fixLabel == nil ? "Put the corrected command in the editor" : "Puts this in the editor:\n" + fix, filled: true, theme: t)
-        } else if let last = s.lastBlockInContext, (last.exitCode ?? 0) != 0, !last.command.isEmpty, s.atPrompt {
+        } else if let last = s.lastBlockInContext, (last.exitCode ?? 0) != 0, !last.command.isEmpty, s.atPrompt, editor.string.isEmpty {
+            // Until you start typing something else.
             fixChip.filled = t.foreground
             fixChip.set(symbol: "arrow.uturn.backward", text: "Edit & retry", color: t.foreground.withAlphaComponent(0.75), tooltip: last.command)
         } else {
             fixChip.filled = nil
             fixChip.set(symbol: nil, text: "", color: dim)
         }
-        if Services.shared.aiEnabled, let last = s.lastBlockInContext, (last.exitCode ?? 0) != 0, !last.command.isEmpty, s.atPrompt {
+        if Services.shared.aiEnabled, let last = s.lastBlockInContext, (last.exitCode ?? 0) != 0, !last.command.isEmpty, s.atPrompt, editor.string.isEmpty {
             explainChip.set(role: .suggestion, symbol: "sparkles", text: "Explain", tooltip: "Ask \(Services.shared.aiName) why this failed (⌥⌘I)", filled: true, theme: t)
         } else {
             explainChip.filled = nil
@@ -1087,19 +1124,15 @@ final class PaneView: NSView, ShellSessionDelegate {
         }
         if s.historyPaused {
             statusChip.set(role: .waiting, symbol: "pause.circle", text: "history paused", theme: t)
-        } else if let last = s.lastBlockInContext, (last.exitCode ?? 0) != 0 {
-            // Success needs no badge (each command shows ✓ and its time in
-            // the output); a failure stays visible here.
-            let d = last.duration.map { " · " + Services.formatDuration($0) } ?? ""
-            statusChip.set(symbol: "xmark.circle", text: "exit \(last.exitCode ?? 0)\(d)", color: t.red,
-                           tooltip: last.command + "\nClick for options")
         } else if !s.integrated {
             statusChip.set(symbol: "bolt.slash", text: "shell integration not active", color: dim,
                            tooltip: "Typing goes straight to the shell. zsh and bash get the full editor.")
         } else {
             statusChip.set(symbol: nil, text: "", color: dim)
         }
-        gutter.promptColor = (s.lastExit ?? 0) == 0 ? t.green : t.red
+        // The same quiet ❯ as the commands above: the failed command already shows its ✗,
+        // and a red ❯ here would read as if what you're typing were wrong.
+        gutter.promptColor = t.foreground.withAlphaComponent(0.45)
 
         let waiting = editorEnabled && !s.integrated && !showRunning
         editorScroll.isHidden = !editorEnabled || showRunning || !s.integrated

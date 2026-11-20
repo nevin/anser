@@ -10,7 +10,7 @@ out="${1:-$dir/window.png}"
 cfg="$(mktemp -d)"
 # Optional starting settings, e.g. CONFIG='{"appearance":{"backgroundImage":"/path/pic.jpg"}}'
 if [[ -n "${CONFIG:-}" ]]; then mkdir -p "$cfg/anser"; printf '%s' "$CONFIG" > "$cfg/anser/config.json"; fi
-XDG_CONFIG_HOME="$cfg" ANSER_SELFTEST_ONLY=window ANSER_SELFTEST_HOLD=1 ANSER_SELFTEST="$dir/results.txt" \
+XDG_CONFIG_HOME="$cfg" ANSER_SELFTEST_ONLY=window ANSER_SELFTEST_HOLD=1 ANSER_SHOT_INPUT="${INPUT:-}" ANSER_SELFTEST="$dir/results.txt" \
     "$root/build/Anser.app/Contents/MacOS/Anser" >/dev/null 2>&1 &
 pid=$!
 for _ in $(seq 1 60); do [[ -f "$dir/results.txt" ]] && break; sleep 1; done

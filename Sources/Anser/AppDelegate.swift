@@ -52,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             Services.shared.record("menu." + item.title.replacingOccurrences(of: "…", with: ""))
         }
         let selfTest = ProcessInfo.processInfo.environment["ANSER_SELFTEST"] != nil
+        Services.shared.adoptQuieterDefaults()
         let restored = !selfTest && Services.shared.config.restoreSession && restoreSession()
         if !restored { newWindow(cwd: nil) }
         Startup.mark("windows")

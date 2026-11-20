@@ -47,7 +47,10 @@ enum SelfTest {
                 NSApp.activate(ignoringOtherApps: true)
                 wc.window?.makeKeyAndOrderFront(nil)
                 pane.focus()
+                // Optional text in the input, e.g. a long command, to see how it looks.
+                if let t = ProcessInfo.processInfo.environment["ANSER_SHOT_INPUT"], !t.isEmpty { pane.editor.setTextForTests(t.replacingOccurrences(of: "\\n", with: "\n")) }
                 await sleep(1)
+                if !pane.editor.string.isEmpty { note("input \(pane.editor.string.debugDescription) issues \(pane.editor.issues.map(\.message))") }
                 note("input line top \(Int(pane.barTopForTest)), follows output: \(pane.followTop != nil)")
                 finish()
             }
@@ -1392,8 +1395,14 @@ enum SelfTest {
               vp.split(separator: "\n").suffix(4).joined(separator: " ⏎ "))
         let lastLine = vp.split(separator: "\n", omittingEmptySubsequences: false)
             .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !CommandSeparator.isSeparator(String($0)) }) ?? ""
-        check("a separator with user, Mac and time follows the command",
-              vp.split(separator: "\n").contains { CommandSeparator.isSeparator(String($0)) && $0.contains(NSUserName() + "@") }, String(vp.suffix(200)))
+        // By default no separator row: the time goes on the command's own row.
+        pane.blocksOverlay.refresh()
+        let timedBlock = pane.blocksOverlay.blocks.last { $0.info?.command.contains("anser-ok") == true }
+        check("no separator rows between commands by default",
+              !vp.split(separator: "\n").contains { CommandSeparator.isSeparator(String($0)) }, String(vp.suffix(200)))
+        check("each command shows the time it ran on its own row",
+              timedBlock.flatMap { pane.blocksOverlay.timeLabel($0) }?.range(of: #"^\d\d:\d\d:\d\d$"#, options: .regularExpression) != nil,
+              timedBlock.flatMap { pane.blocksOverlay.timeLabel($0) } ?? "no block")
         check("no duplicate prompt waiting in the terminal", lastLine.contains("line3"), String(lastLine))
         pane.needsLayout = true
         pane.layoutSubtreeIfNeeded()
@@ -1522,6 +1531,22 @@ enum SelfTest {
 
         // Failure help.
         check("failed command offers Edit & retry", pane.fixChipText == "Edit & retry", pane.fixChipText)
+        // One failure, said once: no exit chip in the status row, and a quiet ❯ (not red).
+        check("the status row doesn't repeat the exit code", !pane.statusChip.text.contains("exit"), pane.statusChip.text)
+        check("the input's ❯ stays quiet after a failure", pane.gutter.promptColor != GhosttyRuntime.shared.theme.red)
+        // "Edit & retry" goes away once you start typing something else, and comes back if you clear it.
+        type(pane, "ls")
+        let retryHides = pane.fixChipText.isEmpty
+        pane.editor.clear()
+        await sleep(0.1)
+        check("Edit & retry steps aside while you type", retryHides && pane.fixChipText == "Edit & retry", "typing=\(retryHides) after=\(pane.fixChipText)")
+        // Key tips: each one retires after you've used its shortcut a few times.
+        pane.editor.clear()
+        let tipsBefore = Services.shared.config.keyTips == "auto" ? pane.keyTipsLeft ?? "" : "-"
+        for _ in 0..<TipEngine.learnedAfter { Services.shared.usedKey("⌥⌘E") }
+        let tipsAfter = pane.keyTipsLeft ?? ""
+        check("a key tip retires once you use its shortcut", tipsBefore.contains("⌥⌘E") && !tipsAfter.contains("⌥⌘E") && tipsAfter.contains("⌘R"),
+              "before: \(tipsBefore) · after: \(tipsAfter)")
         pane.run("gti status # anser-selftest")
         ok = await wait(10) { s.blocks.last?.command.hasPrefix("gti") == true && s.atPrompt }
         check("typo gets a fix suggestion", pane.fixCommand == "git status # anser-selftest", pane.fixCommand ?? "-")
@@ -3121,6 +3146,9 @@ enum SelfTest {
             pane.needsLayout = true; pane.layoutSubtreeIfNeeded()
             return pane.editor.lineCount >= 4 && pane.followTop == nil && pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5 }
         let tallTerm = pane.surfaceView.frame.minY, tallBar = pane.barTopForTest
+        // It settles: the terminal doesn't keep switching height (that flickers).
+        var tallHeights = Set<Int>()
+        for _ in 0..<10 { await sleep(0.1); pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); tallHeights.insert(Int(pane.surfaceView.frame.minY)) }
         let tallInfo = "lines \(pane.editor.lineCount) follow \(pane.followTop.map { Int($0) } ?? -1) running \(s.running != nil) atBottom \(pane.viewportAtBottom) out \(Int(pane.outputBottomForTest ?? -1))"
         pane.editor.setTextForTests("")
         let tallBack = await wait(3) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return pane.surfaceView.frame.minY < tallTerm - 1 }
@@ -3131,11 +3159,26 @@ enum SelfTest {
         let pasteClear = await wait(3) {
             pane.needsLayout = true; pane.layoutSubtreeIfNeeded()
             return pane.editor.lineCount >= 8 && pane.surfaceView.frame.minY >= pane.barTopForTest - 0.5 }
+        // All of it shows when the pane has room (here up to its height less a few output rows).
+        let shownLines = Int((pane.editorScroll.frame.height + 1) / pane.editor.lineHeight)
+        check("a big paste isn't cut short when there's room", shownLines >= min(40, pane.maxEditorLines) && pane.maxEditorLines > 8,
+              "shows \(shownLines) of 40 lines, room for \(pane.maxEditorLines)")
         let pasteInfo = "paste: terminal bottom \(Int(pane.surfaceView.frame.minY)) · input top \(Int(pane.barTopForTest))"
         pane.editor.setTextForTests("")
         _ = await wait(3) { pane.needsLayout = true; pane.layoutSubtreeIfNeeded(); return pane.surfaceView.frame.minY < tallTerm - 1 }
         await sleep(0.4)
         check("pasting a lot of text doesn't cover the output", pasteClear, pasteInfo)
+        check("a tall input doesn't make the terminal flicker", tallHeights == [Int(tallTerm)], "heights \(tallHeights.sorted())")
+        // Super long input isn't cut: a 20,000-character command reaches the shell whole.
+        let longArg = String(repeating: "x", count: 20000)
+        pane.editor.setTextForTests("echo \(longArg) | wc -c # anser-selftest")
+        let longScrolls = pane.editorScroll.hasVerticalScroller
+        pane.editor.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+        let longRan = await wait(10) { s.atPrompt && s.blocks.last?.command.contains(longArg) == true }
+        await sleep(0.5)
+        let longOut = pane.surfaceView.viewportText() ?? ""
+        check("a 20,000-character command runs whole", longRan && longScrolls && longOut.contains("20001"),
+              "ran=\(longRan) scroller=\(longScrolls) · \(longOut.split(separator: "\n").suffix(3).joined(separator: " ⏎ "))")
         check("a long command from history doesn't cover the output", tallClear && tallBack,
               "terminal bottom \(Int(tallTerm)) · input top \(Int(tallBar)) · \(tallInfo) · back=\(tallBack)")
         // Back to the default: the input line follows the output.

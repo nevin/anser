@@ -66,6 +66,7 @@ extension PaneView {
     /// back into the editor when you save and quit. (GUI editors need a wait flag,
     /// e.g. EDITOR="code --wait".)
     func editInExternalEditor() {
+        Services.shared.usedKey("⌥⌘E")
         guard editorUsable else { NSSound.beep(); return }
         let file = NSTemporaryDirectory() + "anser-edit-\(session.id.prefix(8)).sh"
         try? (editor.string + "\n").write(toFile: file, atomically: true, encoding: .utf8)

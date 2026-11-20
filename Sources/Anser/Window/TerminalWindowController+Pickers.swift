@@ -8,6 +8,7 @@ extension TerminalWindowController {
 
     /// ⌘R: the one search window (see SearchUI.swift), on a history scope.
     func showHistorySearch(for pane: PaneView, scope initialScope: HistoryScope = .all) {
+        Services.shared.usedKey("⌘R")
         showSearch(for: pane, scope: SearchScope(initialScope))
     }
 

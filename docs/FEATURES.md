@@ -293,6 +293,7 @@ You can switch to the imported theme and font in the same step. Themes go to `~/
   - After typing `history | grep`, the same tip.
   - After running the same long command four times: "⌥⌘S saves it to your notebook".
 - **Each tip shows once, at most one every 10 minutes.** Settings → Editor → Keyboard tips turns them off.
+- **Shortcut hints retire as you learn them.** The row of shortcuts under the input (⇥ complete, ↑ history, ⌘R search…) drops each one after you've used it three times, and goes away when you know them all. Settings → Editor → Keyboard tips → Always keeps them.
 
 ## Your usage, on your Mac
 
@@ -331,7 +332,8 @@ You can switch to the imported theme and font in the same step. Themes go to `~/
   - The branch chip switches branches, or creates one when you type a new name (⇧⌘B).
   - "3 changed" lists changed files: diff, stage/unstage, open (⇧⌘G).
   - The result chip offers retry and copy actions.
-- **Help when things fail:** typos like `gti status` get a one-click "Did you mean: git status"; any failed command offers "Edit & retry". A Stop button appears while a command runs.
+- **Help when things fail:** typos like `gti status` get a one-click "Did you mean: git status"; any failed command offers "Edit & retry" (until you start typing something else). A failure is shown once, on the command itself (red bar and ✗ exit code); the input's ❯ stays neutral.
+- **No separator rows between commands.** A faint line divides commands, and each command's row ends with the time it ran (and the host, over SSH). Settings → Appearance → After each command brings back the "you@mac · time" rows. A Stop button appears while a command runs.
 - **Discoverable:** ⌘/ shows every shortcut, and a short welcome card appears on first launch, with a button for the tour (Help → Take the Tour any time). After an update with new features, a What's New window lists them once (Help → What's New in Anser). Settings has a search box: type and press Return to jump to a setting.
 - **Command blocks:** a colored bar beside each command and its output (green ok, red failed, yellow running). Hover a block for its exit code and duration, Run again, Copy output, Copy command, Save to Notebook, ✨ Explain (failed commands only) and **…** for everything else (the same menu as right-click).
 - **⌘-click file paths** in output (`src/app.swift:42:10`, `main.go(7)`, Python tracebacks) to open them at that line in Cursor, VS Code, Zed or Sublime. Choose the editor in Settings → Suggestions & Helpers, including terminal editors like nvim.
