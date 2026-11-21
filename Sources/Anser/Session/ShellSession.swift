@@ -260,9 +260,9 @@ final class ShellSession {
         // Gives the shell an `imgcat` (when it has none) that shows pictures.
         if let helper = SessionHost.shared.helperPath { env["ANSER_HELPER"] = helper }
         if !Services.shared.config.showLoginMessage { env["ANSER_HIDE_LOGIN"] = "1" }
-        // "time" is drawn by Anser on the command's row: the shell prints no separator row.
         let sep = Services.shared.config.commandSeparator
-        env["ANSER_SEPARATOR"] = sep == "time" ? "none" : sep
+        // "time": an empty row after each command, with a faint line in it; the time goes on the command's row.
+        env["ANSER_SEPARATOR"] = sep == "time" ? "gap" : sep
         if let gh = GhosttyRuntime.shared.resourcesDir {
             env["GHOSTTY_RESOURCES_DIR"] = gh
             env["ANSER_GHOSTTY_INTEGRATION"] = gh + "/shell-integration"

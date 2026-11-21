@@ -261,31 +261,50 @@ final class BlocksOverlayView: NSView {
             }
             path.stroke()
         }
-        // "time" style: a faint line between commands instead of a separator row.
+        // "time" style: a faint line between commands. The shell leaves an empty row after
+        // each command; the line goes in its upper part, so there's room before the next one.
+        var gapAbove: [Int: CGFloat] = [:]
         if Services.shared.config.commandSeparator == "time" {
             let line = NSBezierPath()
-            for b in blocks where b.top > 2 && b.info != nil {
-                line.move(to: NSPoint(x: padX, y: b.top.rounded() + 0.5 / scale))
-                line.line(to: NSPoint(x: bounds.width - padX, y: b.top.rounded() + 0.5 / scale))
+            for b in blocks where b.top > 2 {
+                var y = b.top
+                if b.rowHeight > 0, let pane {
+                    let row = Int((b.top / b.rowHeight).rounded(.down))
+                    if row >= 1, let above = pane.surfaceView.rowText(row - 1), above.trimmingCharacters(in: .whitespaces).isEmpty {
+                        gapAbove[b.markIndex] = b.rowHeight
+                        y = b.top - b.rowHeight * Self.gapLinePosition
+                    }
+                }
+                guard b.info != nil else { continue }
+                line.move(to: NSPoint(x: padX, y: y.rounded() + 0.5 / scale))
+                line.line(to: NSPoint(x: bounds.width - padX, y: y.rounded() + 0.5 / scale))
             }
             line.lineWidth = 1 / scale
             t.foreground.withAlphaComponent(0.12).setStroke()
             line.stroke()
         }
+        lastGapLines = gapAbove.count
         for b in blocks {
+            // Stop before the empty row that follows the command (the last one too, above the input).
+            var gapBelow = blocks.first { abs($0.top - b.bottom) < 1 }.flatMap { gapAbove[$0.markIndex] } ?? 0
+            if gapBelow == 0, !gapAbove.isEmpty || Services.shared.config.commandSeparator == "time", !b.running, b.rowHeight > 0,
+               b.bottom - b.top > b.rowHeight * 1.5, let pane {
+                let last = Int((b.bottom / b.rowHeight).rounded(.down)) - 1
+                if let text = pane.surfaceView.rowText(last), text.trimmingCharacters(in: .whitespaces).isEmpty { gapBelow = b.rowHeight }
+            }
             let color: NSColor
             if b.running { color = t.yellow }
             else if let e = b.info?.exitCode, e != 0 { color = t.red }
             else { color = t.green.withAlphaComponent(0.55) }
             let failed = (b.info?.exitCode ?? 0) != 0 && !b.running
             let hovered = b.markIndex == self.hovered
-            let rect = NSRect(x: 1, y: b.top + 2, width: hovered ? 3.5 : (failed ? 3 : 2.5), height: max(4, b.bottom - b.top - 5))
+            let rect = NSRect(x: 1, y: b.top + 2, width: hovered ? 3.5 : (failed ? 3 : 2.5), height: max(4, b.bottom - gapBelow - b.top - 5))
             color.withAlphaComponent(hovered || failed ? 1 : (b.running ? 0.9 : 0.75)).setFill()
             NSBezierPath(roundedRect: rect, xRadius: 1.25, yRadius: 1.25).fill()
             if !hovered { drawResultMark(b) }
             if hovered {
                 t.foreground.withAlphaComponent(0.035).setFill()
-                NSRect(x: 0, y: b.top, width: bounds.width, height: b.bottom - b.top).fill()
+                NSRect(x: 0, y: b.top, width: bounds.width, height: b.bottom - gapBelow - b.top).fill()
             }
         }
     }
@@ -313,6 +332,12 @@ final class BlocksOverlayView: NSView {
         let cells = text.unicodeScalars.reduce(0) { $0 + ($1.properties.isEmojiPresentation || ($1.value >= 0x1100 && $1.value <= 0xFFDC && $1.properties.isIdeographic) ? 2 : 1) }
         return padding + CGFloat(cells) * cellWidth + 12 < markStart
     }
+
+    /// Where the line sits in the empty row between commands (from its bottom, as a share of the row):
+    /// nearer the output above, leaving more room before the next command.
+    static let gapLinePosition: CGFloat = 0.62
+    /// Lines drawn in an empty row at the last draw (for tests).
+    private(set) var lastGapLines = 0
 
     static func markFits(command: String, cellWidth: CGFloat, markStart: CGFloat) -> Bool {
         let firstLine = command.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""

@@ -185,6 +185,26 @@ enum SelfTest {
         _ = await wait(8) { s.atPrompt }
     }
 
+    /// Room between commands: an empty row after each one, with the faint line drawn in it.
+    @MainActor
+    static func commandGapChecks(_ pane: PaneView) async {
+        let s = pane.session
+        _ = await wait(10) { s.atPrompt }
+        pane.run("echo gap-one # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.blocks.last?.command.contains("gap-one") == true }
+        pane.run("echo gap-two # anser-selftest")
+        _ = await wait(5) { s.atPrompt && s.blocks.last?.command.contains("gap-two") == true }
+        await sleep(0.4)
+        let gapRows = (pane.surfaceView.viewportText() ?? "").split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let gapOneRow = gapRows.firstIndex { $0.hasPrefix("gap-one") }
+        pane.blocksOverlay.refresh()
+        pane.blocksOverlay.display()
+        check("an empty row separates each command from the next, with the line in it",
+              gapOneRow.map { $0 + 2 < gapRows.count && gapRows[$0 + 1].trimmingCharacters(in: .whitespaces).isEmpty && gapRows[$0 + 2].contains("gap-two") } == true
+                && pane.blocksOverlay.lastGapLines > 0,
+              gapOneRow.map { gapRows[$0..<min(gapRows.count, $0 + 3)].joined(separator: " ⏎ ") } ?? "no gap-one row")
+    }
+
     /// A prompt theme that insists on running last (like powerlevel10k, sourced again with
     /// `source ~/.zshrc`) mustn't bring its prompt or the terminal's cursor back under the input.
     @MainActor
@@ -3264,6 +3284,7 @@ enum SelfTest {
         await uxReviewChecks(pane, wc, tmp: tmp)
         await processChecks(pane, wc)
         await themeOverrideChecks(wc)
+        await commandGapChecks(pane)
         await closeBusyTabsCheck(pane, wc, tmp: tmp)
         await runtimeChecks(pane, wc, tmp: tmp)
         await stopChecks(pane)

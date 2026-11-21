@@ -122,7 +122,7 @@ final class SettingsWindowController: NSWindowController, NSComboBoxDelegate {
     private var themes: [String] = []
 
     private static let cursorStyles: [(String?, String)] = [(nil, "Default"), ("block", "Block"), ("bar", "Bar"), ("underline", "Underline"), ("block_hollow", "Hollow block")]
-    private static let separatorStyles: [(String, String)] = [("time", "Time on each command's row  (no extra rows)"), ("dotted", "Dotted  ⋯ you@mac · 14:02 ⋯⋯⋯"), ("line", "Line  ─ you@mac · 14:02 ───"), ("none", "None")]
+    private static let separatorStyles: [(String, String)] = [("time", "A little space and a faint line, time on each command's row"), ("dotted", "Dotted  ⋯ you@mac · 14:02 ⋯⋯⋯"), ("line", "Line  ─ you@mac · 14:02 ───"), ("none", "None")]
     private static let promptModes: [(String, String)] = [("hidden", "Hidden (the editor is the only input)"), ("compact", "Short ❯ prompt"), ("full", "My shell's own prompt")]
 
     private init() {

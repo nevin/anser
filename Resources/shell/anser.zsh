@@ -88,6 +88,13 @@ typeset -g _anser_separator=${ANSER_SEPARATOR:-none} _anser_sep_at=""
 # Runs after Ghostty's hook has closed the command's output, so the line is
 # neither output (Copy Output skips it) nor prompt.
 _anser_sep_print() {
+    # "gap": one empty row after each command, for room between it and the next
+    # (Anser draws a faint line in it). Not after clearing the screen.
+    if [[ $_anser_separator == gap ]]; then
+        [[ -n $_anser_sep_at && $_anser_sep_cmd != (clear|reset|tput clear)(| *) ]] && builtin print -rn -- $'\e[K\n'
+        _anser_sep_at=""
+        return 0
+    fi
     [[ -n $_anser_sep_at && $_anser_separator != none ]] || { _anser_sep_at=""; return 0 }
     # \e[K: zsh has already filled this line with spaces (its PROMPT_SP check); clear
     # them, or they'd wrap onto extra blank rows when the window gets narrower.
@@ -212,6 +219,7 @@ _anser_precmd() {
 
 _anser_preexec() {
     _anser_sep_at=${(%):-%D{%H:%M:%S}}
+    _anser_sep_cmd=$1
     # Show the terminal cursor again for the running program.
     [[ $_anser_prompt_mode == hidden ]] && builtin print -n $'\e[?25h'
     local cmd=$1

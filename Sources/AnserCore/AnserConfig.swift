@@ -202,7 +202,7 @@ public struct AnserConfig: Codable, Sendable {
     /// Show macOS's "Last login: …" line when a tab opens.
     public var showLoginMessage: Bool = false
     /// Between commands in the scrollback. "time" (default): a faint line between commands
-    /// and the time each ran at the end of its own row, so no extra rows. "dotted" / "line":
+    /// and the time each ran at the end of its own row; an empty row after each command holds the line. "dotted" / "line":
     /// a row after each command with who ran it, on which Mac, and when. "none": nothing.
     public var commandSeparator: String = "time"
     /// Keyboard tips in the hints row under the editor. "auto" shows them while you're new

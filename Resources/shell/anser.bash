@@ -23,6 +23,7 @@ unset _anser_km
 
 # Prompt while Anser's editor is in charge: hidden | compact | full.
 _anser_prompt_mode=${ANSER_PROMPT_MODE:-full}
+_anser_separator=${ANSER_SEPARATOR:-none}
 _anser_user_ps1=$PS1
 case $_anser_prompt_mode in
     hidden)  PS1='\[\e[?25l\]' ;;
@@ -96,8 +97,18 @@ if [[ -n "$ANSER_FIFO" && -p "$ANSER_FIFO" ]] && exec 249<>"$ANSER_FIFO"; then
         _anser_send "prompt"$'\t'"$ec"$'\t'"$REPLY"
     }
 
+    # "gap": one empty row after each command (not after clearing the screen), for room before the next.
+    _anser_gap_after=""
+    _anser_gap() {
+        if [[ $_anser_separator == gap && -n $_anser_gap_after ]]; then
+            case $_anser_gap_after in clear|clear\ *|reset|reset\ *) ;; *) printf '\e[K\n' ;; esac
+        fi
+        _anser_gap_after=""
+    }
+
     _anser_preexec() {
         [[ $_anser_prompt_mode == hidden ]] && printf '\e[?25h'
+        _anser_gap_after=${1:-x}
         local cmd=$1
         [[ "$cmd" == ' '* ]] && cmd=""
         _anser_esc "$cmd"; local c=$REPLY
@@ -132,7 +143,7 @@ if [[ -n "$ANSER_FIFO" && -p "$ANSER_FIFO" ]] && exec 249<>"$ANSER_FIFO"; then
         }
     fi
 
-    precmd_functions=(_anser_precmd "${precmd_functions[@]}")
+    precmd_functions=(_anser_precmd "${precmd_functions[@]}" _anser_gap)
     preexec_functions+=(_anser_preexec)
 fi
 
