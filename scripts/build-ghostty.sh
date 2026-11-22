@@ -5,9 +5,9 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-GHOSTTY_REV=554ea65867ffe34bb3e51e09bd016e154a1f9d7a
-ZIG_VERSION=0.16.0
-ZIG_SHA=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  # aarch64-macos
+GHOSTTY_REV=6d244209978e599277904ff3ced7b8a2ebcc528d
+ZIG_VERSION=0.17.1
+ZIG_SHA=75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d  # aarch64-macos
 
 mkdir -p .tools .build vendor
 zig_dir="$root/.tools/zig-aarch64-macos-$ZIG_VERSION"

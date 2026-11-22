@@ -33,24 +33,25 @@ final class GhosttyRuntime {
         config = makeConfig()
         theme = Theme(config: config)
 
-        var rt = ghostty_runtime_config_s()
-        rt.userdata = nil
-        rt.supports_selection_clipboard = false
-        rt.wakeup_cb = { _ in GhosttyRuntime.shared.scheduleTick() }
-        rt.action_cb = { _, target, action in GhosttyRuntime.shared.handle(action: action, target: target) }
-        rt.read_clipboard_cb = { ud, location, state, mimes, count, list in
-            GhosttyRuntime.readClipboard(ud, location, state, mimes, count, list)
-        }
-        rt.confirm_read_clipboard_cb = { ud, confirm, state, request in
-            GhosttyRuntime.confirmReadClipboard(ud, confirm, state, request)
-        }
-        rt.write_clipboard_cb = { ud, location, content, len, confirm in
-            GhosttyRuntime.writeClipboard(ud, location, content, len, confirm)
-        }
-        rt.close_surface_cb = { ud, processAlive in
-            guard let view = TerminalSurfaceView.from(ud) else { return }
-            DispatchQueue.main.async { view.pane?.surfaceRequestedClose() }
-        }
+        guard let config else { NSLog("Anser: ghostty config failed"); return false }
+        var rt = ghostty_runtime_config_s(
+            userdata: nil,
+            supports_selection_clipboard: false,
+            wakeup_cb: { _ in GhosttyRuntime.shared.scheduleTick() },
+            action_cb: { _, target, action in GhosttyRuntime.shared.handle(action: action, target: target) },
+            read_clipboard_cb: { ud, location, state, mimes, count, list in
+                GhosttyRuntime.readClipboard(ud, location, state, mimes, count, list)
+            },
+            confirm_read_clipboard_cb: { ud, confirm, state, request in
+                GhosttyRuntime.confirmReadClipboard(ud, confirm, state, request)
+            },
+            write_clipboard_cb: { ud, location, content, len, confirm in
+                GhosttyRuntime.writeClipboard(ud, location, content, len, confirm)
+            },
+            close_surface_cb: { ud, _ in
+                guard let view = TerminalSurfaceView.from(ud) else { return }
+                DispatchQueue.main.async { view.pane?.surfaceRequestedClose() }
+            })
         app = ghostty_app_new(&rt, config)
         guard app != nil else { NSLog("Anser: ghostty_app_new failed"); return false }
         applyColorScheme()
@@ -85,7 +86,8 @@ final class GhosttyRuntime {
         lines.append("clipboard-paste-protection = \(Services.shared.config.editor.confirmMultilinePaste)")
         // Scrollback per tab (Settings → Sessions & Windows); the biggest memory use with many tabs.
         lines.append("scrollback-limit = \(Services.shared.config.scrollbackMB * 1_000_000)")
-        if Services.shared.config.copyOnSelect { lines.append("copy-on-select = clipboard") }
+        // Off unless asked for (Ghostty turns it on by default).
+        lines.append("copy-on-select = \(Services.shared.config.copyOnSelect ? "clipboard" : "false")")
         lines += Services.shared.config.appearance.ghosttyLines(systemIsDark: Self.systemIsDark)
         lines += Services.shared.config.ghostty
         configText = lines.joined(separator: "\n").appending("\n")
@@ -112,7 +114,7 @@ final class GhosttyRuntime {
         let n = ghostty_config_diagnostics_count(cfg)
         for i in 0..<n {
             let d = ghostty_config_get_diagnostic(cfg, i)
-            if let m = d.message { NSLog("Anser ghostty config: \(String(cString: m))") }
+            NSLog("Anser ghostty config: \(String(cString: d.message))")
         }
         return cfg
     }
@@ -179,12 +181,12 @@ final class GhosttyRuntime {
 
     private func handle(action: ghostty_action_s, target: ghostty_target_s) -> Bool {
         let view: TerminalSurfaceView? = target.tag == GHOSTTY_TARGET_SURFACE
-            ? TerminalSurfaceView.from(ghostty_surface_userdata(target.target.surface)) : nil
+            ? target.target.surface.flatMap { TerminalSurfaceView.from(ghostty_surface_userdata($0)) } : nil
         let pane = view?.pane
 
         switch action.tag {
         case GHOSTTY_ACTION_SET_TITLE, GHOSTTY_ACTION_SET_TAB_TITLE:
-            if let ptr = action.action.set_title.title {
+            do { let ptr = action.action.set_title.title
                 let title = String(cString: ptr)
                 // In-band events from Anser's hooks on an ssh host (not a real title).
                 if title.hasPrefix("\u{E000}anser:") {
@@ -212,7 +214,7 @@ final class GhosttyRuntime {
             }
             return true
         case GHOSTTY_ACTION_PWD:
-            if let ptr = action.action.pwd.pwd {
+            do { let ptr = action.action.pwd.pwd
                 let pwd = String(cString: ptr)
                 DispatchQueue.main.async { pane?.pwdChanged(pwd) }
             }
@@ -225,7 +227,7 @@ final class GhosttyRuntime {
             return true
         case GHOSTTY_ACTION_OPEN_URL:
             let u = action.action.open_url
-            if let ptr = u.url {
+            do { let ptr = u.url
                 let s = String(data: Data(bytes: ptr, count: Int(u.len)), encoding: .utf8) ?? ""
                 DispatchQueue.main.async { Self.openLink(s, from: view?.window) }
             }
@@ -364,17 +366,16 @@ final class GhosttyRuntime {
         return out
     }
 
-    static func readClipboard(_ ud: UnsafeMutableRawPointer?, _ loc: ghostty_clipboard_e, _ state: UnsafeMutableRawPointer?,
-                              _ mimes: UnsafePointer<UnsafePointer<CChar>?>?, _ count: Int, _ list: Bool) -> ghostty_clipboard_read_result_e {
+    static func readClipboard(_ ud: UnsafeMutableRawPointer?, _ loc: ghostty_clipboard_e, _ state: UnsafeMutableRawPointer,
+                              _ mimes: UnsafePointer<UnsafePointer<CChar>>, _ count: Int, _ list: Bool) -> ghostty_clipboard_read_result_e {
         guard let view = TerminalSurfaceView.from(ud), let surface = view.surface, let pb = pasteboard(loc) else {
             return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
         }
         var contents: [(String, Data)] = []
         var seen = Set<String>()
-        if let mimes {
+        do {
             for i in 0..<count {
-                guard let p = mimes[i] else { continue }
-                let m = String(cString: p)
+                let m = String(cString: mimes[i])
                 guard seen.insert(m).inserted, let d = data(from: pb, mime: m) else { continue }
                 contents.append((m, d))
             }
@@ -386,7 +387,7 @@ final class GhosttyRuntime {
     }
 
     static func confirmReadClipboard(_ ud: UnsafeMutableRawPointer?, _ confirm: UnsafePointer<ghostty_clipboard_confirm_s>?,
-                                     _ state: UnsafeMutableRawPointer?, _ request: ghostty_clipboard_request_e) {
+                                     _ state: UnsafeMutableRawPointer, _ request: ghostty_clipboard_request_e) {
         guard let view = TerminalSurfaceView.from(ud), let surface = view.surface else { return }
         guard let confirm else { ghostty_surface_deny_clipboard_request(surface, state); return }
         let c = confirm.pointee
@@ -398,7 +399,7 @@ final class GhosttyRuntime {
             }
         }
         var avail: [String] = []
-        if let a = c.available { for i in 0..<c.available_len { if let p = a[i] { avail.append(String(cString: p)) } } }
+        if let a = c.available { for i in 0..<c.available_len { avail.append(String(cString: a[i])) } }
         let text = reps.first { $0.0 == "text/plain" }.flatMap { String(data: $0.1, encoding: .utf8) } ?? ""
 
         DispatchQueue.main.async {
@@ -430,7 +431,8 @@ final class GhosttyRuntime {
         var text: String?
         for i in 0..<len {
             let c = content[i]
-            guard let m = c.mime, String(cString: m).hasPrefix("text/plain"), let d = c.data else { continue }
+            let m = c.mime, d = c.data
+            guard String(cString: m).hasPrefix("text/plain") else { continue }
             text = String(data: Data(bytes: d, count: c.len), encoding: .utf8)
         }
         guard let text else { return }
@@ -450,7 +452,7 @@ final class GhosttyRuntime {
         }
     }
 
-    private static func complete(_ surface: ghostty_surface_t, contents: [(String, Data)], available: [String], state: UnsafeMutableRawPointer?, confirmed: Bool = false) {
+    private static func complete(_ surface: ghostty_surface_t, contents: [(String, Data)], available: [String], state: UnsafeMutableRawPointer, confirmed: Bool = false) {
         var strings: [UnsafeMutablePointer<CChar>] = []
         var buffers: [UnsafeMutableRawPointer] = []
         defer { strings.forEach { free($0) }; buffers.forEach { $0.deallocate() } }
@@ -464,7 +466,7 @@ final class GhosttyRuntime {
             data.withUnsafeBytes { if let base = $0.baseAddress { buf.copyMemory(from: base, byteCount: $0.count) } }
             cContents.append(ghostty_clipboard_content_s(mime: m, data: buf.assumingMemoryBound(to: CChar.self), len: data.count))
         }
-        var cAvail: [UnsafePointer<CChar>?] = []
+        var cAvail: [UnsafePointer<CChar>] = []
         for a in available { if let s = strdup(a) { strings.append(s); cAvail.append(UnsafePointer(s)) } }
 
         cContents.withUnsafeBufferPointer { cb in

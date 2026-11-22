@@ -417,7 +417,9 @@ final class TabItemView: NSView, NSTextFieldDelegate {
 
     private func updateClose() {
         let compactWidth = bounds.width > 0 && bounds.width < 110
-        closeButton.isHidden = !((selected && !compactWidth) || hovering) || editor != nil
+        // A lone tab keeps its × out of sight until you point at it.
+        let alone = (bar?.itemViews.count ?? 2) < 2
+        closeButton.isHidden = !((selected && !compactWidth && !alone) || hovering) || editor != nil
         needsLayout = true
     }
 

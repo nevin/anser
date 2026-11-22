@@ -275,7 +275,8 @@ final class BlocksOverlayView: NSView {
                         y = b.top - b.rowHeight * Self.gapLinePosition
                     }
                 }
-                guard b.info != nil else { continue }
+                // Nothing above the first command on screen but the tab bar's own edge.
+                guard b.info != nil, gapAbove[b.markIndex] != nil || b.top >= b.rowHeight * 1.5 else { continue }
                 line.move(to: NSPoint(x: padX, y: y.rounded() + 0.5 / scale))
                 line.line(to: NSPoint(x: bounds.width - padX, y: y.rounded() + 0.5 / scale))
             }
@@ -367,14 +368,15 @@ final class BlocksOverlayView: NSView {
         let color: NSColor = b.running ? t.yellow : (failed ? t.red : t.foreground.withAlphaComponent(0.4))
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: failed ? .semibold : .regular),
                                                     .foregroundColor: color]
-        let s = NSMutableAttributedString(string: mark ?? "", attributes: attrs)
-        if let time {
-            s.append(NSAttributedString(string: (mark == nil ? "" : "  ") + time,
-                                        attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular),
-                                                     .foregroundColor: t.foreground.withAlphaComponent(0.32)]))
-        }
-        let size = s.size()
-        let pill = NSRect(x: bounds.width - size.width - 22, y: b.top + max(0, (b.rowHeight - size.height - 2) / 2), width: size.width + 12, height: size.height + 2)
+        let markText = mark.map { NSAttributedString(string: $0, attributes: attrs) }
+        let timeText = time.map { NSAttributedString(string: $0, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular),
+                                                                              .foregroundColor: t.foreground.withAlphaComponent(0.32)]) }
+        // The result and the time are drawn apart, with real space between them (spaces in this font are hair-thin).
+        let markSize = markText?.size() ?? .zero, timeSize = timeText?.size() ?? .zero
+        let gap: CGFloat = markText != nil && timeText != nil ? 8 : 0
+        let height = max(markSize.height, timeSize.height)
+        let width = (markText != nil ? markSize.width + 12 : 0) + gap + (timeText != nil ? timeSize.width + (markText == nil ? 12 : 6) : 0)
+        let pill = NSRect(x: bounds.width - width - 10, y: b.top + max(0, (b.rowHeight - height - 2) / 2), width: width, height: height + 2)
         // Never cover text: skip the mark when the command line reaches it
         // (the hover strip still shows the result).
         // Reads what's really on that row: a theme's prompt or right-side prompt (RPROMPT) can reach further than the command.
@@ -385,12 +387,17 @@ final class BlocksOverlayView: NSView {
         // A backing so a long command line under it stays readable around it.
         t.background.setFill()
         NSBezierPath(roundedRect: pill, xRadius: 4, yRadius: 4).fill()
-        if failed {
-            t.red.withAlphaComponent(0.14).setFill()
-            NSBezierPath(roundedRect: mark == nil ? pill : NSRect(x: pill.minX, y: pill.minY, width: NSAttributedString(string: mark!, attributes: attrs).size().width + 12, height: pill.height),
-                         xRadius: 4, yRadius: 4).fill()
-        }
-        s.draw(at: NSPoint(x: pill.minX + 6, y: pill.minY + 1))
+        var x = pill.minX
+        if let markText {
+            let tag = NSRect(x: x, y: pill.minY, width: markSize.width + 12, height: pill.height)
+            if failed {
+                t.red.withAlphaComponent(0.14).setFill()
+                NSBezierPath(roundedRect: tag, xRadius: 4, yRadius: 4).fill()
+            }
+            markText.draw(at: NSPoint(x: x + 6, y: pill.minY + 1))
+            x = tag.maxX + gap
+        } else { x += 6 }
+        timeText?.draw(at: NSPoint(x: x, y: pill.minY + 1 + (height - timeSize.height) / 2))
     }
 
     // MARK: Right-click menu
