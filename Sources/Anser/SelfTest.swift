@@ -52,6 +52,10 @@ enum SelfTest {
             Task { @MainActor in await fileEditorChecks(pane); finish() }
             return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "panefocus" {
+            Task { @MainActor in await emptyAreaFocusChecks(pane, wc); finish() }
+            return
+        }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "stop" {
             Task { @MainActor in await stopChecks(pane); finish() }
             return
@@ -183,6 +187,90 @@ enum SelfTest {
         await windowShot(w, "input-6-light")
         pane.run("cd ~ && rm -rf \(repo) # anser-selftest")
         _ = await wait(8) { s.atPrompt }
+    }
+
+    /// Clicking the empty space under a pane's input line (above its footer) focuses that pane.
+    @MainActor
+    static func emptyAreaFocusChecks(_ pane: PaneView, _ wc: TerminalWindowController) async {
+        _ = await wait(10) { pane.session.atPrompt }
+        pane.run("clear # anser-selftest")
+        _ = await wait(10) { pane.session.atPrompt }
+        wc.split(pane, vertical: true)
+        guard let other = wc.focusedPane, other !== pane, let window = wc.window else { check("clicking under the input focuses that pane", false, "no split"); return }
+        _ = await wait(10) { other.session.atPrompt && other.editorUsable }
+        window.contentView?.layoutSubtreeIfNeeded()
+        // Click the space between a pane's input line and its footer, both ways (the new pane may show its welcome).
+        func click(into target: PaneView) async -> String {
+            window.contentView?.layoutSubtreeIfNeeded()
+            let bar = target.inputBottomForTest
+            let inPane = NSPoint(x: target.bounds.midX, y: (target.footerTopForTest + bar) / 2)
+            let inWindow = target.convert(inPane, to: nil)
+            let hit = window.contentView?.superview?.hitTest(inWindow) ?? window.contentView?.hitTest(inWindow)
+            if let e = NSEvent.mouseEvent(with: .leftMouseDown, location: inWindow, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                          windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
+               let up = NSEvent.mouseEvent(with: .leftMouseUp, location: inWindow, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                           windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 0) {
+                window.sendEvent(e); window.sendEvent(up)
+            }
+            let moved = await wait(2) { wc.focusedPane === target }
+            await sleep(0.3)
+            let typing = window.firstResponder === target.editor
+            return (moved && typing ? "ok" : (moved ? "MISSED-editor(\(window.firstResponder.map { String(describing: Swift.type(of: $0)) } ?? "nil"))" : "MISSED")) + " hit \(hit.map { String(describing: Swift.type(of: $0)) } ?? "nil") y \(Int(inPane.y)) (input bottom \(Int(bar)), footer top \(Int(target.footerTopForTest)))"
+        }
+        let toFirst = await click(into: pane)
+        let toNew = await click(into: other)
+        check("clicking under the input focuses that pane", !toFirst.hasPrefix("MISSED") && !toNew.hasPrefix("MISSED"),
+              "first: \(toFirst) · new: \(toNew)")
+        // A window that isn't in front: the first click reaches the pane (focusing it) instead of only raising the window.
+        let firstClick = [pane.surfaceView.acceptsFirstMouse(for: nil), pane.editor.acceptsFirstMouse(for: nil),
+                          pane.card.acceptsFirstMouse(for: nil), pane.bar.acceptsFirstMouse(for: nil)]
+        // Another window in front; one click under the input of the first window's other pane.
+        let before = Set(NSApp.windows.map(ObjectIdentifier.init))
+        AppDelegate.shared.newWindow(cwd: nil)
+        let front = await wait(10) { NSApp.windows.contains { !before.contains(ObjectIdentifier($0)) && $0.isKeyWindow } }
+        let target = wc.focusedPane === pane ? other : pane
+        let r = await click(into: target)
+        check("a first click in a background window reaches the pane", !firstClick.contains(false) && front && r.hasPrefix("ok") && window.isKeyWindow,
+              "accepts \(firstClick) · other window in front \(front) · click: \(r) · window key \(window.isKeyWindow)")
+        for w in NSApp.windows where !before.contains(ObjectIdentifier(w)) && w.windowController is TerminalWindowController { w.close() }
+        window.makeKeyAndOrderFront(nil)
+        wc.close(other)
+    }
+
+    /// A branch switched outside the tab (another app, another tab) shows without a new prompt.
+    @MainActor
+    static func branchWatchChecks(_ pane: PaneView, tmp: String) async {
+        let s = pane.session
+        let repo = (tmp as NSString).appendingPathComponent("anser-selftest-branch-watch")
+        try? FileManager.default.removeItem(atPath: repo)
+        try? FileManager.default.createDirectory(atPath: repo, withIntermediateDirectories: true)
+        func git(_ args: [String]) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            p.arguments = ["-C", repo, "-c", "user.name=anser-selftest", "-c", "user.email=selftest@example.invalid"] + args
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            try? p.run(); p.waitUntilExit()
+        }
+        git(["init", "-q", "-b", "main"])
+        git(["commit", "-q", "--allow-empty", "-m", "init"])
+        _ = await wait(10) { s.atPrompt }
+        pane.run("cd \(ShellLexer.escape(repo)) # anser-selftest")
+        // In the repo for real: the cd has finished (the tab may already have been on another repo's main).
+        let onMain = await wait(10) {
+            s.atPrompt && s.blocks.last?.command.contains("anser-selftest-branch-watch") == true && s.gitBranch == "main"
+        }
+        await sleep(0.4)
+        let blocks = s.blocks.count, rereads = s.gitHeadRereads
+        // Switched by another program: no command runs in this tab.
+        git(["checkout", "-q", "-b", "anser-selftest-elsewhere"])
+        let followed = await wait(5) { s.gitBranch == "anser-selftest-elsewhere" }
+        pane.layoutSubtreeIfNeeded()
+        check("a branch switched outside the tab shows without a new prompt",
+              onMain && followed && s.blocks.count == blocks && s.gitHeadRereads > rereads && (pane.branchChipTooltip != nil),
+              "main=\(onMain) branch=\(s.gitBranch ?? "nil") blocks \(blocks)→\(s.blocks.count) rereads \(rereads)→\(s.gitHeadRereads)")
+        pane.run("cd \(ShellLexer.escape(tmp)) # anser-selftest")
+        _ = await wait(10) { s.atPrompt }
+        try? FileManager.default.removeItem(atPath: repo)
     }
 
     /// Room between commands: an empty row after each one, with the faint line drawn in it.
@@ -3285,6 +3373,7 @@ enum SelfTest {
         await processChecks(pane, wc)
         await themeOverrideChecks(wc)
         await commandGapChecks(pane)
+        await branchWatchChecks(pane, tmp: tmp)
         await closeBusyTabsCheck(pane, wc, tmp: tmp)
         await runtimeChecks(pane, wc, tmp: tmp)
         await stopChecks(pane)

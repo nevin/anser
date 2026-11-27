@@ -175,6 +175,7 @@ final class ShellSession {
     /// `keepShell`: Anser is quitting and the shell lives on in anser-session;
     /// leave its channel in place for the next launch.
     func close(keepShell: Bool = false) {
+        watchGit(nil)
         guard fd >= 0, !stopFlag.isSet else { return }
         stopFlag.set()
         // Wake the reader thread; it closes the descriptor on its way out.
@@ -515,6 +516,7 @@ final class ShellSession {
             head = t.hasPrefix("ref: refs/heads/") ? String(t.dropFirst(16)) : String(t.prefix(7))
         }
         gitBranch = head
+        watchGit(head == nil ? nil : gitDir)
         guard head != nil else { gitDirty = false; gitChangeCount = 0; gitRisky = false; delegate?.sessionDidUpdateInfo(self); return }
         gitRisky = GitSafety.isRisky(cwd: dir)
         if gitRisky {
@@ -525,6 +527,47 @@ final class ShellSession {
         }
         countGitChanges()
         delegate?.sessionDidUpdateInfo(self)
+    }
+
+    // A branch switched somewhere else (another tab, an editor, a git app) shows up here
+    // straight away, not only after this tab's next command.
+    private var gitWatcher: DispatchSourceFileSystemObject?
+    private var watchedGitDir: String?
+    private var headCheckPending = false
+    private(set) var gitHeadRereads = 0
+
+    /// Watches the repo's git folder (git replaces HEAD by renaming a new file into it).
+    private func watchGit(_ dir: String?) {
+        guard dir != watchedGitDir else { return }
+        gitWatcher?.cancel()
+        gitWatcher = nil
+        watchedGitDir = dir
+        guard let dir, !isRemote else { return }
+        let wfd = open(dir, O_EVTONLY)
+        guard wfd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: wfd, eventMask: [.write, .rename, .delete, .link], queue: .main)
+        src.setEventHandler { [weak self] in self?.gitFolderChanged() }
+        src.setCancelHandler { Darwin.close(wfd) }
+        src.resume()
+        gitWatcher = src
+    }
+
+    /// Only HEAD is re-read (a file read, no git process): git status itself writes
+    /// the index in this folder, so recounting changes here would feed itself.
+    private func gitFolderChanged() {
+        guard !headCheckPending else { return }
+        headCheckPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            self.headCheckPending = false
+            guard let dir = self.watchedGitDir, !self.isRemote,
+                  let h = try? String(contentsOfFile: dir + "/HEAD", encoding: .utf8) else { return }
+            let t = h.trimmingCharacters(in: .whitespacesAndNewlines)
+            let head = t.hasPrefix("ref: refs/heads/") ? String(t.dropFirst(16)) : String(t.prefix(7))
+            guard head != self.gitBranch else { return }
+            self.gitHeadRereads += 1
+            self.refreshGit()
+        }
     }
 
     /// One `git status` per session at a time. Requests that arrive while one is

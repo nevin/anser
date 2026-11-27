@@ -113,8 +113,10 @@ extension SelfTest {
             await sleep(0.5)
             let watch = StallWatch(); watch.start()
             let t0 = Date()
-            pane.run("\(cmd) # anser-selftest-perf")
-            _ = await wait(180) { pane.session.atPrompt && pane.session.blocks.last?.command.contains("anser-selftest-perf") == true && pane.session.blocks.last?.duration != nil }
+            // Each run has its own tag, so the wait can't match the run before it.
+            let tag = "anser-selftest-perf-\(label.hasPrefix("cat") ? "cat" : "seq")"
+            pane.run("\(cmd) # \(tag)")
+            _ = await wait(180) { pane.session.atPrompt && pane.session.blocks.last?.command.contains(tag) == true && pane.session.blocks.last?.duration != nil }
             let secs = Date().timeIntervalSince(t0)
             let lag = watch.stop()
             let shellSecs = pane.session.blocks.last?.duration ?? secs

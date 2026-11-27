@@ -61,6 +61,8 @@ extension PaneView {
 
     /// For tests: where the input area's top edge is.
     var barTopForTest: CGFloat { bar.frame.maxY }
+    var inputBottomForTest: CGFloat { bar.frame.minY }
+    var footerTopForTest: CGFloat { footer.frame.maxY }
 
     /// For tests: the bottom edge of the last output line (the top of the cursor's row), in pane coordinates.
     var outputBottomForTest: CGFloat? {

@@ -176,6 +176,9 @@ extension CommandEditor {
         extraSelections = Array(ranges.dropFirst())
     }
 
+    // Clicking the input of a pane in a window that isn't in front puts the caret there.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func mouseDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags == .option {

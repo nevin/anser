@@ -1363,7 +1363,13 @@ final class PaneView: NSView, ShellSessionDelegate {
     func sessionDidUpdateInfo(_ session: ShellSession) {
         updateProfile()
         refreshBar()
+        // The sidebar's Git section follows a branch switched from elsewhere too.
+        if session.gitBranch != shownBranch {
+            shownBranch = session.gitBranch
+            if windowController?.focusedPane === self { windowController?.refreshSidebar() }
+        }
     }
+    private var shownBranch: String?
 
     /// Whether you can see this pane now: Anser in front, this window showing, this tab selected.
     var sessionIsVisible: Bool {

@@ -32,7 +32,8 @@ final class BarView: NSView {
         }
     }
 
-    // Clicking anywhere in the bar focuses the editor.
+    // Clicking anywhere in the bar focuses the editor (in a window that isn't in front too).
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) {
         (superview as? PaneView)?.focus()
     }
@@ -42,6 +43,7 @@ final class BarView: NSView {
 /// input area, so there's no box around it.
 final class CardView: NSView {
     var focused = false
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
         (superview?.superview as? PaneView)?.focus()

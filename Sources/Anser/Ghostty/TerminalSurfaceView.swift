@@ -101,6 +101,13 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
     // MARK: Geometry
 
     override var acceptsFirstResponder: Bool { true }
+    // A click in a window that isn't in front (or with Anser in the background) focuses this pane
+    // instead of only raising the window; that first click isn't passed to the program.
+    private var focusOnlyClick: TimeInterval?
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        focusOnlyClick = !(window?.isKeyWindow ?? false) || !NSApp.isActive ? event?.timestamp : nil
+        return true
+    }
     override var isFlipped: Bool { false }
 
     override func viewDidMoveToWindow() {
@@ -385,6 +392,12 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if let t = focusOnlyClick, t == event.timestamp {
+            focusOnlyClick = nil
+            ignoreNextMouseUp = true
+            if let pane { pane.focus() } else { window?.makeFirstResponder(self) }
+            return
+        }
         if window?.firstResponder !== self { window?.makeFirstResponder(self) }
         guard let surface else { return }
         sendPos(event)
@@ -393,7 +406,10 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
         _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, Self.mods(event.modifierFlags))
     }
 
+    private var ignoreNextMouseUp = false
+
     override func mouseUp(with event: NSEvent) {
+        if ignoreNextMouseUp { ignoreNextMouseUp = false; return }
         guard let surface else { return }
         _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, Self.mods(event.modifierFlags))
         // After selecting with the mouse at a prompt, go back to the editor
