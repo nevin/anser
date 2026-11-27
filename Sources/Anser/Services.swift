@@ -225,6 +225,9 @@ final class Services {
     /// Tests set profiles without touching the user's config file.
     func setProfilesForTest(_ p: [Profile]) { config.profiles = p }
 
+    /// Tests open plain tabs next to kept ones without touching the user's config file.
+    func setKeepShellsForTest(_ on: Bool) { config.keepShellsRunning = on }
+
     // MARK: Notifications
 
     private var askedForNotifications = false

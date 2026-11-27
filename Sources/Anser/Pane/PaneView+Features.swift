@@ -287,14 +287,17 @@ extension PaneView {
             if pullRequest != nil || !conflicts.isEmpty { pullRequest = nil; conflicts = []; gitOperation = nil; refreshBar() }
             return
         }
-        guard !gitExtrasRunning else { return }
+        guard !gitExtrasRunning else { gitExtrasAgain = true; return }
         gitExtrasRunning = true
         let cwd = session.cwd, env = session.env
         Task { @MainActor [weak self] in
             let porcelain = await ScriptRunner.shared.run("git status --porcelain 2>/dev/null | grep -E '^(UU|AA|DD|AU|UA|DU|UD) ' | head -300",
                                                           cwd: cwd, env: env, timeout: 3) ?? ""
             guard let self else { return }
-            defer { self.gitExtrasRunning = false }
+            defer {
+                self.gitExtrasRunning = false
+                if self.gitExtrasAgain { self.gitExtrasAgain = false; self.refreshGitExtras() }
+            }
             guard self.session.cwd == cwd else { return }
             let gitDir = GitInfo.gitDir(for: cwd)
             self.conflicts = GitInfo.parseConflicts(porcelain)
@@ -307,15 +310,19 @@ extension PaneView {
             let key = (gitDir ?? cwd) + "#" + branch
             if let c = Self.prCache[key], Date().timeIntervalSince(c.at) < 120 {
                 self.pullRequest = c.pr
+                self.pullRequestKey = key
                 self.refreshBar()
                 return
             }
-            Self.prCache[key] = (Date(), self.pullRequest)   // one lookup at a time per branch
+            // One lookup at a time per branch. Meanwhile keep what's showing only if it's this
+            // branch's: never another branch's PR.
+            Self.prCache[key] = (Date(), self.pullRequestKey == key ? self.pullRequest : nil)
             let json = await ScriptRunner.shared.run("gh pr view --json \(GitInfo.prFields) 2>/dev/null", cwd: cwd, env: env, timeout: 10) ?? ""
             let pr = GitInfo.parsePullRequest(json)
             Self.prCache[key] = (Date(), pr)
             guard self.session.gitBranch == branch, self.session.cwd == cwd else { return }
             self.pullRequest = pr
+            self.pullRequestKey = key
             self.refreshBar()
         }
     }

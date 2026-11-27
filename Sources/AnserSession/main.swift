@@ -76,6 +76,10 @@ func cStringArray(_ strings: [String]) -> [UnsafeMutablePointer<CChar>?] {
     strings.map { strdup($0) } + [nil]
 }
 
+/// Written to when a shell ends, so the helper notices without reading its terminal
+/// (which a direct client reads instead).
+var childWrite: Int32 = -1
+
 // MARK: - Helper (daemon)
 
 final class Daemon {
@@ -99,6 +103,12 @@ final class Daemon {
         var pending: Int { out.count - sent }
         var session: String?
         var closeAfterFlush = false
+        /// The shell's terminal, to pass once everything queued before it (the replay) is out.
+        var handoff: Int32?
+        /// The client has the terminal and reads and writes it itself.
+        var direct = false
+        /// Reading the terminal is the client's job (or will be, once the handoff is out).
+        var ownsTerminal: Bool { direct || handoff != nil }
     }
 
     let path: String
@@ -106,6 +116,7 @@ final class Daemon {
     var clients: [Int32: Client] = [:]
     var sessions: [String: Session] = [:]
     var idleSince = Date()
+    var childRead: Int32 = -1
 
     init(path: String) { self.path = path }
 
@@ -130,6 +141,15 @@ final class Daemon {
         setNonBlocking(listenFD)
         signal(SIGHUP, SIG_IGN)
         signal(SIGINT, SIG_IGN)
+        var childPipe: [Int32] = [-1, -1]
+        if pipe(&childPipe) == 0 {
+            childRead = childPipe[0]; childWrite = childPipe[1]
+            for fd in childPipe { setNonBlocking(fd); setCloseOnExec(fd) }
+            var sa = sigaction()
+            sa.__sigaction_u.__sa_handler = { _ in var b: UInt8 = 1; _ = write(childWrite, &b, 1) }
+            sa.sa_flags = SA_RESTART | SA_NOCLDSTOP
+            sigaction(SIGCHLD, &sa, nil)
+        }
 
         while true {
             loopOnce()
@@ -143,8 +163,17 @@ final class Daemon {
 
     private func loopOnce() {
         var fds: [pollfd] = [pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0)]
-        for (fd, c) in clients { fds.append(pollfd(fd: fd, events: Int16(POLLIN) | (c.pending == 0 ? 0 : Int16(POLLOUT)), revents: 0)) }
+        if childRead >= 0 { fds.append(pollfd(fd: childRead, events: Int16(POLLIN), revents: 0)) }
+        for (fd, c) in clients {
+            let out = c.pending > 0 || c.handoff != nil
+            fds.append(pollfd(fd: fd, events: Int16(POLLIN) | (out ? Int16(POLLOUT) : 0), revents: 0))
+        }
         for s in sessions.values where s.masterOpen {
+            // Handed over: the client reads it.
+            if ownsTerminal(s) {
+                if !s.toShell.isEmpty { fds.append(pollfd(fd: s.master, events: Int16(POLLOUT), revents: 0)) }
+                continue
+            }
             // Backpressure, like a real terminal: while the pane is behind on
             // drawing, stop reading, so the program waits instead of output piling up.
             let behind = s.client.map { (clients[$0]?.pending ?? 0) > Self.maxBehind } ?? false
@@ -155,6 +184,11 @@ final class Daemon {
         if n > 0 {
             for p in fds where p.revents != 0 {
                 if p.fd == listenFD { acceptClients(); continue }
+                if p.fd == childRead {
+                    var b = [UInt8](repeating: 0, count: 64)
+                    while read(childRead, &b, b.count) > 0 {}
+                    continue
+                }
                 if clients[p.fd] != nil { serviceClient(p.fd, p.revents); continue }
                 if let s = sessions.values.first(where: { $0.master == p.fd }) { serviceShell(s, p.revents) }
             }
@@ -175,6 +209,26 @@ final class Daemon {
     }
 
     static let maxBehind = 1 << 20
+
+    private func ownsTerminal(_ s: Session) -> Bool { s.client.flatMap { clients[$0] }?.ownsTerminal ?? false }
+
+    /// Passes the terminal once everything queued before it (the replay) has gone out.
+    private func sendHandoff(_ fd: Int32) {
+        guard var c = clients[fd], let master = c.handoff, c.pending == 0 else { return }
+        // The shell's pid goes along, so the tab can tell when another program is in front.
+        let pid = c.session.flatMap { sessions[$0]?.pid } ?? 0
+        let header = SessionProtocol.frame(.handoff, json: ["pid": Int(pid)])
+        let n = DescriptorPassing.send(fd, header, passing: master)
+        if n > 0 {
+            // The descriptor went with the first byte; anything short goes out as plain bytes.
+            if n < header.count { c.out = header.subdata(in: n..<header.count); c.sent = 0 }
+            c.handoff = nil
+            c.direct = true
+        } else if errno != EAGAIN && errno != EINTR {
+            c.handoff = nil   // stay on the relay
+        }
+        clients[fd] = c
+    }
 
     private func send(_ fd: Int32, _ frame: Data) {
         guard clients[fd] != nil else { return }
@@ -199,6 +253,7 @@ final class Daemon {
             clients[fd] = c
             if c.pending == 0 && c.closeAfterFlush { drop(fd); return }
         }
+        if ev & Int16(POLLOUT) != 0, clients[fd]?.handoff != nil { sendHandoff(fd) }
         if ev & Int16(POLLIN | POLLHUP | POLLERR) != 0 {
             var buf = [UInt8](repeating: 0, count: 65536)
             let n = read(fd, &buf, buf.count)
@@ -219,6 +274,13 @@ final class Daemon {
             if (json["mode"] as? String) == "control" { control(fd, json) } else { attach(fd, json) }
         case .input:
             if let id = clients[fd]?.session, let s = sessions[id] { s.toShell.append(payload) }
+        case .replay:
+            // What a direct client showed: the replay for whoever attaches next.
+            if clients[fd]?.direct == true, let id = clients[fd]?.session, let s = sessions[id], s.client == fd {
+                var r = ReplayBuffer(limit: s.replay.limit)
+                r.append(payload)
+                s.replay = r
+            }
         case .resize:
             if let id = clients[fd]?.session, let s = sessions[id], let size = SessionProtocol.parseResize(payload) {
                 var ws = winsize(ws_row: UInt16(size.rows), ws_col: UInt16(size.cols), ws_xpixel: 0, ws_ypixel: 0)
@@ -266,6 +328,12 @@ final class Daemon {
             _ = ioctl(session.master, TIOCSWINSZ, &smaller)
         }
         _ = ioctl(session.master, TIOCSWINSZ, &ws)
+        // A client that asks reads and writes the terminal itself (Anser's own tabs, with
+        // Ghostty reading it directly). Older clients and plain `attach` stay on the relay.
+        if (json["direct"] as? Bool) == true, !Self.ignoreDirect {
+            clients[fd]?.handoff = session.master
+            sendHandoff(fd)
+        }
     }
 
     private func spawn(id: String, json: [String: Any], cols: Int, rows: Int) -> Session? {
@@ -296,6 +364,9 @@ final class Daemon {
         setNonBlocking(master)
         return Session(id: id, master: master, pid: pid)
     }
+
+    /// Tests: behave like a helper from before direct tabs (Anser falls back to `attach`).
+    static let ignoreDirect = ProcessInfo.processInfo.environment["ANSER_SESSION_IGNORE_DIRECT"] == "1"
 
     static var userShell: String {
         if let pw = getpwuid(getuid()), let s = pw.pointee.pw_shell { return String(cString: s) }
@@ -391,7 +462,7 @@ final class Daemon {
                 if !s.masterOpen { /* background jobs may still hold it; keep waiting */ }
                 continue
             }
-            if s.masterOpen { readShell(s) }
+            if s.masterOpen && !ownsTerminal(s) { readShell(s) }
             let code: Int32 = r < 0 ? 1 : (status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f)
             if let c = s.client {
                 send(c, SessionProtocol.frame(.exit, SessionProtocol.exitPayload(code)))

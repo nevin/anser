@@ -11,7 +11,8 @@ final class SessionHost {
 
     /// Self-tests use their own helper, never the one holding your real shells.
     let directory: URL = Services.isSelfTest
-        ? URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("anser-st-sessions")
+        ? URL(fileURLWithPath: ProcessInfo.processInfo.environment["ANSER_SELFTEST_SESSIONS"]
+              ?? NSTemporaryDirectory() + "anser-st-sessions")
         : SessionProtocol.defaultDirectory
 
     var socketPath: String { directory.appendingPathComponent("d.sock").path }

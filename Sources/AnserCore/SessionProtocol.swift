@@ -19,6 +19,13 @@ public enum SessionProtocol {
         case resize = 0x57       // W
         /// Helper → client: terminal output.
         case output = 0x4F       // O
+        /// Helper → client, JSON `{"pid": shell}`, carrying the shell's terminal (SCM_RIGHTS): a client that
+        /// asked with `"direct": true` reads and writes it itself from now on. Sent after the
+        /// replay; the helper stops reading the terminal until that client leaves.
+        case handoff = 0x44      // D
+        /// Client → helper, after a handoff: the recent output the client showed. It replaces
+        /// the helper's replay (sent on the way out, and now and then in case of a crash).
+        case replay = 0x50       // P
         /// Helper → client: the shell exited; 4-byte status.
         case exit = 0x58         // X
         /// Helper → client: JSON reply to a control request.

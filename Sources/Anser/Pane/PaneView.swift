@@ -113,6 +113,8 @@ final class PaneView: NSView, ShellSessionDelegate {
     /// Settings from a matching profile (Settings → Profiles).
     var profile: Profile?
     var pullRequest: GitInfo.PullRequest?
+    /// The repo and branch `pullRequest` belongs to.
+    var pullRequestKey: String?
     var conflicts: [GitInfo.Conflict] = []
     var gitOperation: GitInfo.Operation?
     /// A one-time tip showing in the status row (never over the output).
@@ -219,15 +221,27 @@ final class PaneView: NSView, ShellSessionDelegate {
         session = ShellSession(cwd: cwd, persistentID: id, restored: restored)
         var env = session.shellEnvironment()
         var command = session.shellCommand
-        if let id, let helper = host.helperPath {
+        var direct: DirectTerminal?
+        if let id, host.helperPath != nil, Self.directKeptTabs {
+            // The helper hands over the shell's own terminal, and Ghostty reads it directly.
+            direct = DirectTerminal.open(id: id, cwd: session.cwd, command: command, env: env)
+        }
+        if direct == nil, let id, let helper = host.helperPath {
             // The terminal runs the attach helper, which runs (or reconnects to) the real shell.
             env["ANSER_SESSION_ID"] = id
             env["ANSER_SESSION_SOCKET"] = host.socketPath
             env["ANSER_SESSION_COMMAND"] = command ?? ""
             command = ShellLexer.escape(helper) + " attach"
         }
-        surfaceView = TerminalSurfaceView(workingDirectory: session.cwd, command: command, env: env)
+        self.direct = direct
+        if let direct {
+            surfaceView = TerminalSurfaceView(workingDirectory: session.cwd, command: nil, env: env,
+                                              adoptPTY: direct.fd, initialOutput: direct.replay)
+        } else {
+            surfaceView = TerminalSurfaceView(workingDirectory: session.cwd, command: command, env: env)
+        }
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        watchDirect()
         wantsLayer = true
         session.delegate = self
         surfaceView.pane = self
@@ -432,6 +446,24 @@ final class PaneView: NSView, ShellSessionDelegate {
         PerfProbe.time("pane layout") { layoutPane() }
     }
 
+    /// At a prompt, with the input line following short output, the empty space between it and
+    /// the status row is part of the input: a click there focuses it instead of landing on the
+    /// terminal's blank rows. Scrolling there still scrolls the terminal.
+
+    /// Tests: the event a hit test is for (synthetic clicks don't set `NSApp.currentEvent`).
+    static var clickTypeForTests: NSEvent.EventType?
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        guard let hit, hit === surfaceView || hit.isDescendant(of: surfaceView), bar.floating, !bar.isHidden,
+              editorUsable, !fullscreenProgram else { return hit }
+        switch Self.clickTypeForTests ?? NSApp.currentEvent?.type {
+        case .leftMouseDown, .leftMouseUp, .leftMouseDragged: break
+        default: return hit
+        }
+        let p = convert(point, from: superview)
+        return p.y < bar.frame.minY && p.y >= footer.frame.maxY ? bar : hit
+    }
+
 
     private func layoutPane() {
         super.layout()
@@ -470,6 +502,10 @@ final class PaneView: NSView, ShellSessionDelegate {
         if roomForTallInput { reserved = barHeight }
         let target = NSRect(x: 0, y: reserved, width: w, height: max(0, bounds.height - reserved - headerH))
         if surfaceView.frame != target { surfaceView.frame = target }
+        // Where the input line goes: right under the output when it's short, else at the bottom.
+        let h = barHeight - Self.statusHeight
+        let barY = followTop.map { max(Self.statusHeight, $0 - h) } ?? Self.statusHeight
+        bar.floating = barY > Self.statusHeight + 0.5
         let fillBottom: CGFloat = fullscreenProgram ? 0 : Self.statusHeight
         inputAreaFill.frame = NSRect(x: 0, y: fillBottom, width: w, height: max(0, target.minY - fillBottom))
         dimView.frame = target
@@ -486,13 +522,10 @@ final class PaneView: NSView, ShellSessionDelegate {
             let fh = min(max(160, target.height * 0.6), target.height - 8)
             fp.frame = NSRect(x: 8, y: target.maxY - fh - 6, width: max(200, w - 16), height: fh)
         }
-        // The footer stays at the bottom; the input line follows the output above it.
+        // The status row stays at the bottom; the input line follows the output above it.
         footer.frame = NSRect(x: 0, y: 0, width: w, height: Self.statusHeight)
         let imageBottom: CGFloat = fullscreenProgram ? 0 : Self.statusHeight
         backgroundImageView.frame = NSRect(x: 0, y: imageBottom, width: w, height: max(0, bounds.height - imageBottom))
-        let h = barHeight - Self.statusHeight
-        let barY = followTop.map { max(Self.statusHeight, $0 - h) } ?? Self.statusHeight
-        bar.floating = barY > Self.statusHeight + 0.5
         bar.frame = NSRect(x: 0, y: barY, width: w, height: h)
         let pad: CGFloat = 10
 
@@ -1365,8 +1398,15 @@ final class PaneView: NSView, ShellSessionDelegate {
         refreshBar()
         // The sidebar's Git section follows a branch switched from elsewhere too.
         if session.gitBranch != shownBranch {
+            let switched = shownBranch != nil
             shownBranch = session.gitBranch
             if windowController?.focusedPane === self { windowController?.refreshSidebar() }
+            // The pull request and conflicts belong to the old branch: drop them and look again,
+            // so a branch switched elsewhere never shows next to the old branch's PR.
+            if switched {
+                if pullRequest != nil { pullRequest = nil; refreshBar() }
+                refreshGitExtras()
+            }
         }
     }
     private var shownBranch: String?
@@ -1580,6 +1620,8 @@ final class PaneView: NSView, ShellSessionDelegate {
     /// even on servers without Anser's hooks).
     private(set) var sshTarget: String?
     var gitExtrasRunning = false
+    /// Asked again while a check was running (the branch changed): check once more after it.
+    var gitExtrasAgain = false
     var previewPopover: NSPopover?
     var previewAnchor: NSPoint = .zero
     /// The file being previewed (for tests).
@@ -1595,6 +1637,8 @@ final class PaneView: NSView, ShellSessionDelegate {
 
     /// Tests: let go of the shell without ending it, as quitting does.
     var keepShellOnClose = false
+    /// A kept shell whose terminal Ghostty reads directly (nil: a plain shell, or `attach`).
+    let direct: DirectTerminal?
 
     func teardown() {
         guard !closed else { return }
@@ -1616,6 +1660,7 @@ final class PaneView: NSView, ShellSessionDelegate {
         filterPanel?.removeFromSuperview()
         filterPanel = nil
         editor.hidePopup()
+        releaseDirect(keep: keep)
         surfaceView.destroy()
         session.close(keepShell: keep)
         MemoryManager.shared.releaseSoon()

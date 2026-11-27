@@ -28,6 +28,10 @@ enum SelfTest {
             Task { @MainActor in await resizeChecks(pane, wc); finish() }
             return
         }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "adopt" {
+            Task { @MainActor in for r in await adoptChecks() { check(r.0, r.1, r.2) }; finish() }
+            return
+        }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "perf" {
             Task { @MainActor in await perfChecks(pane, wc); finish() }
             return
@@ -93,6 +97,30 @@ enum SelfTest {
         }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "profile" {
             Task { @MainActor in await profileChecks(pane, wc); finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "branch" {
+            Task { @MainActor in await branchWatchChecks(pane, tmp: NSTemporaryDirectory()); finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "crash1" {
+            Task { @MainActor in await crashBefore(pane) }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "crash2" {
+            Task { @MainActor in for r in await crashAfter(wc) { check(r.0, r.1, r.2) }; finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "fallback" {
+            Task { @MainActor in for r in await fallbackChecks(pane, wc) { check(r.0, r.1, r.2) }; finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "keptperf" {
+            Task { @MainActor in for r in await keptPerfChecks(wc) { check(r.0, r.1, r.2) }; finish() }
+            return
+        }
+        if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "direct" {
+            Task { @MainActor in for r in await directChecks(pane, wc) { check(r.0, r.1, r.2) }; finish() }
             return
         }
         if ProcessInfo.processInfo.environment["ANSER_SELFTEST_ONLY"] == "busytabs" {
@@ -205,7 +233,9 @@ enum SelfTest {
             let bar = target.inputBottomForTest
             let inPane = NSPoint(x: target.bounds.midX, y: (target.footerTopForTest + bar) / 2)
             let inWindow = target.convert(inPane, to: nil)
+            PaneView.clickTypeForTests = .leftMouseDown
             let hit = window.contentView?.superview?.hitTest(inWindow) ?? window.contentView?.hitTest(inWindow)
+            PaneView.clickTypeForTests = nil
             if let e = NSEvent.mouseEvent(with: .leftMouseDown, location: inWindow, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
                                           windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
                let up = NSEvent.mouseEvent(with: .leftMouseUp, location: inWindow, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
@@ -220,6 +250,9 @@ enum SelfTest {
         let toFirst = await click(into: pane)
         let toNew = await click(into: other)
         check("clicking under the input focuses that pane", !toFirst.hasPrefix("MISSED") && !toNew.hasPrefix("MISSED"),
+              "first: \(toFirst) · new: \(toNew)")
+        // At a prompt, that space belongs to the input line: the click goes to it, not the terminal.
+        check("the space under the input is part of the input", toFirst.contains("hit BarView") && toNew.contains("hit BarView"),
               "first: \(toFirst) · new: \(toNew)")
         // A window that isn't in front: the first click reaches the pane (focusing it) instead of only raising the window.
         let firstClick = [pane.surfaceView.acceptsFirstMouse(for: nil), pane.editor.acceptsFirstMouse(for: nil),
@@ -261,10 +294,15 @@ enum SelfTest {
         }
         await sleep(0.4)
         let blocks = s.blocks.count, rereads = s.gitHeadRereads
+        // main's pull request is showing; it mustn't stay next to the other branch.
+        pane.pullRequest = GitInfo.parsePullRequest(#"{"number": 4242, "title": "main's PR", "state": "OPEN"}"#)
+        pane.refreshBar()
         // Switched by another program: no command runs in this tab.
         git(["checkout", "-q", "-b", "anser-selftest-elsewhere"])
         let followed = await wait(5) { s.gitBranch == "anser-selftest-elsewhere" }
         pane.layoutSubtreeIfNeeded()
+        check("the old branch's pull request goes with it", pane.pullRequest?.number != 4242,
+              "still showing #\(pane.pullRequest?.number ?? 0) on \(s.gitBranch ?? "nil")")
         check("a branch switched outside the tab shows without a new prompt",
               onMain && followed && s.blocks.count == blocks && s.gitHeadRereads > rereads && (pane.branchChipTooltip != nil),
               "main=\(onMain) branch=\(s.gitBranch ?? "nil") blocks \(blocks)→\(s.blocks.count) rereads \(rereads)→\(s.gitHeadRereads)")

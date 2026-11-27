@@ -91,7 +91,9 @@ extension PaneView {
     /// Something other than the shell is in the foreground (a build, ssh, vim…).
     var hasRunningProcess: Bool {
         if session.running != nil { return true }
-        // The terminal's own foreground process is the attach helper; ask anser-session about the real shell.
+        // A direct tab has the shell's own terminal; through `attach`, the terminal's foreground
+        // process is the helper, so ask anser-session about the real shell.
+        if let direct, !direct.closed, direct.shellPID > 0 { return direct.busy }
         if session.persistent { return SessionHost.shared.busy(session.id) }
         guard let s = surfaceView.surface, session.shellPID > 0 else { return false }
         let fg = ghostty_surface_foreground_pid(s)

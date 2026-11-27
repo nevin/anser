@@ -20,7 +20,11 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
         return Unmanaged<TerminalSurfaceView>.fromOpaque(ud).takeUnretainedValue()
     }
 
-    init(workingDirectory: String?, command: String?, env: [String: String]) {
+    /// With `adoptPTY`, the surface shows that existing pty (master side) instead of running
+    /// `command`, starting with `initialOutput`. Ghostty keeps its own copy of the fd and never
+    /// signals the process behind it.
+    init(workingDirectory: String?, command: String?, env: [String: String],
+         adoptPTY: Int32? = nil, initialOutput: [UInt8] = []) {
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         guard let app = GhosttyRuntime.shared.app else { return }
 
@@ -38,11 +42,16 @@ final class TerminalSurfaceView: NSView, NSTextInputClient {
 
         if let wd = workingDirectory { cfg.working_directory = UnsafePointer(c(wd)) }
         if let command { cfg.command = UnsafePointer(c(command)) }
+        if let fd = adoptPTY { cfg.adopt_pty = true; cfg.pty_fd = fd }
         var vars = env.map { ghostty_env_var_s(key: UnsafePointer(c($0.key)), value: UnsafePointer(c($0.value))) }
         vars.withUnsafeMutableBufferPointer { buf in
             cfg.env_vars = buf.baseAddress
             cfg.env_var_count = buf.count
-            surface = ghostty_surface_new(app, &cfg)
+            initialOutput.withUnsafeBufferPointer { out in
+                cfg.initial_output = out.baseAddress
+                cfg.initial_output_len = out.count
+                surface = ghostty_surface_new(app, &cfg)
+            }
         }
         updateTrackingAreas()
         registerForDraggedTypes([.fileURL])

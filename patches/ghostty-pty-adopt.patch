@@ -1,0 +1,426 @@
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 1661451a2..e28abee95 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -534,6 +534,11 @@ typedef struct {
+   const char* GHOSTTY_NULLABLE initial_input;
+   bool wait_after_command;
+   ghostty_surface_context_e context;
++  // Anser: show an existing pty instead of starting a command (see embedded.zig).
++  bool adopt_pty;
++  int pty_fd;
++  const uint8_t* GHOSTTY_NULLABLE initial_output;
++  size_t initial_output_len;
+ } ghostty_surface_config_s;
+ 
+ typedef struct {
+@@ -1274,6 +1279,10 @@ typedef struct {
+   uint32_t index;
+ } ghostty_prompt_mark_s;
+ GHOSTTY_API size_t ghostty_surface_prompt_marks(ghostty_surface_t, ghostty_prompt_mark_s*, size_t);
++// Anser: adopted ptys (ghostty_surface_config_s.adopt_pty).
++GHOSTTY_API void ghostty_surface_child_exited(ghostty_surface_t, uint32_t, uint64_t);
++GHOSTTY_API size_t ghostty_surface_recent_output(ghostty_surface_t, uint8_t*, size_t);
++GHOSTTY_API uint64_t ghostty_surface_recent_output_total(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+ 
+ #ifdef __APPLE__
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 1d200cf4e..62ec8422b 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -697,6 +697,8 @@ pub fn init(
+             .term = config.term,
+             .rt_pre_exec_info = .init(config),
+             .rt_post_fork_info = .init(config),
++            .adopt_fd = if (comptime @hasField(apprt.runtime.Surface, "adopt_pty_fd")) rt_surface.adopt_pty_fd else null,
++            .initial_output = if (comptime @hasField(apprt.runtime.Surface, "adopt_initial_output")) rt_surface.adopt_initial_output else "",
+         });
+         errdefer io_exec.deinit();
+ 
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 52af1b6d6..799fb1965 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -454,6 +454,10 @@ pub const Surface = struct {
+     cursor_pos: apprt.CursorPos,
+     inspector: ?*Inspector = null,
+ 
++    /// Anser: set only while the core surface initializes (it copies them).
++    adopt_pty_fd: ?std.posix.fd_t = null,
++    adopt_initial_output: []const u8 = "",
++
+     /// The current title of the surface. The embedded apprt saves this so
+     /// that getTitle works without the implementer needing to save it.
+     title: ?[:0]const u8 = null,
+@@ -499,6 +503,18 @@ pub const Surface = struct {
+ 
+         /// Context for the new surface
+         context: apprt.surface.NewSurfaceContext = .window,
++
++        /// Anser: show this existing pty (its master side) instead of
++        /// starting a command. The fd is duplicated, so the caller still
++        /// owns pty_fd. The process behind it is never signalled; report
++        /// its exit with ghostty_surface_child_exited.
++        adopt_pty: bool = false,
++        pty_fd: c_int = -1,
++
++        /// Anser: output shown before anything read from the adopted pty.
++        /// Copied during ghostty_surface_new.
++        initial_output: ?[*]const u8 = null,
++        initial_output_len: usize = 0,
+     };
+ 
+     pub fn init(self: *Surface, app: *App, opts: Options) !void {
+@@ -612,6 +628,18 @@ pub const Surface = struct {
+             config.@"wait-after-command" = true;
+         }
+ 
++        // Anser: adopt an existing pty. Exec.init duplicates the fd and
++        // copies the output during core_surface.init, so these are only
++        // borrowed for the call.
++        if (opts.adopt_pty and opts.pty_fd >= 0) {
++            self.adopt_pty_fd = opts.pty_fd;
++            if (opts.initial_output) |p| self.adopt_initial_output = p[0..opts.initial_output_len];
++        }
++        defer {
++            self.adopt_pty_fd = null;
++            self.adopt_initial_output = "";
++        }
++
+         // Initialize our surface right away. We're given a view that is
+         // ready to use.
+         try self.core_surface.init(
+@@ -2074,6 +2102,33 @@ pub const CAPI = struct {
+         return false;
+     }
+ 
++    /// Anser: the process behind an adopted pty exited. Same handling as a
++    /// child Ghostty started itself (message, or close on next key).
++    export fn ghostty_surface_child_exited(surface: *Surface, exit_code: u32, runtime_ms: u64) void {
++        surface.core_surface.handleMessage(.{ .child_exited = .{
++            .exit_code = exit_code,
++            .runtime_ms = runtime_ms,
++        } }) catch |err| log.warn("error handling adopted child exit err={}", .{err});
++    }
++
++    /// Anser: copies up to cap bytes of an adopted pty's most recent output
++    /// (newest last) into buf. Returns 0 for surfaces that didn't adopt one.
++    export fn ghostty_surface_recent_output(surface: *Surface, buf: [*]u8, cap: usize) usize {
++        const recent = switch (surface.core_surface.io.backend) {
++            .exec => |*exec| exec.recent,
++        } orelse return 0;
++        return recent.copyOut(buf[0..cap]);
++    }
++
++    /// Anser: how many bytes of output an adopted pty has produced so far
++    /// (including its initial output). Changes whenever there's new output.
++    export fn ghostty_surface_recent_output_total(surface: *Surface) u64 {
++        const recent = switch (surface.core_surface.io.backend) {
++            .exec => |*exec| exec.recent,
++        } orelse return 0;
++        return recent.totalBytes();
++    }
++
+     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
+         ptr.deinit();
+     }
+diff --git a/src/termio/Exec.zig b/src/termio/Exec.zig
+index a10001f7a..87eec4425 100644
+--- a/src/termio/Exec.zig
++++ b/src/termio/Exec.zig
+@@ -44,20 +44,33 @@ const FlatpakHostCommand = if (!build_config.flatpak) struct {
+ /// The subprocess state for our exec backend.
+ subprocess: Subprocess,
+ 
++/// Anser: a copy of recent output, kept only for adopted terminals so the
++/// embedder can hand it back to whoever replays it later.
++recent: ?*RecentOutput = null,
++
+ /// Initialize the exec state. This will NOT start it, this only sets
+ /// up the internal state necessary to start it later.
+ pub fn init(
+     alloc: Allocator,
+     cfg: Config,
+ ) !Exec {
++    const adopting = cfg.adopt_fd != null;
++    const initial_output = cfg.initial_output;
+     var subprocess = try Subprocess.init(alloc, cfg);
+     errdefer subprocess.deinit();
+ 
+-    return .{ .subprocess = subprocess };
++    const recent: ?*RecentOutput = if (adopting) recent: {
++        const r = try RecentOutput.create(alloc);
++        r.append(initial_output);
++        break :recent r;
++    } else null;
++
++    return .{ .subprocess = subprocess, .recent = recent };
+ }
+ 
+ pub fn deinit(self: *Exec) void {
+     self.subprocess.deinit();
++    if (self.recent) |r| r.destroy();
+ }
+ 
+ /// Call to initialize the terminal state as necessary for this backend.
+@@ -114,6 +127,10 @@ pub fn threadEnter(
+         // as a special case in os/flatpak.zig) since the
+         // command is on the host.
+         .flatpak => null,
++
++        // Anser: an adopted terminal's shell isn't our child. The
++        // embedder tells us when it exits.
++        .adopted => null,
+     } else return error.ProcessNotStarted;
+     errdefer if (process) |*p| p.deinit();
+ 
+@@ -137,11 +154,16 @@ pub fn threadEnter(
+     errdefer termios_timer.deinit();
+ 
+     // Start our read thread
+-    const read_thread = try std.Thread.spawn(
+-        .{},
+-        if (builtin.target.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
+-        .{ pty_fds.read, io, pipe[0] },
+-    );
++    const read_thread = try if (comptime builtin.target.os.tag == .windows)
++        std.Thread.spawn(.{}, ReadThread.threadMainWindows, .{ pty_fds.read, io, pipe[0] })
++    else
++        std.Thread.spawn(.{}, ReadThread.threadMainPosix, .{
++            pty_fds.read,
++            io,
++            pipe[0],
++            self.subprocess.initial_output,
++            self.recent,
++        });
+     read_thread.setName(global.io(), "io-reader") catch {};
+ 
+     // Setup our threadata backend state to be our own
+@@ -174,7 +196,7 @@ pub fn threadEnter(
+                 flatpakExit,
+             ),
+ 
+-            .fork_exec => {},
++            .fork_exec, .adopted => {},
+         }
+     }
+ 
+@@ -582,6 +604,16 @@ pub const Config = struct {
+ 
+     rt_pre_exec_info: Command.RtPreExecInfo,
+     rt_post_fork_info: Command.RtPostForkInfo,
++
++    /// Anser: use this existing pty master instead of opening a pty and
++    /// starting the command. It's duplicated during init, so the caller
++    /// keeps (and closes) its own descriptor. The process on the other
++    /// side is never signalled or waited for.
++    adopt_fd: ?posix.fd_t = null,
++
++    /// Anser: output to show before anything read from the adopted pty
++    /// (the history of a shell that's being reattached). Copied in init.
++    initial_output: []const u8 = "",
+ };
+ 
+ const Subprocess = struct {
+@@ -596,6 +628,10 @@ const Subprocess = struct {
+     pty: ?Pty = null,
+     process: ?Process = null,
+ 
++    /// Anser: see Config.adopt_fd. Owned by us until start moves it into pty.
++    adopt_fd: ?posix.fd_t = null,
++    initial_output: []const u8 = "",
++
+     rt_pre_exec_info: Command.RtPreExecInfo,
+     rt_post_fork_info: Command.RtPostForkInfo,
+ 
+@@ -606,6 +642,9 @@ const Subprocess = struct {
+ 
+         /// Flatpak DBus command
+         flatpak: FlatpakHostCommand,
++
++        /// Anser: an existing pty whose process isn't ours.
++        adopted: void,
+     };
+ 
+     const ArgsFormatter = struct {
+@@ -868,11 +907,24 @@ const Subprocess = struct {
+         // https://github.com/ghostty-org/ghostty/discussions/7769
+         if (cwd) |pwd| try env.put("PWD", pwd);
+ 
++        const initial_output = try alloc.dupe(u8, cfg.initial_output);
++        const adopt_fd: ?posix.fd_t = if (cfg.adopt_fd) |fd| adopt: {
++            if (comptime builtin.target.os.tag == .windows) return error.AdoptUnsupported;
++            const rc = posix.system.fcntl(fd, posix.F.DUPFD_CLOEXEC, @as(c_int, 0));
++            if (rc < 0) {
++                log.err("error duplicating adopted pty fd err=E{s}", .{@tagName(posix.errno(rc))});
++                return error.AdoptFailed;
++            }
++            break :adopt @intCast(rc);
++        } else null;
++
+         return .{
+             .arena = arena,
+             .env = env,
+             .cwd = cwd,
+             .args = args,
++            .adopt_fd = adopt_fd,
++            .initial_output = initial_output,
+ 
+             .rt_pre_exec_info = cfg.rt_pre_exec_info,
+             .rt_post_fork_info = cfg.rt_post_fork_info,
+@@ -887,6 +939,7 @@ const Subprocess = struct {
+     pub fn deinit(self: *Subprocess) void {
+         self.stop();
+         if (self.pty) |*pty| pty.deinit();
++        if (self.adopt_fd) |fd| _ = posix.system.close(fd);
+         if (self.env) |*env| env.deinit();
+         self.arena.deinit();
+         self.* = undefined;
+@@ -900,6 +953,28 @@ const Subprocess = struct {
+     } {
+         assert(self.pty == null and self.process == null);
+ 
++        // Anser: adopt an existing pty. There's nothing to spawn; the
++        // embedder reports the exit of the process behind it.
++        if (comptime builtin.target.os.tag != .windows) {
++            if (self.adopt_fd) |fd| {
++                self.adopt_fd = null;
++                var pty: Pty = .{ .master = fd, .slave = -1 };
++                pty.setSize(.{
++                    .ws_row = std.math.cast(u16, self.grid_size.rows) orelse std.math.maxInt(u16),
++                    .ws_col = std.math.cast(u16, self.grid_size.columns) orelse std.math.maxInt(u16),
++                    .ws_xpixel = std.math.cast(u16, self.screen_size.width) orelse std.math.maxInt(u16),
++                    .ws_ypixel = std.math.cast(u16, self.screen_size.height) orelse std.math.maxInt(u16),
++                }) catch |err| log.warn("error sizing adopted pty err={}", .{err});
++                self.pty = pty;
++                self.process = .{ .adopted = {} };
++                if (self.env) |*env| {
++                    env.deinit();
++                    self.env = null;
++                }
++                return .{ .read = fd, .write = fd };
++            }
++        }
++
+         // This function is funny because on POSIX systems it can
+         // fail in the forked process. This is flipped to true if
+         // we're in an error state in the forked process (child
+@@ -1127,6 +1202,10 @@ const Subprocess = struct {
+                 _ = cmd.wait() catch |err|
+                     log.err("error waiting for command to exit: {}", .{err});
+             },
++
++            // Anser: not ours to stop. Our copy of the pty is closed in
++            // deinit and the process keeps running for its owner.
++            .adopted => {},
+         }
+ 
+         self.process = null;
+@@ -1409,7 +1488,13 @@ pub const ReadThread = struct {
+         bufs: [buffer_count][buffer_capacity]u8 = undefined,
+     };
+ 
+-    fn threadMainPosix(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
++    fn threadMainPosix(
++        fd: posix.fd_t,
++        io: *termio.Termio,
++        quit: posix.fd_t,
++        initial_output: []const u8,
++        recent: ?*RecentOutput,
++    ) void {
+         // Always close our end of the pipe when we exit.
+         defer _ = posix.system.close(quit);
+ 
+@@ -1438,6 +1523,11 @@ pub const ReadThread = struct {
+             return;
+         }
+ 
++        // Anser: an adopted pty's history goes in before anything read
++        // from it. Done on this thread so replies the terminal sends
++        // while parsing it don't wait on the IO thread that started us.
++        if (initial_output.len > 0) io.processOutput(initial_output);
++
+         // Shared pipeline
+         var pipeline: Pipeline = .{};
+ 
+@@ -1496,6 +1586,7 @@ pub const ReadThread = struct {
+             // drop it: parsing up to a full ring of a flooding program's
+             // output only delays the close the app thread is waiting on.
+             if (!io.renderer_state.closing.load(.acquire)) io.processOutput(batch);
++            if (recent) |r| r.append(batch);
+ 
+             {
+                 pipeline.mutex.lockUncancelable(global.io());
+@@ -2370,3 +2461,71 @@ test "init frees the env when it fails" {
+         try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+     }
+ }
++
++/// Anser: the last couple of megabytes of output of an adopted terminal,
++/// so the embedder can hand them to whoever shows this shell next (after
++/// a restart). Written by the read thread, read from the app thread.
++pub const RecentOutput = struct {
++    pub const capacity = 2 * 1024 * 1024;
++
++    alloc: Allocator,
++    mutex: std.Io.Mutex = .init,
++    buf: []u8,
++    /// Where the next byte goes.
++    head: usize = 0,
++    /// Valid bytes in buf (at most capacity).
++    len: usize = 0,
++    /// Bytes ever appended. Lets the embedder skip unchanged terminals.
++    total: u64 = 0,
++
++    pub fn create(alloc: Allocator) !*RecentOutput {
++        const self = try alloc.create(RecentOutput);
++        errdefer alloc.destroy(self);
++        self.* = .{ .alloc = alloc, .buf = try alloc.alloc(u8, capacity) };
++        return self;
++    }
++
++    pub fn destroy(self: *RecentOutput) void {
++        const alloc = self.alloc;
++        alloc.free(self.buf);
++        alloc.destroy(self);
++    }
++
++    pub fn append(self: *RecentOutput, data_: []const u8) void {
++        if (data_.len == 0) return;
++        self.mutex.lockUncancelable(global.io());
++        defer self.mutex.unlock(global.io());
++        self.total += data_.len;
++        const data = if (data_.len > capacity) data_[data_.len - capacity ..] else data_;
++        const first = @min(data.len, capacity - self.head);
++        @memcpy(self.buf[self.head..][0..first], data[0..first]);
++        @memcpy(self.buf[0 .. data.len - first], data[first..]);
++        self.head = (self.head + data.len) % capacity;
++        self.len = @min(capacity, self.len + data.len);
++    }
++
++    pub fn totalBytes(self: *RecentOutput) u64 {
++        self.mutex.lockUncancelable(global.io());
++        defer self.mutex.unlock(global.io());
++        return self.total;
++    }
++
++    /// Copies the newest bytes into out and returns how many. If older
++    /// output was cut off, the copy starts after the first line break so
++    /// it doesn't begin halfway through a line or escape sequence.
++    pub fn copyOut(self: *RecentOutput, out: []u8) usize {
++        self.mutex.lockUncancelable(global.io());
++        defer self.mutex.unlock(global.io());
++        const n = @min(out.len, self.len);
++        if (n == 0) return 0;
++        const start = (self.head + capacity - n) % capacity;
++        const first = @min(n, capacity - start);
++        @memcpy(out[0..first], self.buf[start..][0..first]);
++        @memcpy(out[first..n], self.buf[0 .. n - first]);
++        if (n == self.total) return n;
++        const nl = std.mem.indexOfScalar(u8, out[0..n], '\n') orelse return n;
++        const rest = n - (nl + 1);
++        std.mem.copyForwards(u8, out[0..rest], out[nl + 1 .. n]);
++        return rest;
++    }
++};

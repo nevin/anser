@@ -58,7 +58,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         Startup.mark("windows")
         // Shells left from before that no window came back to are ended.
         if SessionHost.shared.helperPath != nil {
-            SessionHost.shared.keepOnly(Set(allPanes.filter(\.session.persistent).map(\.session.id)))
+            var keep = Set(allPanes.filter(\.session.persistent).map(\.session.id))
+            // The crash test's relaunch comes back to a shell no saved layout names.
+            if selfTest, let id = ProcessInfo.processInfo.environment["ANSER_SELFTEST_KEEP"] { keep.insert(id) }
+            SessionHost.shared.keepOnly(keep)
         }
         startAutosave()
         if !selfTest, !UserDefaults.standard.bool(forKey: "AnserWelcomeShown") { currentPane?.showWelcome() }
@@ -119,6 +122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let panes = allPanes.filter(\.session.persistent)
         if keepingShellsOnQuit {
             panes.forEach { SessionHost.shared.save($0.session) }
+            // Quitting (or Sparkle restarting for an update) doesn't close the panes: hand each
+            // direct tab's history back to the helper here, for the next launch to show.
+            panes.forEach { $0.releaseDirect(keep: true) }
         } else {
             for p in panes { SessionHost.shared.request(["cmd": "kill", "id": p.session.id], timeout: 0.5) }
         }
